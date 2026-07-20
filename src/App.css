@@ -516,6 +516,14 @@ body {
 .table-wrap {
   flex: 1;
   overflow: auto;
+  /* keep row backgrounds from ever painting over the sticky header */
+  isolation: isolate;
+}
+
+.table-wrap tbody tr,
+.table-wrap tbody td {
+  position: static;
+  z-index: auto;
 }
 
 table {
@@ -537,16 +545,20 @@ tr.spacer {
 th {
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: 5;
   display: table-cell;
   background: var(--bg);
+  background-clip: padding-box;
+  /* fixed height so the scroll math (HEADER_H) matches reality */
+  height: 30px;
+  box-sizing: border-box;
   text-align: left;
   color: var(--dim);
   font-weight: 600;
   font-size: 10.5px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 8px 14px 6px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--border);
   overflow: hidden;
   text-overflow: ellipsis;

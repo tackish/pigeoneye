@@ -92,6 +92,13 @@ interface TabState {
   source: string;
 }
 
+interface DisplayRow {
+  row: TableRow;
+  cells: string[];
+  /// lowercase text of everything visible, precomputed for filtering
+  hay: string;
+}
+
 interface PodStat {
   key: string;
   cpu: number;
@@ -1819,44 +1826,65 @@ function App() {
     void select(t);
   }
 
-  const rows = createMemo(() => {
-    const t = table();
-    if (!t) return [];
-    const terms = rowFilter().toLowerCase().split(/\s+/).filter(Boolean);
-    if (!terms.length) return t.rows;
-    // Anything on screen — name, namespace, labels, every printed cell
-    // (IP, node, image…) — matches immediately. The backend index adds
-    // the fields the table doesn't show; the two are unioned so a hit
-    // is never lost while indexing is still running.
-    const localHit = (i: number) => {
-      const r = t.rows[i];
-      const hay = [
-        r.name,
-        r.namespace ?? "",
-        ...Object.entries(r.labels).map(([k, v]) => `${k}=${v}`),
-        ...r.cells.map((c) => String(c ?? "")),
-      ]
-        .join(" ")
-        .toLowerCase();
-      return terms.every((x) => hay.includes(x));
-    };
-    const idx = new Set<number>();
-    for (let i = 0; i < t.rows.length; i++) if (localHit(i)) idx.add(i);
-    for (const i of matched() ?? []) idx.add(i);
-    return [...idx].sort((a, b) => a - b).map((i) => t.rows[i]);
-  });
+  /// Row count for the header badge — the filtered set lives in view().
+  const rows = createMemo(() => view().rows.map((r) => r.row));
 
   /// Final display model: server columns + injected Namespace, live
   /// metric columns for pods, AZ for nodes — then column sorting.
-  const view = createMemo(() => {
+  // ── virtual table ──────────────────────────────────────
+  // Rows are a fixed height so the window can be computed instead of
+  // measured, and only what fits on screen is ever put in the DOM.
+  const ROW_H = 26;
+  const HEADER_H = 30;
+  const OVERSCAN = 8;
+  const [scrollTop, setScrollTop] = createSignal(0);
+  const [viewH, setViewH] = createSignal(600);
+
+  const windowRange = createMemo(() => {
+    const total = view().rows.length;
+    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
+    const visible = Math.ceil(viewH() / ROW_H) + OVERSCAN * 2;
+    return { first, last: Math.min(total, first + visible), total };
+  });
+
+  const windowRows = createMemo(() => {
+    const { first, last } = windowRange();
+    return view().rows.slice(first, last);
+  });
+
+  /// Keep the cursor row inside the viewport without needing it to be
+  /// in the DOM.
+  function scrollRowIntoView(idx: number) {
+    const el = tableFocusRef;
+    if (!el) return;
+    const top = idx * ROW_H;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (top + ROW_H > el.scrollTop + el.clientHeight - HEADER_H) {
+      el.scrollTop = top + ROW_H - el.clientHeight + HEADER_H;
+    }
+  }
+
+  function scrollColIntoView(i: number) {
+    document
+      .querySelector(`th[data-col="${i}"]`)
+      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }
+
+  function moveCursor(delta: number) {
+    const n = view().rows.length;
+    if (!n) return;
+    const next = Math.min(Math.max(cursor() + delta, 0), n - 1);
+    setCursor(next);
+    scrollRowIntoView(next);
+  }
+
+  /// Display cells for every row, built once per list — not per
+  /// keystroke. On a 24k-pod cluster rebuilding this while typing was
+  /// what made search collapse.
+  const baseRows = createMemo(() => {
     const t = table();
     const rt = selected();
-    if (!t || !rt)
-      return {
-        cols: [] as string[],
-        allCols: [] as string[],
-        rows: [] as { row: TableRow; cells: string[] }[],
-      };
+    if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
     let cols = t.columns.map((c) => c.name);
     if (rt.namespaced) cols = [cols[0], "Namespace", ...cols.slice(1)];
     const stats = rt.group === "" && rt.kind === "Pod" ? podStats() : null;
@@ -1868,7 +1896,8 @@ function App() {
     }
     const nodeView = rt.group === "" && rt.kind === "Node";
     if (nodeView) cols = [...cols, "AZ"];
-    const out = rows().map((r) => {
+
+    const rows: DisplayRow[] = t.rows.map((r) => {
       let cells = r.cells.map((c) => String(c ?? ""));
       if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
       if (stats) {
@@ -1886,96 +1915,74 @@ function App() {
         cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
       }
       if (nodeView) cells = [...cells, zoneOf(r.labels)];
-      return { row: r, cells };
+      // one lowercase haystack per row, reused by every keystroke
+      const hay = (
+        cells.join(" ") +
+        " " +
+        Object.entries(r.labels)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(" ")
+      ).toLowerCase();
+      return { row: r, cells, hay };
     });
-    const sc = sortCol();
-    if (sc !== null && sc >= 0 && sc < cols.length) {
-      const dir = sortDir();
-      out.sort((a, b) => cmpCells(a.cells[sc] ?? "", b.cells[sc] ?? "") * dir);
-    }
-    // drop hidden columns last so sorting still refers to real data
-    const hide = hiddenFor();
-    const keep = cols.map((c, i) => [c, i] as const).filter(([c]) => !hide.has(c));
-    return {
-      cols: keep.map(([c]) => c),
-      allCols: cols,
-      rows: out.map((r) => ({ ...r, cells: keep.map(([, i]) => r.cells[i]) })),
-    };
+    return { cols, rows };
   });
 
-  createEffect(() => {
-    const n = view().rows.length;
-    if (cursor() >= n) setCursor(n ? n - 1 : 0);
-  });
-
-  createEffect(() => {
-    const n = sidebarItems().length;
-    if (sideIdx() >= n) setSideIdx(n ? n - 1 : 0);
-  });
-
-  function moveCursor(delta: number) {
-    const n = view().rows.length;
-    if (!n) return;
-    const next = Math.min(Math.max(cursor() + delta, 0), n - 1);
-    setCursor(next);
-    scrollRowIntoView(next);
-  }
-
-  // ── virtual table ──────────────────────────────────────
-  // Rows are a fixed height so the window can be computed instead of
-  // measured, and only what fits on screen is ever put in the DOM.
-  const ROW_H = 26;
-  const OVERSCAN = 8;
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [viewH, setViewH] = createSignal(600);
-
-  const windowRange = createMemo(() => {
-    const total = view().rows.length;
-    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
-    const visible = Math.ceil(viewH() / ROW_H) + OVERSCAN * 2;
-    return { first, last: Math.min(total, first + visible), total };
-  });
-
-  const windowRows = createMemo(() => {
-    const { first, last } = windowRange();
-    return view().rows.slice(first, last);
-  });
-
-  /// Column widths from the data itself: with table-layout fixed the
-  /// columns must not depend on which rows happen to be rendered, or
-  /// they would jitter while scrolling.
+  /// Column widths follow the data, but sampling the first rows is
+  /// enough — scanning 24k rows on every change is not.
   const colWidths = createMemo(() => {
-    const v = view();
-    return v.cols.map((c, i) => {
-      // header text plus room for the sort arrow, which must not
-      // change the width when it appears
+    const b = baseRows();
+    const sample = b.rows.slice(0, 600);
+    return b.cols.map((c, i) => {
       let max = c.length + 2;
-      for (const r of v.rows) {
-        // cells hold numbers too, so measure the rendered string
-        const len = String(r.cells[i] ?? "").length;
+      for (const r of sample) {
+        const len = r.cells[i]?.length ?? 0;
         if (len > max) max = len;
       }
       return Math.min(Math.max(max * 7.4 + 28, 76), 460);
     });
   });
 
-  /// Keep the cursor row inside the viewport without needing it to be
-  /// in the DOM.
-  function scrollRowIntoView(idx: number) {
-    const el = tableFocusRef;
-    if (!el) return;
-    const top = idx * ROW_H;
-    if (top < el.scrollTop) el.scrollTop = top;
-    else if (top + ROW_H > el.scrollTop + el.clientHeight - 28) {
-      el.scrollTop = top + ROW_H - el.clientHeight + 28;
-    }
-  }
+  /// Filter, then sort, then drop hidden columns. Only this part runs
+  /// per keystroke, and it works on already-built rows.
+  const view = createMemo(() => {
+    const b = baseRows();
+    if (!b.rows.length && !b.cols.length)
+      return {
+        cols: [] as string[],
+        allCols: [] as string[],
+        rows: [] as DisplayRow[],
+      };
 
-  function scrollColIntoView(i: number) {
-    document
-      .querySelector(`th[data-col="${i}"]`)
-      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
-  }
+    const terms = rowFilter().toLowerCase().split(/\s+/).filter(Boolean);
+    let out: DisplayRow[];
+    if (!terms.length) {
+      out = b.rows;
+    } else {
+      const backend = matched();
+      const extra = backend ? new Set(backend) : null;
+      out = b.rows.filter(
+        (r, i) => terms.every((x) => r.hay.includes(x)) || extra?.has(i),
+      );
+    }
+
+    const sc = sortCol();
+    if (sc !== null && sc >= 0 && sc < b.cols.length) {
+      const dir = sortDir();
+      out = [...out].sort(
+        (x, y) => cmpCells(x.cells[sc] ?? "", y.cells[sc] ?? "") * dir,
+      );
+    }
+
+    const hide = hiddenFor();
+    if (!hide.size) return { cols: b.cols, allCols: b.cols, rows: out };
+    const keep = b.cols.map((c, i) => [c, i] as const).filter(([c]) => !hide.has(c));
+    return {
+      cols: keep.map(([c]) => c),
+      allCols: b.cols,
+      rows: out.map((r) => ({ ...r, cells: keep.map(([, i]) => r.cells[i]) })),
+    };
+  });
 
   function clickSort(i: number) {
     if (sortCol() === i) {
