@@ -649,6 +649,15 @@ function App() {
 
   const colKey = () => (selected() ? typeKey(selected()!) : "");
 
+  /// Columns the API server marks as wide-only (priority > 0) — the
+  /// ones `kubectl` hides unless you ask for -o wide.
+  const widePriority = createMemo(() => {
+    const t = table();
+    const m = new Set<string>();
+    for (const c of t?.columns ?? []) if (c.priority > 0) m.add(c.name);
+    return m;
+  });
+
   /// Columns hidden for this kind: the user's choice if they made one,
   /// otherwise the server's own "wide only" marking (priority > 0).
   const hiddenFor = createMemo(() => {
@@ -3305,15 +3314,20 @@ function App() {
                       </div>
                       <For each={view().allCols}>
                         {(c) => (
-                          <button
-                            class="ns-item"
-                            onClick={() => toggleCol(c)}
-                          >
+                          <button class="ns-item" onClick={() => toggleCol(c)}>
                             <span
                               class="mark-box"
                               classList={{ on: !hiddenFor().has(c) }}
                             />
                             {c}
+                            <Show when={widePriority().has(c)}>
+                              <span
+                                class="wide-tag"
+                                title="the API marks this wide-only: it is empty for most objects"
+                              >
+                                wide
+                              </span>
+                            </Show>
                           </button>
                         )}
                       </For>
