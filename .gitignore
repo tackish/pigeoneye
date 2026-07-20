@@ -1,0 +1,12 @@
+node_modules
+dist
+src-tauri/target
+
+# local-only context notes for AI sessions
+context.md
+
+# the mascot sheet the SVGs were traced from
+pigeon_image.png
+
+.DS_Store
+src/assets/png

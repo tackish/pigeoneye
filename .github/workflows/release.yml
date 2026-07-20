@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'Casks/**'
+      - '**.md'
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        name: Determine next version
+        run: |
+          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          MAJOR=$(echo $LATEST | cut -d. -f1 | tr -d v)
+          MINOR=$(echo $LATEST | cut -d. -f2)
+          PATCH=$(( $(echo $LATEST | cut -d. -f3) + 1 ))
+          echo "version=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+          echo "tag=v${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            label: darwin-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # webkit2gtk + friends are what Tauri links against on Linux
+      - name: Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libssl-dev build-essential curl wget file
+
+      - name: Stamp version
+        shell: bash
+        run: |
+          V=${{ needs.version.outputs.version }}
+          node -e "const f='package.json',j=require('./'+f);j.version='$V';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          node -e "const f='src-tauri/tauri.conf.json',j=require('./'+f);j.version='$V';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          perl -pi -e "s/^version = \".*\"/version = \"$V\"/ if 1..10" src-tauri/Cargo.toml
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run smoke
+
+      - name: Build app
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          V=${{ needs.version.outputs.version }}
+          mkdir -p dist
+          B=src-tauri/target/${{ matrix.target }}/release/bundle
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # ship the .app as a tarball: a cask can install it directly
+            tar -czf "dist/PigeonEye-${{ matrix.label }}.tar.gz" -C "$B/macos" PigeonEye.app
+          else
+            find "$B/deb" -name '*.deb' -exec cp {} "dist/PigeonEye-${V}-linux-x86_64.deb" \;
+            find "$B/appimage" -name '*.AppImage' -exec cp {} "dist/PigeonEye-${V}-linux-x86_64.AppImage" \; || true
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: dist/*
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: mkdir -p dist && find artifacts -type f -exec cp {} dist/ \; && ls -la dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ needs.version.outputs.tag }}
+          git tag -d $TAG 2>/dev/null || true
+          git push origin :refs/tags/$TAG 2>/dev/null || true
+          gh release delete $TAG --yes 2>/dev/null || true
+          git tag $TAG
+          git push origin $TAG
+          gh release create $TAG dist/* --title "$TAG" --generate-notes
+
+      - name: Update Homebrew cask
+        run: |
+          V=${{ needs.version.outputs.version }}
+          ARM=$(sha256sum dist/PigeonEye-darwin-arm64.tar.gz | awk '{print $1}')
+          AMD=$(sha256sum dist/PigeonEye-darwin-x86_64.tar.gz | awk '{print $1}')
+          python3 scripts/update-cask.py "$V" "$ARM" "$AMD"
+          git config user.name "Tek"
+          git config user.email "realblack86@gmail.com"
+          git add Casks/pigeoneye.rb
+          git commit -m "brew: update cask to ${V}" || exit 0
+          git push origin HEAD:main

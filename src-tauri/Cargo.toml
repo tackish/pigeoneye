@@ -1,0 +1,31 @@
+[package]
+name = "pigeoneye"
+version = "0.1.0"
+description = "PigeonEye — a bird's-eye view of your clusters. Faster than anything."
+authors = ["tackish"]
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "pigeoneye_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+http = "1"
+kube = { version = "1", features = ["client", "runtime", "ws"] }
+k8s-openapi = { version = "0.25", features = ["latest"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+thiserror = "2"
