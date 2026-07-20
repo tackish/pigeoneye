@@ -30,6 +30,9 @@ pub struct AppState {
     pub forwards: RwLock<std::collections::HashMap<u32, PfSession>>,
     /// Live watches feeding incremental table updates.
     pub watches: RwLock<std::collections::HashMap<u32, tokio::task::AbortHandle>>,
+    /// Recently viewed lists, so going back to a view paints from
+    /// memory instead of refetching (an Events list can be 20k rows).
+    pub lists: RwLock<Vec<(String, CachedList)>>,
 }
 
 pub struct ExecSession {
@@ -59,6 +62,18 @@ pub struct PfInfo {
     pub remote: u16,
     pub local: u16,
 }
+
+#[derive(Clone)]
+pub struct CachedList {
+    pub columns: Vec<ColumnDef>,
+    pub rows: Vec<TableRow>,
+    pub resource_version: Option<String>,
+    pub include: String,
+}
+
+/// How many past views to keep. Each one is rows only — no open
+/// connections — so the cost is memory, not sockets.
+const LIST_CACHE_MAX: usize = 6;
 
 #[derive(Default)]
 pub struct SearchCache {
@@ -120,13 +135,13 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ColumnDef {
     pub name: String,
     pub priority: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct TableRow {
     pub name: String,
     pub namespace: Option<String>,
@@ -641,6 +656,91 @@ pub struct RowPage {
     pub done: bool,
 }
 
+fn list_key(
+    context: &str,
+    rt: &ResourceType,
+    namespace: Option<&str>,
+    field_selector: Option<&str>,
+) -> String {
+    format!(
+        "{context}|{}/{}|{}|{}",
+        rt.group,
+        rt.kind,
+        namespace.unwrap_or(""),
+        field_selector.unwrap_or("")
+    )
+}
+
+/// Seed the search index straight from cached rows — name, namespace,
+/// labels and printed cells are all we need for an instant filter; the
+/// full-text pass still happens lazily on first search.
+async fn seed_search_from_rows(
+    state: &AppState,
+    rows: &[TableRow],
+    context: &str,
+    rt: &ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+) -> u64 {
+    let mut s = state.search.write().await;
+    s.generation += 1;
+    s.keys = rows.iter().map(row_key).collect();
+    s.blobs = rows.iter().map(basic_blob).collect();
+    s.pod_res.clear();
+    s.indexed = false;
+    s.source = Some((
+        context.to_string(),
+        rt.clone(),
+        namespace,
+        field_selector,
+    ));
+    s.generation
+}
+
+async fn cache_list(state: &AppState, key: String, entry: CachedList) {
+    let mut c = state.lists.write().await;
+    c.retain(|(k, _)| k != &key);
+    c.push((key, entry));
+    let over = c.len().saturating_sub(LIST_CACHE_MAX);
+    if over > 0 {
+        c.drain(0..over);
+    }
+}
+
+/// Rows already seen for this view, if any.
+pub async fn cached_list(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+) -> Result<Option<ResourceTable>, String> {
+    let key = list_key(&context, &rt, namespace.as_deref(), field_selector.as_deref());
+    let hit = {
+        let c = state.lists.read().await;
+        c.iter().find(|(k, _)| k == &key).map(|(_, v)| v.clone())
+    };
+    let Some(entry) = hit else {
+        return Ok(None);
+    };
+    seed_search_from_rows(
+        state,
+        &entry.rows,
+        &context,
+        &rt,
+        namespace.clone(),
+        field_selector.clone(),
+    )
+    .await;
+    Ok(Some(ResourceTable {
+        columns: entry.columns,
+        rows: entry.rows,
+        truncated: false,
+        resource_version: entry.resource_version,
+        include: entry.include,
+    }))
+}
+
 pub async fn list_resources(
     state: &AppState,
     context: String,
@@ -860,15 +960,41 @@ pub async fn list_resources(
         });
     }
 
+    // Cache before the background warm-up moves `rt` into it.
+    if !truncated {
+        cache_list(
+            state,
+            list_key(&context, &rt, namespace.as_deref(), field_selector.as_deref()),
+            CachedList {
+                columns: columns.clone(),
+                rows: rows.clone(),
+                resource_version: table
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(|r| r.as_str())
+                    .map(String::from),
+                include: include.to_string(),
+            },
+        )
+        .await;
+    }
+
     // Pods show live CPU/MEM, which needs requests/limits — that one
     // still warms in the background; everything else indexes lazily.
     if is_table && rt.group.is_empty() && rt.kind == "Pod" {
         let search = state.search.clone();
         let fs = field_selector.clone();
+        let rt_bg = rt.clone();
+        let ns_bg = namespace.clone();
         tokio::spawn(async move {
-            let _ =
-                build_index(&client, &rt, namespace.as_deref(), fs.as_deref(), &search, generation)
-                    .await;
+            let _ = build_index(
+                &client,
+                &rt_bg,
+                ns_bg.as_deref(),
+                fs.as_deref(),
+                &search,
+                generation,
+            )
+            .await;
         });
     }
     Ok(ResourceTable {

@@ -1226,10 +1226,28 @@ function App() {
     indexPromise = null;
     filterSeq++;
     closeDetail();
-    setLoading(true);
     setError(null);
+    const ns = rt.namespaced && namespace() ? namespace() : null;
+    // Coming back to a view should not refetch 20k rows before showing
+    // anything: paint the cached rows, then revalidate underneath.
+    let warm = false;
     try {
-      const ns = rt.namespaced && namespace() ? namespace() : null;
+      const cached = await invoke<ResourceTable | null>("cached_list", {
+        context: ctx,
+        resource: rt,
+        namespace: ns,
+        fieldSelector: fieldSelector ?? null,
+      });
+      if (cached && active() === ctx && selected() === rt) {
+        setTable(cached);
+        setLoading(false);
+        warm = true;
+      }
+    } catch {
+      /* no cache is fine */
+    }
+    if (!warm) setLoading(true);
+    try {
       // Big clusters do not fit in one page: the first page renders
       // immediately and the rest arrives on this channel, so search
       // eventually covers everything without blocking first paint.
@@ -2319,6 +2337,11 @@ function App() {
       else rowSearchRef?.focus();
       return;
     }
+    if ((e.metaKey || e.ctrlKey) && e.code === "Digit0") {
+      e.preventDefault();
+      pickNamespace("");
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key === ",") {
       e.preventDefault();
       setSettingsOpen(!settingsOpen());
@@ -3292,6 +3315,15 @@ function App() {
                 </span>
               </Show>
               <Show when={table()}>
+                <Show when={kindIs("", "Namespace") && namespace()}>
+                  <button
+                    class="btn sm"
+                    title="show every namespace again (⌘0)"
+                    onClick={() => pickNamespace("")}
+                  >
+                    all namespaces
+                  </button>
+                </Show>
                 <div class="cols-picker">
                   <button
                     class="btn sm"
@@ -4358,6 +4390,7 @@ function App() {
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
                   <b class="help-sec">app</b><span />
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
+                  <b>⌘0</b><span>back to all namespaces</span>
                   <b>⌘,</b><span>settings (kubeconfig, shell)</span>
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
