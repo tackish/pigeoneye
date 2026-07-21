@@ -5184,6 +5184,7 @@ function App() {
                     value={newYaml()}
                     theme={theme()}
                     readOnly={false}
+                    autofocus
                     onChange={setNewYaml}
                     onLeave={() => {
                       // Esc in the editor steps out to the actions row;

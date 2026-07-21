@@ -19,6 +19,7 @@ export default function YamlEditor(props: {
   onChange: (v: string) => void;
   onLeave?: () => void;
   onFind?: () => void;
+  autofocus?: boolean;
   api?: (a: { next: () => void; focus: () => void }) => void;
 }) {
   let host!: HTMLDivElement;
@@ -85,6 +86,9 @@ export default function YamlEditor(props: {
         view?.focus();
       },
     });
+    // Grab focus so the keyboard is inside the editor the moment it opens
+    // (e.g. the New dialog) instead of stuck on the page behind it.
+    if (props.autofocus) setTimeout(() => view?.focus());
   });
 
   // External resets (Reset button, new resource opened) flow back in.
