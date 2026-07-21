@@ -2310,6 +2310,7 @@ pub async fn exec_start(
 
 /// Follow a pod's logs into the same session plumbing the shells use —
 /// read-only (no stdin), \n normalized to \r\n for xterm.
+#[allow(clippy::too_many_arguments)]
 pub async fn log_start(
     state: &AppState,
     context: String,
@@ -2317,6 +2318,10 @@ pub async fn log_start(
     pod: String,
     container: Option<String>,
     tail: Option<i64>,
+    previous: Option<bool>,
+    since_seconds: Option<i64>,
+    timestamps: Option<bool>,
+    follow: Option<bool>,
     channel: Channel<String>,
 ) -> Result<u32, String> {
     if namespace.is_empty() {
@@ -2340,9 +2345,12 @@ pub async fn log_start(
         }
     };
     let lp = kube::api::LogParams {
-        follow: true,
+        follow: follow.unwrap_or(true),
         tail_lines: Some(tail.unwrap_or(500)),
         container,
+        previous: previous.unwrap_or(false),
+        since_seconds: since_seconds.filter(|s| *s > 0),
+        timestamps: timestamps.unwrap_or(false),
         ..Default::default()
     };
     let stream = pods.log_stream(&pod, &lp).await.map_err(err)?;

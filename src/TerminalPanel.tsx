@@ -1,7 +1,8 @@
-import { createEffect, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 
 export interface ResourceTypeRef {
@@ -21,6 +22,10 @@ export interface ShellTarget {
   resource?: ResourceTypeRef;
   /// pod shells and logs: which container to attach to
   container?: string;
+  /// logs: initial options (also settable from the log toolbar)
+  logPrevious?: boolean;
+  logSince?: number; // seconds; 0/undef = from tail
+  logTimestamps?: boolean;
   /// pod shells: override shell command ("bash || sh" by default)
   command?: string;
   /// node shells: helper-pod customization
@@ -67,7 +72,15 @@ export default function TerminalPanel(props: {
   let host!: HTMLDivElement;
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
+  let search: SearchAddon | undefined;
   let sessionId: number | null = null;
+  const isLogs = props.target.kind === "logs" || props.target.kind === "wlogs";
+  // Buffer the streamed log text so it can be downloaded.
+  let logBuf = "";
+  const [logPrev, setLogPrev] = createSignal(!!props.target.logPrevious);
+  const [logTs, setLogTs] = createSignal(!!props.target.logTimestamps);
+  const [logSince, setLogSince] = createSignal(props.target.logSince ?? 0);
+  const [findQ, setFindQ] = createSignal("");
 
   const onWinResize = () => props.active && fit?.fit();
 
@@ -93,6 +106,10 @@ export default function TerminalPanel(props: {
     });
     fit = new FitAddon();
     term.loadAddon(fit);
+    if (isLogs) {
+      search = new SearchAddon();
+      term.loadAddon(search);
+    }
     term.open(host);
     fit.fit();
     term.focus();
@@ -153,6 +170,7 @@ export default function TerminalPanel(props: {
         props.onExit();
         return;
       }
+      if (isLogs) logBuf += d.replace(/\r\n/g, "\n");
       term?.write(d);
     };
     try {
@@ -173,6 +191,10 @@ export default function TerminalPanel(props: {
                 pod: t.name,
                 container: t.container ?? null,
                 tail: 500,
+                previous: logPrev(),
+                sinceSeconds: logSince() > 0 ? logSince() : null,
+                timestamps: logTs(),
+                follow: true,
                 channel: chan,
               })
             : t.kind === "wlogs"
@@ -221,11 +243,129 @@ export default function TerminalPanel(props: {
     term?.dispose();
   });
 
+  // Re-open a pod-log stream with the current toolbar options.
+  async function reloadLogs() {
+    if (props.target.kind !== "logs" || !term) return;
+    if (sessionId != null) {
+      void invoke("exec_stop", { id: sessionId });
+      sessionId = null;
+    }
+    term.clear();
+    logBuf = "";
+    const chan = new Channel<string>();
+    chan.onmessage = (d) => {
+      if (d === "\u0000exit") return;
+      logBuf += d.replace(/\r\n/g, "\n");
+      term?.write(d);
+    };
+    try {
+      sessionId = await invoke<number>("log_start", {
+        context: props.target.context,
+        namespace: props.target.namespace,
+        pod: props.target.name,
+        container: props.target.container ?? null,
+        tail: 500,
+        previous: logPrev(),
+        sinceSeconds: logSince() > 0 ? logSince() : null,
+        timestamps: logTs(),
+        follow: true,
+        channel: chan,
+      });
+    } catch (e) {
+      term.write(`\r\n\x1b[31m${String(e)}\x1b[0m\r\n`);
+    }
+  }
+
+  const doFind = (back = false) => {
+    const q = findQ();
+    if (!q || !search) return;
+    if (back) search.findPrevious(q);
+    else search.findNext(q);
+  };
+
+  function downloadLogs() {
+    const blob = new Blob([logBuf], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${props.target.name}.log`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   return (
     <div
-      class="term-host"
-      style={{ display: props.active ? "block" : "none" }}
-      ref={host}
-    />
+      class="term-wrap"
+      style={{ display: props.active ? "flex" : "none" }}
+    >
+      <Show when={isLogs}>
+        <div class="log-bar">
+          <input
+            class="search log-find"
+            placeholder="find in logs…"
+            value={findQ()}
+            onInput={(e) => {
+              setFindQ(e.currentTarget.value);
+              search?.findNext(e.currentTarget.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") doFind(e.shiftKey);
+              if (e.key === "Escape") e.currentTarget.blur();
+            }}
+          />
+          <button class="btn sm" title="next match (↵)" onClick={() => doFind()}>
+            ↓
+          </button>
+          <button class="btn sm" title="previous match (⇧↵)" onClick={() => doFind(true)}>
+            ↑
+          </button>
+          <Show when={props.target.kind === "logs"}>
+            <span class="log-sep" />
+            <button
+              class="btn sm"
+              classList={{ primary: logPrev() }}
+              title="show the previous (crashed) container's logs"
+              onClick={() => {
+                setLogPrev(!logPrev());
+                void reloadLogs();
+              }}
+            >
+              previous
+            </button>
+            <button
+              class="btn sm"
+              classList={{ primary: logTs() }}
+              title="prefix each line with a timestamp"
+              onClick={() => {
+                setLogTs(!logTs());
+                void reloadLogs();
+              }}
+            >
+              timestamps
+            </button>
+            <select
+              class="log-since"
+              title="only logs newer than…"
+              value={String(logSince())}
+              onChange={(e) => {
+                setLogSince(Number(e.currentTarget.value));
+                void reloadLogs();
+              }}
+            >
+              <option value="0">tail 500</option>
+              <option value="300">last 5m</option>
+              <option value="900">last 15m</option>
+              <option value="3600">last 1h</option>
+              <option value="86400">last 24h</option>
+            </select>
+          </Show>
+          <span class="log-sep" />
+          <button class="btn sm" title="download the buffered logs" onClick={downloadLogs}>
+            download
+          </button>
+        </div>
+      </Show>
+      <div class="term-host" ref={host} />
+    </div>
   );
 }

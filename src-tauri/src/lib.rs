@@ -235,6 +235,7 @@ async fn node_shell_start(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn log_start(
     state: State<'_, AppState>,
     context: String,
@@ -242,9 +243,17 @@ async fn log_start(
     pod: String,
     container: Option<String>,
     tail: Option<i64>,
+    previous: Option<bool>,
+    since_seconds: Option<i64>,
+    timestamps: Option<bool>,
+    follow: Option<bool>,
     channel: Channel<String>,
 ) -> Result<u32, String> {
-    k8s::log_start(&state, context, namespace, pod, container, tail, channel).await
+    k8s::log_start(
+        &state, context, namespace, pod, container, tail, previous, since_seconds, timestamps,
+        follow, channel,
+    )
+    .await
 }
 
 #[tauri::command]
