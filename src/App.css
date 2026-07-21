@@ -966,7 +966,11 @@ th.sortable:hover {
 
 th.sorted {
   color: var(--fg);
-  background: var(--accent-soft);
+  /* The tint must sit ON an opaque base — --accent-soft alone is
+     translucent, so scrolled cells would show through the sticky
+     header. Composite the tint over --bg via a same-color gradient. */
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--accent-soft), var(--accent-soft));
   box-shadow: inset 0 -2px 0 var(--accent);
 }
 
