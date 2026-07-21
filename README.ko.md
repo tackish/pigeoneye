@@ -1,16 +1,31 @@
 <p align="center">
-  <img src="src/assets/svg/app-icon.svg" width="88" alt="PigeonEye" />
+  <img src="src/assets/svg/logo-horizontal.svg" width="360" alt="PigeonEye — Observe. Navigate. Control." />
 </p>
 
-<h1 align="center">PigeonEye</h1>
-
 <p align="center"><b>A bird's-eye view of your clusters. Faster than anything.</b></p>
+
+<p align="center">
+  <img src="src/assets/svg/pigeon-search.svg" width="150" alt="" />
+</p>
 
 <p align="center"><a href="README.md">English</a> | 한국어</p>
 
 PigeonEye는 빠른 네이티브 Kubernetes GUI입니다. 클러스터가 서빙하는 모든
 리소스 타입 — 모든 CRD 포함 — 이 자동으로 표시되고, `kubectl get`과
 동일한 칼럼을 보여줍니다.
+
+## 왜 빠른가
+
+프로덕션 클러스터(**파드 23,770개 · 이벤트 171,267개**)에서 실측:
+
+| | PigeonEye | 전체 오브젝트 LIST (informer 클라이언트가 연결 시 하는 일) |
+|---|---|---|
+| 파드 첫 화면 | **~0.35초 / 350 KB** | 60초+ 동안 136 MB 받고도 미완 |
+| 연결 시 Discovery | **0.18초**, 단일 요청 | API 그룹마다 왕복 1회 |
+
+테이블은 화면에 보이는 행만 렌더(가상 스크롤)하므로, 2만 4천 행 목록을
+필터링해도 **키 입력당 ~0.5ms**입니다. 열린 목록은 watch로 **실시간**
+갱신되고, 다시 방문하면 캐시에서 즉시 그려집니다.
 
 ## 지원 플랫폼
 | 플랫폼 | 상태 |

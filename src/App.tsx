@@ -1826,58 +1826,6 @@ function App() {
     void select(t);
   }
 
-  /// Row count for the header badge — the filtered set lives in view().
-  const rows = createMemo(() => view().rows.map((r) => r.row));
-
-  /// Final display model: server columns + injected Namespace, live
-  /// metric columns for pods, AZ for nodes — then column sorting.
-  // ── virtual table ──────────────────────────────────────
-  // Rows are a fixed height so the window can be computed instead of
-  // measured, and only what fits on screen is ever put in the DOM.
-  const ROW_H = 26;
-  const HEADER_H = 30;
-  const OVERSCAN = 8;
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [viewH, setViewH] = createSignal(600);
-
-  const windowRange = createMemo(() => {
-    const total = view().rows.length;
-    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
-    const visible = Math.ceil(viewH() / ROW_H) + OVERSCAN * 2;
-    return { first, last: Math.min(total, first + visible), total };
-  });
-
-  const windowRows = createMemo(() => {
-    const { first, last } = windowRange();
-    return view().rows.slice(first, last);
-  });
-
-  /// Keep the cursor row inside the viewport without needing it to be
-  /// in the DOM.
-  function scrollRowIntoView(idx: number) {
-    const el = tableFocusRef;
-    if (!el) return;
-    const top = idx * ROW_H;
-    if (top < el.scrollTop) el.scrollTop = top;
-    else if (top + ROW_H > el.scrollTop + el.clientHeight - HEADER_H) {
-      el.scrollTop = top + ROW_H - el.clientHeight + HEADER_H;
-    }
-  }
-
-  function scrollColIntoView(i: number) {
-    document
-      .querySelector(`th[data-col="${i}"]`)
-      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
-  }
-
-  function moveCursor(delta: number) {
-    const n = view().rows.length;
-    if (!n) return;
-    const next = Math.min(Math.max(cursor() + delta, 0), n - 1);
-    setCursor(next);
-    scrollRowIntoView(next);
-  }
-
   /// Display cells for every row, built once per list — not per
   /// keystroke. On a 24k-pod cluster rebuilding this while typing was
   /// what made search collapse.
@@ -1983,6 +1931,58 @@ function App() {
       rows: out.map((r) => ({ ...r, cells: keep.map(([, i]) => r.cells[i]) })),
     };
   });
+
+  /// Row count for the header badge — the filtered set lives in view().
+  const rows = createMemo(() => view().rows.map((r) => r.row));
+
+  /// Final display model: server columns + injected Namespace, live
+  /// metric columns for pods, AZ for nodes — then column sorting.
+  // ── virtual table ──────────────────────────────────────
+  // Rows are a fixed height so the window can be computed instead of
+  // measured, and only what fits on screen is ever put in the DOM.
+  const ROW_H = 26;
+  const HEADER_H = 30;
+  const OVERSCAN = 8;
+  const [scrollTop, setScrollTop] = createSignal(0);
+  const [viewH, setViewH] = createSignal(600);
+
+  const windowRange = createMemo(() => {
+    const total = view().rows.length;
+    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
+    const visible = Math.ceil(viewH() / ROW_H) + OVERSCAN * 2;
+    return { first, last: Math.min(total, first + visible), total };
+  });
+
+  const windowRows = createMemo(() => {
+    const { first, last } = windowRange();
+    return view().rows.slice(first, last);
+  });
+
+  /// Keep the cursor row inside the viewport without needing it to be
+  /// in the DOM.
+  function scrollRowIntoView(idx: number) {
+    const el = tableFocusRef;
+    if (!el) return;
+    const top = idx * ROW_H;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (top + ROW_H > el.scrollTop + el.clientHeight - HEADER_H) {
+      el.scrollTop = top + ROW_H - el.clientHeight + HEADER_H;
+    }
+  }
+
+  function scrollColIntoView(i: number) {
+    document
+      .querySelector(`th[data-col="${i}"]`)
+      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }
+
+  function moveCursor(delta: number) {
+    const n = view().rows.length;
+    if (!n) return;
+    const next = Math.min(Math.max(cursor() + delta, 0), n - 1);
+    setCursor(next);
+    scrollRowIntoView(next);
+  }
 
   function clickSort(i: number) {
     if (sortCol() === i) {

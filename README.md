@@ -1,16 +1,31 @@
 <p align="center">
-  <img src="src/assets/svg/app-icon.svg" width="88" alt="PigeonEye" />
+  <img src="src/assets/svg/logo-horizontal.svg" width="360" alt="PigeonEye — Observe. Navigate. Control." />
 </p>
 
-<h1 align="center">PigeonEye</h1>
-
 <p align="center"><b>A bird's-eye view of your clusters. Faster than anything.</b></p>
+
+<p align="center">
+  <img src="src/assets/svg/pigeon-search.svg" width="150" alt="" />
+</p>
 
 <p align="center">English | <a href="README.ko.md">한국어</a></p>
 
 PigeonEye is a fast, native Kubernetes GUI. Every resource type your cluster
 serves — including every CRD — shows up automatically, with the same columns
 `kubectl get` prints.
+
+## Why it's fast
+
+Measured on a production cluster with **23,770 pods and 171,267 events**:
+
+| | PigeonEye | Full-object list (what informer clients sync on connect) |
+|---|---|---|
+| First pod screen | **~0.35s / 350 KB** | 60s+ and 136 MB, still incomplete |
+| Discovery on connect | **0.18s**, one request | one round-trip per API group |
+
+The table renders only the rows on screen (virtual scroll), so filtering a
+24k-row list stays at **~0.5ms per keystroke**. Open lists then stay **live**
+over a watch, and revisiting a view paints instantly from cache.
 
 ## Platform support
 | Platform | Status |
