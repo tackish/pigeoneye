@@ -2972,6 +2972,25 @@ function App() {
     });
   }
 
+  const [access, setAccess] = createSignal<[string, boolean][] | null>(null);
+  function openAccess() {
+    const rt = selected();
+    const ctx = active();
+    if (!rt || !ctx) return;
+    setAccess([]);
+    void invoke<[string, boolean][]>("can_i", {
+      context: ctx,
+      group: rt.group,
+      resource: rt.plural,
+      namespace: rt.namespaced ? namespace() || null : null,
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"],
+    })
+      .then((r) => setAccess(r))
+      .catch((e) => {
+        setAccess(null);
+        setError(prettyError(String(e)));
+      });
+  }
   const [history, setHistory] = createSignal<Revision[] | null>(null);
   function openHistory(target?: Target) {
     const d = target ?? currentTarget();
@@ -3113,6 +3132,7 @@ function App() {
         return;
       }
       if (dryRun()) setDryRun(null);
+      else if (access()) setAccess(null);
       else if (history()) setHistory(null);
       else if (colMenu()) setColMenu(null);
       else if (colsOpen()) setColsOpen(false);
@@ -4425,6 +4445,15 @@ function App() {
                   onClick={openNew}
                 >
                   + New
+                </button>
+              </Show>
+              <Show when={selected()}>
+                <button
+                  class="btn sm"
+                  title="which verbs you may perform on this kind (auth can-i)"
+                  onClick={openAccess}
+                >
+                  access
                 </button>
               </Show>
               <Show when={table()}>
@@ -5804,6 +5833,41 @@ function App() {
                 <p class="dim new-foot">
                   <b>↑↓</b> section · <b>↵</b> {newSec() === "editor" ? "edit" : newSec() === "namespace" ? "pick ns" : "run"} · <b>esc</b> {newNsOpen() ? "close list" : "close"} · <b>⌘↵</b> create
                 </p>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={access()}>
+            <div class="modal-backdrop" onClick={() => setAccess(null)}>
+              <div class="modal" onClick={(e) => e.stopPropagation()}>
+                <h3>
+                  Can I… {selected()?.plural}
+                  <span class="dim gv">
+                    {selected()?.namespaced ? namespace() || "all ns" : "cluster"}
+                  </span>
+                </h3>
+                <Show
+                  when={access()!.length}
+                  fallback={<p class="dim">checking…</p>}
+                >
+                  <div class="access-grid">
+                    <For each={access()}>
+                      {([verb, ok]) => (
+                        <>
+                          <span class="access-verb">{verb}</span>
+                          <span classList={{ "access-y": ok, "access-n": !ok }}>
+                            {ok ? "✓ allowed" : "✗ denied"}
+                          </span>
+                        </>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                <div class="modal-actions">
+                  <button class="btn primary" onClick={() => setAccess(null)}>
+                    close
+                  </button>
+                </div>
               </div>
             </div>
           </Show>

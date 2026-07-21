@@ -2464,6 +2464,47 @@ pub async fn restart_rollout(
     Ok(())
 }
 
+/// `kubectl auth can-i` for a set of verbs on one resource kind, via
+/// SelfSubjectAccessReview. Returns (verb, allowed) for each.
+pub async fn can_i(
+    state: &AppState,
+    context: String,
+    group: String,
+    resource: String,
+    namespace: Option<String>,
+    verbs: Vec<String>,
+) -> Result<Vec<(String, bool)>, String> {
+    let client = client(state, &context).await?;
+    let ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk(
+        "authorization.k8s.io",
+        "v1",
+        "SelfSubjectAccessReview",
+    ));
+    let api: Api<DynamicObject> = Api::all_with(client, &ar);
+    let mut out = Vec::new();
+    for verb in verbs {
+        let mut ra = serde_json::json!({
+            "group": group, "resource": resource, "verb": verb,
+        });
+        if let Some(ns) = namespace.as_deref().filter(|n| !n.is_empty()) {
+            ra["namespace"] = ns.into();
+        }
+        let review = serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": { "resourceAttributes": ra },
+        });
+        let obj: DynamicObject = serde_json::from_value(review).map_err(err)?;
+        let created = api.create(&PostParams::default(), &obj).await.map_err(err)?;
+        let allowed = serde_json::to_value(&created)
+            .ok()
+            .and_then(|v| v.pointer("/status/allowed").and_then(|a| a.as_bool()))
+            .unwrap_or(false);
+        out.push((verb, allowed));
+    }
+    Ok(out)
+}
+
 /// Generic merge-patch — drives suspend/resume (spec.suspend), Argo
 /// Rollout restart (spec.restartAt), and similar one-field edits.
 pub async fn patch_resource(

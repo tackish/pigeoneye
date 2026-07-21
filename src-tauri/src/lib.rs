@@ -228,6 +228,18 @@ async fn rollout_undo(
 }
 
 #[tauri::command]
+async fn can_i(
+    state: State<'_, AppState>,
+    context: String,
+    group: String,
+    resource: String,
+    namespace: Option<String>,
+    verbs: Vec<String>,
+) -> Result<Vec<(String, bool)>, String> {
+    k8s::can_i(&state, context, group, resource, namespace, verbs).await
+}
+
+#[tauri::command]
 async fn patch_resource(
     state: State<'_, AppState>,
     context: String,
@@ -495,6 +507,7 @@ pub fn run() {
             restart_rollout,
             rollout_history,
             rollout_undo,
+            can_i,
             patch_resource,
             trigger_cronjob,
             exec_start,

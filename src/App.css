@@ -2005,6 +2005,27 @@ details.fold[open] > summary::before {
   margin: 6px 0 10px;
 }
 
+.access-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 16px;
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+.access-verb {
+  font-family: var(--font-mono);
+  color: var(--fg);
+}
+
+.access-y {
+  color: var(--good);
+}
+
+.access-n {
+  color: var(--bad);
+}
+
 .rev-list {
   display: flex;
   flex-direction: column;
