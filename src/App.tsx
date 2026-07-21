@@ -1041,6 +1041,48 @@ function App() {
     setSortCol(null);
   }
   const [sortDir, setSortDir] = createSignal<1 | -1>(1);
+  // Per-column value filters (spreadsheet-style), keyed by column name so
+  // they survive re-sorting. colMenu is the column whose value list is open.
+  const [colFilters, setColFilters] = createSignal<Record<string, Set<string>>>(
+    {},
+  );
+  const [colMenu, setColMenu] = createSignal<string | null>(null);
+  const [colMenuQ, setColMenuQ] = createSignal("");
+  const [colMenuAt, setColMenuAt] = createSignal<{ x: number; y: number } | null>(
+    null,
+  );
+  // Distinct values (+counts) of the open column, filtered by the search.
+  const colMenuValues = createMemo<[string, number][]>(() => {
+    const name = colMenu();
+    if (!name) return [];
+    const b = baseRows();
+    const ci = b.cols.indexOf(name);
+    if (ci < 0) return [];
+    const counts = new Map<string, number>();
+    for (const r of b.rows) {
+      const v = r.cells[ci] ?? "";
+      counts.set(v, (counts.get(v) ?? 0) + 1);
+    }
+    const q = colMenuQ().toLowerCase().trim();
+    return [...counts.entries()]
+      .filter(([v]) => !q || v.toLowerCase().includes(q))
+      .sort((a, z) => cmpCells(a[0], z[0]));
+  });
+  function toggleColValue(name: string, val: string) {
+    const cur = colFilters();
+    const set = new Set(cur[name] ?? []);
+    if (set.has(val)) set.delete(val);
+    else set.add(val);
+    const next = { ...cur };
+    if (set.size) next[name] = set;
+    else delete next[name];
+    setColFilters(next);
+  }
+  function clearColFilter(name: string) {
+    const next = { ...colFilters() };
+    delete next[name];
+    setColFilters(next);
+  }
   const [cmdOpen, setCmdOpen] = createSignal(false);
   const [cmdText, setCmdText] = createSignal("");
   const [cmdIdx, setCmdIdx] = createSignal(0);
@@ -1601,6 +1643,9 @@ function App() {
     stopWatch();
     setPodStats(null);
     setSortCol(null);
+    // Column filters are per-kind (columns differ), so clear on switch.
+    setColFilters({});
+    setColMenu(null);
     setCursor(0);
     setMarked(new Set<string>());
     if (tableFocusRef) tableFocusRef.scrollTop = 0;
@@ -2392,6 +2437,19 @@ function App() {
       }
     }
 
+    // Per-column value filters (AND across columns). Keyed by column
+    // name; map to the cell index in the full (pre-hide) column list.
+    const cfs = colFilters();
+    const activeCF = Object.entries(cfs)
+      .filter(([, s]) => s.size > 0)
+      .map(([name, set]) => [b.cols.indexOf(name), set] as const)
+      .filter(([ci]) => ci >= 0);
+    if (activeCF.length) {
+      out = out.filter((r) =>
+        activeCF.every(([ci, set]) => set.has(r.cells[ci] ?? "")),
+      );
+    }
+
     const sc = sortCol();
     if (sc !== null && sc >= 0 && sc < b.cols.length) {
       const dir = sortDir();
@@ -2727,7 +2785,8 @@ function App() {
         else setNewOpen(false);
         return;
       }
-      if (pickMode()) setPickMode(null);
+      if (colMenu()) setColMenu(null);
+      else if (pickMode()) setPickMode(null);
       else if (scaleOpen()) setScaleOpen(false);
       else if (pfOpen()) setPfOpen(false);
       else if (helpOpen()) setHelpOpen(false);
@@ -4197,16 +4256,44 @@ function App() {
                               class="sortable"
                               data-col={i()}
                               classList={{ sorted: sortCol() === i() }}
-                              onClick={() => clickSort(i())}
                             >
-                              <span class="th-text">{c}</span>
-                              <span class="sort-ind">
+                              <span
+                                class="th-text"
+                                onClick={() => clickSort(i())}
+                              >
+                                {c}
+                              </span>
+                              <span
+                                class="sort-ind"
+                                onClick={() => clickSort(i())}
+                              >
                                 {sortCol() === i()
                                   ? sortDir() === 1
                                     ? "▲"
                                     : "▼"
                                   : ""}
                               </span>
+                              <button
+                                class="col-filt-btn"
+                                classList={{
+                                  on: (colFilters()[c]?.size ?? 0) > 0,
+                                }}
+                                title="filter this column's values"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (colMenu() === c) {
+                                    setColMenu(null);
+                                    return;
+                                  }
+                                  const r =
+                                    e.currentTarget.getBoundingClientRect();
+                                  setColMenuAt({ x: r.left, y: r.bottom + 4 });
+                                  setColMenuQ("");
+                                  setColMenu(c);
+                                }}
+                              >
+                                ⏷
+                              </button>
                             </th>
                           )}
                         </For>
@@ -5246,6 +5333,72 @@ function App() {
                 <p class="dim new-foot">
                   <b>↑↓</b> section · <b>↵</b> {newSec() === "editor" ? "edit" : newSec() === "namespace" ? "pick ns" : "run"} · <b>esc</b> {newNsOpen() ? "close list" : "close"} · <b>⌘↵</b> create
                 </p>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={colMenu()}>
+            <div class="col-menu-backdrop" onClick={() => setColMenu(null)} />
+            <div
+              class="col-menu"
+              style={{
+                left: `${colMenuAt()?.x ?? 0}px`,
+                top: `${colMenuAt()?.y ?? 0}px`,
+              }}
+            >
+              <div class="col-menu-head">
+                filter <b>{colMenu()}</b>
+              </div>
+              <input
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck={false}
+                class="search"
+                placeholder="filter values…"
+                ref={(el) => setTimeout(() => el.focus())}
+                value={colMenuQ()}
+                onInput={(e) => setColMenuQ(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setColMenu(null);
+                }}
+              />
+              <div class="col-menu-list">
+                <For each={colMenuValues()}>
+                  {([val, count]) => (
+                    <button
+                      class="ns-item col-val"
+                      onClick={() => toggleColValue(colMenu()!, val)}
+                    >
+                      <span
+                        class="mark-box"
+                        classList={{
+                          on: colFilters()[colMenu()!]?.has(val) ?? false,
+                        }}
+                      />
+                      <span class="col-val-txt">{val || "∅ (empty)"}</span>
+                      <span class="dim col-val-n">{count}</span>
+                    </button>
+                  )}
+                </For>
+                <Show when={colMenuValues().length === 0}>
+                  <p class="dim" style={{ padding: "8px 12px" }}>
+                    no values
+                  </p>
+                </Show>
+              </div>
+              <div class="col-menu-foot">
+                <Show when={(colFilters()[colMenu()!]?.size ?? 0) > 0}>
+                  <button
+                    class="btn sm"
+                    onClick={() => clearColFilter(colMenu()!)}
+                  >
+                    clear ({colFilters()[colMenu()!]?.size})
+                  </button>
+                </Show>
+                <button class="btn sm" onClick={() => setColMenu(null)}>
+                  done
+                </button>
               </div>
             </div>
           </Show>

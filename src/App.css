@@ -990,6 +990,104 @@ th.sortable:hover {
 .th-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+/* Per-column value filter: a funnel button in the header, lit when the
+   column has an active filter. */
+.col-filt-btn {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 8px;
+  padding: 0 2px;
+  margin-left: 2px;
+  opacity: 0;
+  transition: opacity 0.1s;
+  vertical-align: middle;
+}
+
+th:hover .col-filt-btn {
+  opacity: 0.7;
+}
+
+.col-filt-btn:hover {
+  color: var(--fg);
+  opacity: 1;
+}
+
+.col-filt-btn.on {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.col-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
+.col-menu {
+  position: fixed;
+  z-index: 31;
+  width: 260px;
+  max-height: 60vh;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+}
+
+.col-menu-head {
+  padding: 8px 12px 0;
+  font-size: 11px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.col-menu-head b {
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.col-menu .search {
+  margin: 8px;
+}
+
+.col-menu-list {
+  overflow-y: auto;
+  padding-bottom: 4px;
+  flex: 1;
+}
+
+.col-val {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.col-val-txt {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.col-val-n {
+  font-size: 11px;
+}
+
+.col-menu-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
 }
 
 th.sorted {
