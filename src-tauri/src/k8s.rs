@@ -195,6 +195,10 @@ pub struct ResourceDetail {
     pub links: Vec<InvolvedRef>,
     /// True when the object selects pods (workloads, services).
     pub has_pod_selector: bool,
+    /// The label selector (as a query string) for those pods, so the
+    /// "pods →" jump lists exactly the owned pods instead of guessing
+    /// from the name. None when the object selects nothing.
+    pub pod_selector: Option<String>,
     /// Scalable workloads: desired and currently ready replicas.
     pub replicas: Option<i64>,
     pub ready_replicas: Option<i64>,
@@ -784,8 +788,16 @@ async fn fetch_table_page(
         include_object
     );
     if let Some(fs) = field_selector.filter(|f| !f.is_empty()) {
-        url.push_str("&fieldSelector=");
-        url.push_str(&urlencode(fs));
+        // A "label:" prefix routes to labelSelector; otherwise it's a
+        // fieldSelector. This lets one selector param thread through the
+        // whole list/watch/cache path for both kinds of narrowing.
+        if let Some(ls) = fs.strip_prefix("label:") {
+            url.push_str("&labelSelector=");
+            url.push_str(&urlencode(ls));
+        } else {
+            url.push_str("&fieldSelector=");
+            url.push_str(&urlencode(fs));
+        }
     }
     if let Some(tok) = continue_token.filter(|t| !t.is_empty()) {
         url.push_str("&continue=");
@@ -1256,8 +1268,13 @@ pub async fn watch_start(
         urlencode(&resource_version)
     );
     if let Some(fs) = field_selector.filter(|f| !f.is_empty()) {
-        url.push_str("&fieldSelector=");
-        url.push_str(&urlencode(&fs));
+        if let Some(ls) = fs.strip_prefix("label:") {
+            url.push_str("&labelSelector=");
+            url.push_str(&urlencode(ls));
+        } else {
+            url.push_str("&fieldSelector=");
+            url.push_str(&urlencode(&fs));
+        }
     }
     let req = http::Request::get(&url)
         .header(
@@ -1588,6 +1605,10 @@ pub async fn get_resource(
         links: related_links(&v, &rt.kind),
         has_pod_selector: v.pointer("/spec/selector").is_some()
             && rt.kind != "PersistentVolumeClaim",
+        pod_selector: (v.pointer("/spec/selector").is_some()
+            && rt.kind != "PersistentVolumeClaim")
+        .then(|| label_selector_string(&v))
+        .filter(|s| !s.is_empty()),
         ports: v
             .pointer("/spec/containers")
             .and_then(|c| c.as_array())
@@ -2364,44 +2385,7 @@ pub async fn logs_selector_start(
     let api = dyn_api(client.clone(), &resource, Some(&namespace));
     let obj = api.get(&name).await.map_err(err)?;
     let v = serde_json::to_value(&obj).map_err(err)?;
-    let mut parts: Vec<String> = Vec::new();
-    // Services carry a plain label map; workloads use matchLabels and
-    // may add matchExpressions. Ignoring the latter would stream logs
-    // from pods the workload does not own.
-    let label_map = v
-        .pointer("/spec/selector/matchLabels")
-        .or_else(|| v.pointer("/spec/selector"))
-        .and_then(|m| m.as_object());
-    if let Some(m) = label_map {
-        for (k, val) in m {
-            if let Some(sv) = val.as_str() {
-                parts.push(format!("{k}={sv}"));
-            }
-        }
-    }
-    for expr in v
-        .pointer("/spec/selector/matchExpressions")
-        .and_then(|e| e.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let key = expr["key"].as_str().unwrap_or_default();
-        let op = expr["operator"].as_str().unwrap_or_default();
-        let vals: Vec<&str> = expr["values"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-            .unwrap_or_default();
-        match op {
-            "In" if !vals.is_empty() => parts.push(format!("{key} in ({})", vals.join(","))),
-            "NotIn" if !vals.is_empty() => {
-                parts.push(format!("{key} notin ({})", vals.join(",")))
-            }
-            "Exists" => parts.push(key.to_string()),
-            "DoesNotExist" => parts.push(format!("!{key}")),
-            _ => {}
-        }
-    }
-    let selector = parts.join(",");
+    let selector = label_selector_string(&v);
     if selector.is_empty() {
         return Err("resource has no usable pod selector".into());
     }
@@ -2583,6 +2567,47 @@ pub async fn pf_stop(state: &AppState, id: u32) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Build a Kubernetes label-selector string from an object's
+/// `spec.selector`. Handles a plain label map (Services) and
+/// matchLabels + matchExpressions (workloads). Empty if there's none.
+fn label_selector_string(v: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let label_map = v
+        .pointer("/spec/selector/matchLabels")
+        .or_else(|| v.pointer("/spec/selector"))
+        .and_then(|m| m.as_object());
+    if let Some(m) = label_map {
+        for (k, val) in m {
+            if let Some(sv) = val.as_str() {
+                parts.push(format!("{k}={sv}"));
+            }
+        }
+    }
+    for expr in v
+        .pointer("/spec/selector/matchExpressions")
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let key = expr["key"].as_str().unwrap_or_default();
+        let op = expr["operator"].as_str().unwrap_or_default();
+        let vals: Vec<&str> = expr["values"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        match op {
+            "In" if !vals.is_empty() => parts.push(format!("{key} in ({})", vals.join(","))),
+            "NotIn" if !vals.is_empty() => {
+                parts.push(format!("{key} notin ({})", vals.join(",")))
+            }
+            "Exists" => parts.push(key.to_string()),
+            "DoesNotExist" => parts.push(format!("!{key}")),
+            _ => {}
+        }
+    }
+    parts.join(",")
 }
 
 /// Sanitize a user string into a DNS-1123 label prefix: lowercase,

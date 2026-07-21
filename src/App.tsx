@@ -80,6 +80,7 @@ interface ResourceDetail {
   involved: RefLink | null;
   links: RefLink[];
   has_pod_selector: boolean;
+  pod_selector: string | null;
   replicas: number | null;
   ready_replicas: number | null;
   yaml: string;
@@ -1881,8 +1882,17 @@ function App() {
       if (st) st.namespace = d.namespace;
       setNamespace(d.namespace);
     }
-    await select(pod);
-    onRowFilterInput(d.name);
+    // Use the real label selector when the object has one (Services,
+    // workloads) — a name text-filter over-matches (any pod whose name
+    // contains this one's) and misses Services entirely (pods don't carry
+    // the Service name). Fall back to the name filter only if there's no
+    // selector.
+    if (d.pod_selector) {
+      await select(pod, `label:${d.pod_selector}`);
+    } else {
+      await select(pod);
+      onRowFilterInput(d.name);
+    }
   }
 
   /// Reverse links: who *uses* the open resource. Forward references
@@ -4163,8 +4173,8 @@ function App() {
                 }}
               />
               <Show when={activeFieldSel()}>
-                <span class="fieldsel">
-                  {activeFieldSel()}
+                <span class="fieldsel" title={activeFieldSel() ?? ""}>
+                  {activeFieldSel()!.replace(/^label:/, "")}
                   <button
                     class="tab-close"
                     title="clear this filter"
