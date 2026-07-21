@@ -330,6 +330,14 @@ async fn pod_stats(
 }
 
 #[tauri::command]
+async fn node_stats(
+    state: State<'_, AppState>,
+    context: String,
+) -> Result<Vec<k8s::NodeStat>, String> {
+    k8s::node_stats(&state, context).await
+}
+
+#[tauri::command]
 async fn ensure_index(state: State<'_, AppState>) -> Result<(), String> {
     k8s::ensure_index(&state).await
 }
@@ -428,6 +436,7 @@ pub fn run() {
             exec_stop,
             get_events,
             pod_stats,
+            node_stats,
             ensure_index,
             filter_rows,
             list_namespaces,

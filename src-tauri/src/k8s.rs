@@ -2001,6 +2001,68 @@ pub struct PodStat {
     pub mem_l: i64,
 }
 
+#[derive(Serialize, Clone)]
+pub struct NodeStat {
+    pub name: String,
+    pub cpu: i64, // millicores used
+    pub mem: i64, // bytes used
+    pub cpu_pct: i64, // % of allocatable
+    pub mem_pct: i64,
+}
+
+/// `kubectl top nodes`: live per-node CPU/MEM usage from
+/// metrics.k8s.io, plus % of each node's allocatable.
+pub async fn node_stats(state: &AppState, context: String) -> Result<Vec<NodeStat>, String> {
+    let client = client(state, &context).await?;
+    // Allocatable per node (for the %).
+    let node_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "Node"));
+    let nodes: Api<DynamicObject> = Api::all_with(client.clone(), &node_ar);
+    let mut alloc: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
+    if let Ok(list) = nodes.list(&ListParams::default()).await {
+        for n in &list.items {
+            let name = n.metadata.name.clone().unwrap_or_default();
+            let v = serde_json::to_value(n).unwrap_or_default();
+            let ca = parse_cpu(
+                v.pointer("/status/allocatable/cpu").and_then(|x| x.as_str()).unwrap_or(""),
+            );
+            let ma = parse_mem(
+                v.pointer("/status/allocatable/memory").and_then(|x| x.as_str()).unwrap_or(""),
+            );
+            alloc.insert(name, (ca, ma));
+        }
+    }
+    let nm_ar = KubeApiResource {
+        group: "metrics.k8s.io".into(),
+        version: "v1beta1".into(),
+        api_version: "metrics.k8s.io/v1beta1".into(),
+        kind: "NodeMetrics".into(),
+        plural: "nodes".into(),
+    };
+    let api: Api<DynamicObject> = Api::all_with(client, &nm_ar);
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| format!("metrics API unavailable: {e}"))?;
+    Ok(list
+        .items
+        .iter()
+        .map(|m| {
+            let name = m.metadata.name.clone().unwrap_or_default();
+            let v = serde_json::to_value(m).unwrap_or_default();
+            let cpu = parse_cpu(v.pointer("/usage/cpu").and_then(|x| x.as_str()).unwrap_or(""));
+            let mem = parse_mem(v.pointer("/usage/memory").and_then(|x| x.as_str()).unwrap_or(""));
+            let (ca, ma) = alloc.get(&name).copied().unwrap_or((0, 0));
+            NodeStat {
+                name,
+                cpu,
+                mem,
+                cpu_pct: if ca > 0 { cpu * 100 / ca } else { 0 },
+                mem_pct: if ma > 0 { mem * 100 / ma } else { 0 },
+            }
+        })
+        .collect())
+}
+
 /// Live usage from metrics.k8s.io joined with the requests/limits the
 /// background indexer collected — feeds the live CPU / %CPU/R /
 /// %CPU/L / MEM / %MEM/R / %MEM/L pod columns.

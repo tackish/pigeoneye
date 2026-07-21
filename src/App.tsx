@@ -112,6 +112,14 @@ interface PodStat {
   mem_l: number;
 }
 
+interface NodeStat {
+  name: string;
+  cpu: number;
+  mem: number;
+  cpu_pct: number;
+  mem_pct: number;
+}
+
 interface EventInfo {
   type_: string;
   reason: string;
@@ -518,6 +526,7 @@ function cmpCells(a: string, b: string): number {
 }
 
 const POD_STAT_COLS = ["CPU", "%CPU/R", "%CPU/L", "MEM", "%MEM/R", "%MEM/L"];
+const NODE_STAT_COLS = ["CPU", "%CPU", "MEM", "%MEM"];
 
 /// Resource aliases for the `:` command.
 const KIND_ALIASES: Record<string, string> = {
@@ -998,6 +1007,19 @@ function App() {
     .then(setForwards)
     .catch(() => {});
   const [podStats, setPodStats] = createSignal<Map<string, PodStat> | null>(null);
+  const [nodeStats, setNodeStats] = createSignal<Map<string, NodeStat> | null>(
+    null,
+  );
+  async function loadNodeStats(ctx: string) {
+    try {
+      const stats = await invoke<NodeStat[]>("node_stats", { context: ctx });
+      if (active() === ctx && kindIs("", "Node")) {
+        setNodeStats(new Map(stats.map((s) => [s.name, s])));
+      }
+    } catch {
+      /* metrics API not installed — columns just show "-" */
+    }
+  }
   const [sortCol, setSortCol] = createSignal<number | null>(null);
   const [colsOpen, setColsOpen] = createSignal(false);
   const [hiddenCols, setHiddenCols] = createSignal<Record<string, string[]>>(
@@ -1712,6 +1734,7 @@ function App() {
     setMatched(null);
     stopWatch();
     setPodStats(null);
+    setNodeStats(null);
     setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
     setColFilters({});
@@ -1772,6 +1795,7 @@ function App() {
             });
         }
       }
+      if (rt.group === "" && rt.kind === "Node") void loadNodeStats(ctx);
       const started = await startWatch(
         ctx,
         rt,
@@ -1810,6 +1834,7 @@ function App() {
         setStreaming(t.truncated);
         setTable(t);
         if (rt.group === "" && rt.kind === "Pod") void loadPodStats(ctx, ns);
+        if (rt.group === "" && rt.kind === "Node") void loadNodeStats(ctx);
         void startWatch(
           ctx,
           rt,
@@ -2425,7 +2450,7 @@ function App() {
   /// what made search collapse.
   // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
   let dispCache = new Map<TableRow, DisplayRow>();
-  let dispCacheStats: Map<string, PodStat> | null = null;
+  let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
   const baseRows = createMemo(() => {
     const t = table();
     const rt = selected();
@@ -2440,12 +2465,16 @@ function App() {
       cols = [...cols.slice(0, statAt), ...POD_STAT_COLS, ...cols.slice(statAt)];
     }
     const nodeView = rt.group === "" && rt.kind === "Node";
+    const nstats = nodeView ? nodeStats() : null;
+    if (nstats) cols = [...cols, ...NODE_STAT_COLS];
     if (nodeView) cols = [...cols, "AZ"];
+    // One object identifies "the stats in play" for the row cache.
+    const activeStats = stats ?? nstats;
 
     // Reuse the display row for any TableRow object that hasn't
     // changed identity — a watch flush replaces only touched rows, so
     // this rebuilds a handful instead of all 24k.
-    const prev = dispCacheStats === stats ? dispCache : null;
+    const prev = dispCacheStats === activeStats ? dispCache : null;
     const rows: DisplayRow[] = t.rows.map((r) => {
       const hit = prev?.get(r);
       if (hit) return hit;
@@ -2465,6 +2494,16 @@ function App() {
           : ["-", "-", "-", "-", "-", "-"];
         cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
       }
+      if (nstats) {
+        const ns = nstats.get(r.name);
+        cells = [
+          ...cells,
+          ns ? fmtCpu(ns.cpu) : "-",
+          ns ? `${ns.cpu_pct}%` : "-",
+          ns ? fmtMem(ns.mem) : "-",
+          ns ? `${ns.mem_pct}%` : "-",
+        ];
+      }
       if (nodeView) cells = [...cells, zoneOf(r.labels)];
       const hay = (
         cells.join(" ") +
@@ -2478,7 +2517,7 @@ function App() {
     const next = new Map<TableRow, DisplayRow>();
     for (const d of rows) next.set(d.row, d);
     dispCache = next;
-    dispCacheStats = stats;
+    dispCacheStats = activeStats;
     return { cols, rows };
   });
 
