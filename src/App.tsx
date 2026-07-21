@@ -4002,17 +4002,17 @@ function App() {
                   <Show when={live()}>
                     <span class="live-dot" title="live: updates arrive as they happen" />
                   </Show>
-                  {rowCount()} items
+                  {rowCount()} {selected()?.plural ?? "items"}
                   <Show when={dsCount() > 0}>
-                    <span class="dim" title="DaemonSet pods (one per node) are moved to the bottom of the list">
+                    <span class="dim" title="DaemonSet pods (one per node) are sorted to the bottom">
                       {" · "}
-                      {dsCount()} daemonset at bottom
+                      {dsCount()} daemonset
                     </span>
                   </Show>
                   <Show when={streaming()}>
                     <span class="dim loading-more">
                       <span class="badge-spin" />
-                      loading rows…
+                      loading {selected()?.plural ?? "more"}…
                     </span>
                   </Show>
                 </span>
