@@ -1793,6 +1793,43 @@ pub async fn apply_resource(
     Ok(())
 }
 
+/// Server-side dry-run apply: runs the manifest through the API server
+/// (validation, admission webhooks, defaulting, immutability, quota)
+/// WITHOUT persisting, and returns the resulting object as YAML — the
+/// GUI equivalent of `kubectl apply --dry-run=server`.
+pub async fn dry_run_apply(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    name: String,
+    yaml: String,
+) -> Result<String, String> {
+    require_namespace(&rt, &namespace)?;
+    let value: serde_json::Value = serde_yaml::from_str(&yaml).map_err(err)?;
+    let client = client(state, &context).await?;
+    let api = dyn_api(client, &rt, namespace.as_deref());
+    let pp = PatchParams {
+        dry_run: true,
+        force: true,
+        field_manager: Some("pigeoneye".into()),
+        ..Default::default()
+    };
+    let result: DynamicObject = api
+        .patch(&name, &pp, &Patch::Apply(&value))
+        .await
+        .map_err(err)?;
+    let mut v = serde_json::to_value(&result).map_err(err)?;
+    // Trim the noise so the returned manifest reads like a desired state.
+    if let Some(m) = v.pointer_mut("/metadata").and_then(|m| m.as_object_mut()) {
+        for k in SERVER_MANAGED_META {
+            m.remove(k);
+        }
+    }
+    v.as_object_mut().map(|o| o.remove("status"));
+    serde_yaml::to_string(&v).map_err(err)
+}
+
 /// Create a brand-new object from a manifest (the "New" flow). A plain
 /// POST, so the API server rejects it if the name is already taken —
 /// exactly what you want for create, versus apply's upsert. Returns the

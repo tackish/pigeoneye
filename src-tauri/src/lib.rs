@@ -130,6 +130,18 @@ async fn apply_resource(
 }
 
 #[tauri::command]
+async fn dry_run_apply(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+    name: String,
+    yaml: String,
+) -> Result<String, String> {
+    k8s::dry_run_apply(&state, context, resource, namespace, name, yaml).await
+}
+
+#[tauri::command]
 async fn create_resource(
     state: State<'_, AppState>,
     context: String,
@@ -440,6 +452,7 @@ pub fn run() {
             watch_stop,
             get_resource,
             apply_resource,
+            dry_run_apply,
             create_resource,
             delete_resource,
             cordon_node,

@@ -2005,6 +2005,19 @@ details.fold[open] > summary::before {
   margin: 6px 0 10px;
 }
 
+.dryrun-out {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--editor-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-height: 55vh;
+  overflow: auto;
+  white-space: pre;
+}
+
 .secret-data {
   display: flex;
   flex-direction: column;

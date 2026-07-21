@@ -1282,6 +1282,31 @@ function App() {
   const [findQ, setFindQ] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const [secretShown, setSecretShown] = createSignal(false);
+  const [dryRun, setDryRun] = createSignal<{ ok: boolean; text: string } | null>(
+    null,
+  );
+  function runDryRun() {
+    const rt = selected();
+    const d = detail();
+    const ctx = active();
+    if (!rt || !d || !ctx) return;
+    setActionBusy("dryrun");
+    void invoke<string>("dry_run_apply", {
+      context: ctx,
+      resource: rt,
+      namespace: d.namespace,
+      name: d.name,
+      yaml: yamlText(),
+    })
+      .then((text) => {
+        setActionBusy(null);
+        setDryRun({ ok: true, text });
+      })
+      .catch((e) => {
+        setActionBusy(null);
+        setDryRun({ ok: false, text: prettyError(String(e)) });
+      });
+  }
 
   /// Copy the manifest as shown, so it can be pasted into a file or a
   /// PR without going through the editor's selection.
@@ -3045,7 +3070,8 @@ function App() {
         else setNewOpen(false);
         return;
       }
-      if (colMenu()) setColMenu(null);
+      if (dryRun()) setDryRun(null);
+      else if (colMenu()) setColMenu(null);
       else if (colsOpen()) setColsOpen(false);
       else if (settingsOpen()) setSettingsOpen(false);
       else if (pickMode()) setPickMode(null);
@@ -5180,6 +5206,14 @@ function App() {
                     </button>
                     <button
                       class="btn"
+                      title="server dry-run: validate without persisting"
+                      disabled={actionBusy() !== null}
+                      onClick={runDryRun}
+                    >
+                      {actionBusy() === "dryrun" ? "checking…" : "dry-run"}
+                    </button>
+                    <button
+                      class="btn"
                       disabled={
                         actionBusy() !== null || yamlText() === detail()!.yaml
                       }
@@ -5716,6 +5750,35 @@ function App() {
                 <p class="dim new-foot">
                   <b>↑↓</b> section · <b>↵</b> {newSec() === "editor" ? "edit" : newSec() === "namespace" ? "pick ns" : "run"} · <b>esc</b> {newNsOpen() ? "close list" : "close"} · <b>⌘↵</b> create
                 </p>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={dryRun()}>
+            <div class="modal-backdrop" onClick={() => setDryRun(null)}>
+              <div
+                class="modal new-modal"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <h3>
+                  {dryRun()!.ok ? "✓ dry-run passed" : "dry-run failed"}
+                  <span class="dim gv">server-side, not persisted</span>
+                </h3>
+                <Show
+                  when={dryRun()!.ok}
+                  fallback={<div class="new-err">{dryRun()!.text}</div>}
+                >
+                  <p class="dim new-hint">
+                    The API server accepted the manifest. Below is the object
+                    it would produce (defaults and admission applied):
+                  </p>
+                  <pre class="dryrun-out">{dryRun()!.text}</pre>
+                </Show>
+                <div class="modal-actions">
+                  <button class="btn primary" onClick={() => setDryRun(null)}>
+                    close
+                  </button>
+                </div>
               </div>
             </div>
           </Show>
