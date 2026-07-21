@@ -516,6 +516,30 @@ function sortVal(v: string): number | null {
   return null;
 }
 
+/// Split a search query into plain substrings, regexes, and negations.
+/// `!term` excludes; a token with regex metacharacters is a (case-
+/// insensitive, since the haystack is lowercased) regex; else substring.
+function parseQuery(raw: string): {
+  poss: string[];
+  res: RegExp[];
+  negs: string[];
+} {
+  const poss: string[] = [];
+  const negs: string[] = [];
+  const res: RegExp[] = [];
+  for (const t of raw.toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (t.startsWith("!") && t.length > 1) negs.push(t.slice(1));
+    else if (/[.*+?^${}()|[\]\\]/.test(t)) {
+      try {
+        res.push(new RegExp(t));
+      } catch {
+        poss.push(t);
+      }
+    } else poss.push(t);
+  }
+  return { poss, res, negs };
+}
+
 function cmpCells(a: string, b: string): number {
   const ka = sortVal(a);
   const kb = sortVal(b);
@@ -1689,10 +1713,17 @@ function App() {
       setMatched(null);
       return;
     }
+    // Only the plain substring terms go to the backend deep index;
+    // regex/negation are applied on the visible haystack in view().
+    const backendQ = parseQuery(value).poss.join(" ");
     filterTimer = window.setTimeout(async () => {
       try {
+        if (!backendQ) {
+          if (seq === filterSeq) setMatched(new Set<string>());
+          return;
+        }
         // Seeded matches (name/labels/cells) land instantly…
-        const quick = await invoke<string[]>("filter_rows", { query: value });
+        const quick = await invoke<string[]>("filter_rows", { query: backendQ });
         if (seq === filterSeq) setMatched(new Set(quick));
         // …then the full-object index is built once per list, so a
         // plain browse never pays for it.
@@ -1708,8 +1739,8 @@ function App() {
             });
           }
           await indexPromise;
-          const latest = rowFilter();
-          if (latest.trim()) {
+          const latest = parseQuery(rowFilter()).poss.join(" ");
+          if (latest) {
             setMatched(new Set(await invoke<string[]>("filter_rows", { query: latest })));
           }
         }
@@ -2547,20 +2578,26 @@ function App() {
         rows: [] as DisplayRow[],
       };
 
-    const terms = rowFilter().toLowerCase().split(/\s+/).filter(Boolean);
+    const raw = rowFilter().trim();
     let out: DisplayRow[];
-    if (!terms.length) {
+    if (!raw) {
       out = b.rows;
     } else {
+      // Query supports plain substrings, /regex/ tokens, and !negation.
       // A row survives if it matches on visible fields (name/namespace/
-      // cells/labels) OR the backend full-text index (deep fields:
-      // annotations, env, spec). The backend hits arrive keyed by
-      // namespace/name so they stay aligned through watch reordering.
+      // cells/labels) OR the backend full-text index (deep fields), then
+      // must satisfy every regex and no negation. Backend hits arrive
+      // keyed by namespace/name so they stay aligned through reordering.
+      const { poss, res, negs } = parseQuery(raw);
       const extra = matched();
+      const passExtra = (h: string) =>
+        res.every((re) => re.test(h)) && !negs.some((n) => h.includes(n));
       const nameHit = (r: DisplayRow) =>
-        terms.every((x) => r.row.name.toLowerCase().includes(x));
-      const visibleHit = (r: DisplayRow) => terms.every((x) => r.hay.includes(x));
-      const deepHit = (r: DisplayRow) => extra?.has(rowKeyOf(r.row)) ?? false;
+        poss.every((x) => r.row.name.toLowerCase().includes(x));
+      const visibleHit = (r: DisplayRow) =>
+        poss.every((x) => r.hay.includes(x)) && passExtra(r.hay);
+      const deepHit = (r: DisplayRow) =>
+        (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r.hay);
       out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
       // Rank by why it matched: name first, then other visible fields,
       // then deep-field-only hits (which the user can't see, so they'd
