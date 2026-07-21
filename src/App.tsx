@@ -3032,7 +3032,31 @@ function App() {
       <h1>PigeonEye</h1>
       <p class="dim">pick a cluster context to connect</p>
       <Show when={error()}>
-        <p class="empty-error">{error()}</p>
+        <div class="launcher-error">
+          <p class="empty-error">{prettyError(error()!)}</p>
+          <Show when={authHint()?.can_login}>
+            <div class="auth-actions">
+              <button
+                class="btn primary"
+                disabled={loggingIn()}
+                onClick={() => void runLogin()}
+              >
+                {loggingIn()
+                  ? "logging in…"
+                  : authHint()!.kind === "aws-sso"
+                    ? `Log in with SSO${authHint()!.context ? ` (${authHint()!.context})` : ""}`
+                    : "Log in"}
+              </button>
+              <Show when={authHint()!.command}>
+                <code class="auth-cmd">{authHint()!.command}</code>
+              </Show>
+            </div>
+          </Show>
+          <details class="error-detail">
+            <summary>show details</summary>
+            <pre>{error()}</pre>
+          </details>
+        </div>
       </Show>
       <input
         class="search launcher-search"
