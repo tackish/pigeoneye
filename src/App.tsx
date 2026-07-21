@@ -585,6 +585,29 @@ function App() {
       setLoggingIn(false);
     }
   }
+  /// Turn a raw kube/exec error into one readable line. The exec
+  /// failure dumps the whole get-token command and a Rust Output{...}
+  /// struct; the part that matters is the plugin's stderr.
+  function prettyError(msg: string): string {
+    // pull the exec plugin's own stderr out of the Output{…} dump
+    const stderr = msg.match(/stderr:\s*"((?:\\.|[^"\\])*)"/);
+    if (stderr) {
+      const text = stderr[1].replace(/\\n/g, " ").replace(/\\"/g, '"').trim();
+      if (/SSO Token|sso/i.test(text)) return "AWS SSO session expired — log in to renew it.";
+      if (text) return text;
+    }
+    if (/exit status: 255|get-token/i.test(msg))
+      return "the cluster's auth command failed — your credentials have likely expired.";
+    if (/401|Unauthorized/i.test(msg)) return "unauthorized — the token was rejected.";
+    if (/403|Forbidden/i.test(msg)) return "forbidden — this account lacks access.";
+    if (/no such host|dns/i.test(msg)) return "cannot resolve the API server address.";
+    if (/refused|timed out|timeout/i.test(msg))
+      return "cannot reach the API server (connection refused or timed out).";
+    if (/certificate|x509/i.test(msg)) return "the server certificate could not be verified.";
+    // collapse a long single-line dump
+    return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
+  }
+
   const isAuthError = (msg: string) =>
     /401|403|Unauthorized|Forbidden|credential|token|expired|exec plugin|no such host|refused|timed out|certificate/i.test(
       msg,
@@ -3208,14 +3231,21 @@ function App() {
       <Show when={error()}>
         <div class="error">
           <div class="error-body">
-            <Show when={isAuthError(error()!)}>
-              <b>cluster access failed — credentials may have expired.</b>{" "}
+            <Show
+              when={authHint()?.can_login}
+              fallback={
+                <details class="error-detail">
+                  <summary>{prettyError(error()!)}</summary>
+                  <pre>{error()}</pre>
+                </details>
+              }
+            >
+              {/* the login card below carries the explanation */}
+              <span>{authHint()!.message}</span>
             </Show>
-            {error()}
           </div>
           <Show when={authHint()?.can_login}>
             <div class="auth-login">
-              <div class="auth-msg">{authHint()!.message}</div>
               <div class="auth-actions">
                 <button
                   class="btn primary"

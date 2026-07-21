@@ -321,10 +321,35 @@ body {
 
 .error-body {
   flex: 1;
+  min-width: 200px;
+}
+
+.error-detail > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--error-fg);
+}
+
+.error-detail > summary::before {
+  content: "▸ ";
+  color: var(--dim);
+}
+
+.error-detail[open] > summary::before {
+  content: "▾ ";
+}
+
+.error-detail > pre {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-radius: 4px;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 8em;
+  max-height: 10em;
   overflow-y: auto;
+  font-size: 11px;
+  color: var(--dim);
 }
 
 .error-actions {
