@@ -81,6 +81,7 @@ interface ResourceDetail {
   links: RefLink[];
   has_pod_selector: boolean;
   pod_selector: string | null;
+  secret_data?: [string, string][];
   replicas: number | null;
   ready_replicas: number | null;
   yaml: string;
@@ -1234,6 +1235,7 @@ function App() {
   // find-in-resource: highlights across manifest, labels, annotations, status
   const [findQ, setFindQ] = createSignal("");
   const [copied, setCopied] = createSignal(false);
+  const [secretShown, setSecretShown] = createSignal(false);
 
   /// Copy the manifest as shown, so it can be pasted into a file or a
   /// PR without going through the editor's selection.
@@ -2044,6 +2046,7 @@ function App() {
     const key = `${namespace ?? ""}/${name}`;
     setDetailKey(key);
     setDetail(null);
+    setSecretShown(false); // secrets start hidden on every open
     setEvents([]);
     setActionMsg(null);
     setActionErr(null);
@@ -4816,6 +4819,42 @@ function App() {
                     </span>
                   </div>
                   </div>
+
+                  <Show when={(detail()!.secret_data?.length ?? 0) > 0}>
+                    <div class="psec">
+                      <div class="section-title">
+                        Data
+                        <button
+                          class="btn sm"
+                          onClick={() => setSecretShown(!secretShown())}
+                        >
+                          {secretShown() ? "hide" : "reveal"}
+                        </button>
+                        <span class="dim"> — base64-decoded</span>
+                      </div>
+                      <div class="secret-data">
+                        <For each={detail()!.secret_data}>
+                          {([k, v]) => (
+                            <div class="secret-row">
+                              <span class="secret-key">{k}</span>
+                              <span class="secret-val">
+                                {secretShown() ? v : "•".repeat(Math.min(v.length, 24))}
+                              </span>
+                              <button
+                                class="btn sm"
+                                title="copy the decoded value"
+                                onClick={() =>
+                                  void navigator.clipboard.writeText(v)
+                                }
+                              >
+                                copy
+                              </button>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
 
                   <Show when={Object.keys(detail()!.labels).length > 0}>
                     <div class="psec" data-sec="labels" classList={{ cur: panelSec() === "labels" }}>

@@ -199,6 +199,11 @@ pub struct ResourceDetail {
     /// "pods →" jump lists exactly the owned pods instead of guessing
     /// from the name. None when the object selects nothing.
     pub pod_selector: Option<String>,
+    /// Secret only: each data key with its base64-decoded value (UTF-8;
+    /// non-text values are noted), so the UI can reveal them without the
+    /// user hand-decoding base64.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_data: Vec<(String, String)>,
     /// Scalable workloads: desired and currently ready replicas.
     pub replicas: Option<i64>,
     pub ready_replicas: Option<i64>,
@@ -1609,6 +1614,11 @@ pub async fn get_resource(
             && rt.kind != "PersistentVolumeClaim")
         .then(|| label_selector_string(&v))
         .filter(|s| !s.is_empty()),
+        secret_data: if rt.group.is_empty() && rt.kind == "Secret" {
+            decode_secret_data(&v)
+        } else {
+            Vec::new()
+        },
         ports: v
             .pointer("/spec/containers")
             .and_then(|c| c.as_array())
@@ -2567,6 +2577,32 @@ pub async fn pf_stop(state: &AppState, id: u32) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Decode a Secret's `data` map (base64) into (key, value) pairs, sorted
+/// by key. Binary values that aren't valid UTF-8 are shown as a size
+/// note rather than mojibake.
+fn decode_secret_data(v: &serde_json::Value) -> Vec<(String, String)> {
+    use base64::Engine;
+    let Some(map) = v.pointer("/data").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .map(|(k, val)| {
+            let decoded = val
+                .as_str()
+                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                .map(|bytes| match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => format!("<{} bytes of binary data>", e.into_bytes().len()),
+                })
+                .unwrap_or_else(|| "<invalid base64>".to_string());
+            (k.clone(), decoded)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Build a Kubernetes label-selector string from an object's

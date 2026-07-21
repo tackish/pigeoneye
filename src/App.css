@@ -2005,6 +2005,37 @@ details.fold[open] > summary::before {
   margin: 6px 0 10px;
 }
 
+.secret-data {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.secret-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.secret-key {
+  color: var(--key);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  min-width: 120px;
+  word-break: break-all;
+}
+
+.secret-val {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg);
+}
+
 .node-shell-info {
   margin-top: 12px;
   padding: 10px 12px;
