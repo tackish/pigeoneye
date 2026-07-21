@@ -559,6 +559,16 @@ function App() {
       .filter((c) => !q || c.name.toLowerCase().includes(q))
       .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   });
+  // Keep the keyboard-selected context in view as the cursor moves.
+  createEffect(() => {
+    if (tabs().length) return;
+    const i = pickerIdx();
+    queueMicrotask(() =>
+      document
+        .querySelectorAll(".launcher-item")
+        [i]?.scrollIntoView({ block: "nearest" }),
+    );
+  });
   const [newPath, setNewPath] = createSignal("");
   const [theme, setTheme] = createSignal<"dark" | "light">(
     (localStorage.getItem("pigeoneye.theme") as "dark" | "light") ?? "dark",
@@ -2589,6 +2599,31 @@ function App() {
   function onGlobalKey(e: KeyboardEvent) {
     const el = e.target as HTMLElement | null;
     const typing = el?.closest("input, textarea, select, [contenteditable], .cm-editor, .xterm");
+    // Launcher screen: arrows/Enter drive the context list no matter
+    // where focus sits, so it's fully keyboard-first. Letters still fall
+    // through to the search box (which filters via onInput).
+    if (tabs().length === 0) {
+      if (settingsOpen()) return;
+      const list = pickerList();
+      if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "n")) {
+        e.preventDefault();
+        setPickerIdx(Math.min(pickerIdx() + 1, list.length - 1));
+      } else if (e.key === "ArrowUp" || (e.ctrlKey && e.key === "p")) {
+        e.preventDefault();
+        setPickerIdx(Math.max(pickerIdx() - 1, 0));
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        setPickerIdx(0);
+      } else if (e.key === "End") {
+        e.preventDefault();
+        setPickerIdx(list.length - 1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const c = list[pickerIdx()];
+        if (c) void openContext(c.name);
+      }
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
       e.preventDefault();
       toggleSidebar();
@@ -3341,19 +3376,6 @@ function App() {
         onInput={(e) => {
           setPickerQ(e.currentTarget.value);
           setPickerIdx(0);
-        }}
-        onKeyDown={(e) => {
-          const list = pickerList();
-          if (e.key === "ArrowDown") {
-            e.preventDefault();
-            setPickerIdx(Math.min(pickerIdx() + 1, list.length - 1));
-          } else if (e.key === "ArrowUp") {
-            e.preventDefault();
-            setPickerIdx(Math.max(pickerIdx() - 1, 0));
-          } else if (e.key === "Enter") {
-            const c = list[pickerIdx()];
-            if (c) void openContext(c.name);
-          }
         }}
       />
       <div class="launcher-list">
