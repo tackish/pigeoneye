@@ -1055,22 +1055,43 @@ function App() {
   );
   const [colMenuIdx, setColMenuIdx] = createSignal(-1); // keyboard cursor in the value list
   // Distinct values (+counts) of the open column, filtered by the search.
-  const colMenuValues = createMemo<[string, number][]>(() => {
+  // High-cardinality columns (IP, NODE — nearly every row unique) would
+  // build and render tens of thousands of entries and freeze, so the
+  // scan stops once it passes a cap and reports `overflow` instead; those
+  // columns offer sorting only, not a value list.
+  const COL_VALUE_CAP = 200;
+  const colMenuData = createMemo<{
+    values: [string, number][];
+    overflow: boolean;
+  }>(() => {
     const name = colMenu();
-    if (!name) return [];
+    if (!name) return { values: [], overflow: false };
     const b = baseRows();
     const ci = b.cols.indexOf(name);
-    if (ci < 0) return [];
+    if (ci < 0) return { values: [], overflow: false };
     const counts = new Map<string, number>();
+    let overflow = false;
     for (const r of b.rows) {
       const v = r.cells[ci] ?? "";
-      counts.set(v, (counts.get(v) ?? 0) + 1);
+      const cur = counts.get(v);
+      if (cur === undefined) {
+        if (counts.size >= COL_VALUE_CAP) {
+          overflow = true;
+          break; // too many distinct — bail before it freezes
+        }
+        counts.set(v, 1);
+      } else counts.set(v, cur + 1);
     }
+    if (overflow) return { values: [], overflow: true };
     const q = colMenuQ().toLowerCase().trim();
-    return [...counts.entries()]
-      .filter(([v]) => !q || v.toLowerCase().includes(q))
-      .sort((a, z) => cmpCells(a[0], z[0]));
+    return {
+      values: [...counts.entries()]
+        .filter(([v]) => !q || v.toLowerCase().includes(q))
+        .sort((a, z) => cmpCells(a[0], z[0])),
+      overflow: false,
+    };
   });
+  const colMenuValues = () => colMenuData().values;
   function toggleColValue(name: string, val: string) {
     const cur = colFilters();
     const set = new Set(cur[name] ?? []);
@@ -5527,7 +5548,16 @@ function App() {
               <Show
                 when={colIsNumeric(colMenu()!)}
                 fallback={
-                  <>
+                  <Show
+                    when={!colMenuData().overflow}
+                    fallback={
+                      <p class="dim col-num-hint">
+                        Too many distinct values to list ({COL_VALUE_CAP}+).
+                        Click the header to sort, or use the search box above
+                        to narrow the rows.
+                      </p>
+                    }
+                  >
                     <input
                       autocomplete="off"
                       autocorrect="off"
@@ -5571,7 +5601,7 @@ function App() {
                         </p>
                       </Show>
                     </div>
-                  </>
+                  </Show>
                 }
               >
                 {/* Numeric column: compare instead of listing every number. */}
