@@ -540,6 +540,10 @@ pub async fn discover(state: &AppState, context: String) -> Result<Vec<ResourceT
 /// and costs 15MB at 1000 rows, so it stays small.
 const PAGE_LIMIT_CELLS: u32 = 2000;
 const PAGE_LIMIT_META: u32 = 500;
+/// Safety cap on how many rows the background streamer will pull for one
+/// list. Beyond this the list is served partial and left uncached. Set
+/// well above real clusters (~24k pods) so they finish and cache.
+const MAX_STREAM_ROWS: usize = 120_000;
 
 fn api_resource(rt: &ResourceType) -> KubeApiResource {
     KubeApiResource {
@@ -1089,11 +1093,14 @@ pub async fn list_resources(
                 })
             };
             let mut in_flight = first_token.map(spawn_fetch);
-            let mut guard = 0;
             while let Some(handle) = in_flight.take() {
-                guard += 1;
-                if guard > 40 {
-                    break; // hard stop: ~80k rows
+                // Cap on rows, not pages: a page holds 500 (Metadata) or
+                // 2000 (cells) rows, so a page cap silently truncated
+                // Metadata lists (all-namespace pods) at ~20k — the list
+                // never completed and so never cached. This lets a 24k-pod
+                // cluster finish and be cached.
+                if all_rows.len() > MAX_STREAM_ROWS {
+                    break; // safety cap; a partial list is not cached
                 }
                 let Ok(Ok(page)) = handle.await else {
                     break;
