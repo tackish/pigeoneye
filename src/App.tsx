@@ -280,6 +280,20 @@ spec:
           image: nginx:latest   # 👈 image
           ports:
             - containerPort: 80
+          volumeMounts:
+            - name: data
+              mountPath: /data    # 👈 where the volume mounts
+  # A PVC is created automatically per replica from this template — you
+  # don't pre-create one. Drop this whole block for a stateless set.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: gp3    # 👈 uncomment to pin a StorageClass
+        resources:
+          requests:
+            storage: 1Gi          # 👈 size per replica
 `,
   "/Service": `apiVersion: v1
 kind: Service
@@ -3100,6 +3114,15 @@ function App() {
         clickSort(idx);
         return;
       }
+    }
+    // A focused button/link (e.g. the + New button reached by Tab)
+    // activates on Enter/Space itself — don't let the table hijack those
+    // to open a row detail or toggle a mark.
+    if (
+      (e.key === "Enter" || e.key === " ") &&
+      el?.closest("button, a, [role=button]")
+    ) {
+      return;
     }
     if (e.key === ":") {
       e.preventDefault();
