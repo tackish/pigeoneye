@@ -1093,6 +1093,12 @@ pub async fn list_resources(
                 })
             };
             let mut in_flight = first_token.map(spawn_fetch);
+            // Once the user navigates away this drops to false: we stop
+            // feeding the (now-defunct) view and search cache, but keep
+            // pulling pages so the completed list still lands in the cache
+            // — a later visit then finds it whole instead of re-streaming
+            // from page one.
+            let mut still_current = true;
             while let Some(handle) = in_flight.take() {
                 // Cap on rows, not pages: a page holds 500 (Metadata) or
                 // 2000 (cells) rows, so a page cap silently truncated
@@ -1100,10 +1106,10 @@ pub async fn list_resources(
                 // never completed and so never cached. This lets a 24k-pod
                 // cluster finish and be cached.
                 if all_rows.len() > MAX_STREAM_ROWS {
-                    break; // safety cap; a partial list is not cached
+                    return; // safety cap; a partial list is not cached
                 }
                 let Ok(Ok(page)) = handle.await else {
-                    break;
+                    return; // fetch failed; leave the list uncached
                 };
                 let token = continue_token(&page);
                 // fire the next request before parsing this one
@@ -1118,28 +1124,31 @@ pub async fn list_resources(
                     })
                     .await
                 else {
-                    break;
+                    return;
                 };
-                {
+                if still_current {
                     let mut sc = search.write().await;
                     if sc.generation != generation {
-                        return; // the user moved on
+                        still_current = false; // superseded — cache only now
+                    } else {
+                        sc.keys.extend(keys);
+                        sc.blobs.extend(blobs);
+                        // new rows are not in the full-text index yet
+                        sc.indexed = false;
                     }
-                    sc.keys.extend(keys);
-                    sc.blobs.extend(blobs);
-                    // new rows are not in the full-text index yet
-                    sc.indexed = false;
                 }
                 let done = token.is_none();
                 all_rows.extend(rows.iter().cloned());
-                let payload = serde_json::to_value(RowPage {
-                    generation,
-                    rows: std::mem::take(&mut rows),
-                    done,
-                })
-                .unwrap_or_default();
-                if chan.send(payload).is_err() {
-                    return;
+                if still_current {
+                    let payload = serde_json::to_value(RowPage {
+                        generation,
+                        rows: std::mem::take(&mut rows),
+                        done,
+                    })
+                    .unwrap_or_default();
+                    if chan.send(payload).is_err() {
+                        still_current = false; // the view is gone
+                    }
                 }
                 if done {
                     // Whole list is in — cache the complete snapshot + its
