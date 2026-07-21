@@ -5,18 +5,18 @@
   --bg-hover: #1c2330;
   --bg-drawer: #151a26;
   --border: #262d38;
-  --fg: #dbe2ea;
-  --dim: #79879a;
-  --accent: #aeb6c6;
-  --accent-soft: rgba(174, 182, 198, 0.12);
-  --good: #56cf87;
-  --warn: #e5c25b;
+  --fg: #e3e8f0;
+  --dim: #7a8798;
+  --accent: #7c8cff;
+  --accent-soft: rgba(124, 140, 255, 0.14);
+  --good: #4ec98a;
+  --warn: #e6c565;
   --bad: #f26d6d;
-  --key: #aeb6c6;
-  --primary-bg: #3a4354;
-  --primary-border: #5a6577;
-  --primary-fg: #e6ebf2;
-  --primary-hover: #454f62;
+  --key: #aab3c5;
+  --primary-bg: #5459db;
+  --primary-border: #7079f0;
+  --primary-fg: #f3f4ff;
+  --primary-hover: #6166e6;
   --error-bg: #351b1e;
   --error-fg: #f2a5a5;
   --error-border: #58292e;
@@ -30,6 +30,9 @@
   font-family: var(--font-ui);
   font-size: 13px;
   color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 /* Light theme, matched to the PigeonEye brand mockups:
@@ -43,16 +46,16 @@
   --border: #e2e8f0;
   --fg: #2d3748;
   --dim: #718096;
-  --accent: #4a5568;
-  --accent-soft: rgba(113, 128, 150, 0.14);
+  --accent: #6366f1;
+  --accent-soft: rgba(99, 102, 241, 0.12);
   --good: #16a34a;
   --warn: #d97706;
   --bad: #dc2626;
   --key: #4a5568;
-  --primary-bg: #4a5568;
-  --primary-border: #4a5568;
+  --primary-bg: #6366f1;
+  --primary-border: #6366f1;
   --primary-fg: #ffffff;
-  --primary-hover: #3d4759;
+  --primary-hover: #5457e0;
   --error-bg: #fdecec;
   --error-fg: #b13a3a;
   --error-border: #f3c3c3;
