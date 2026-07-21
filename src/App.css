@@ -708,6 +708,25 @@ tr.row.cursor td:first-child {
   animation: spin 0.9s linear infinite;
 }
 
+/* Inline "still loading" hint in the count badge — a small spinner makes
+   it read as a passive status, not a clickable action. */
+.loading-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 6px;
+}
+
+.badge-spin {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--bg3);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+  display: inline-block;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);

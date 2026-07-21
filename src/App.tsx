@@ -4004,13 +4004,16 @@ function App() {
                   </Show>
                   {rowCount()} items
                   <Show when={dsCount() > 0}>
-                    <span class="dim" title="DaemonSet pods (one per node) are sunk to the bottom">
-                      {" "}
-                      · {dsCount()} daemonset ↓
+                    <span class="dim" title="DaemonSet pods (one per node) are moved to the bottom of the list">
+                      {" · "}
+                      {dsCount()} daemonset at bottom
                     </span>
                   </Show>
                   <Show when={streaming()}>
-                    <span class="dim"> · loading more…</span>
+                    <span class="dim loading-more">
+                      <span class="badge-spin" />
+                      loading rows…
+                    </span>
                   </Show>
                 </span>
               </Show>
