@@ -1078,11 +1078,54 @@ function App() {
     else delete next[name];
     setColFilters(next);
   }
+  // Numeric column filters: a comparison instead of a value list, since
+  // listing every distinct number (cpu, mem, %, restarts) is useless.
+  type NumOp = ">" | ">=" | "<" | "<=" | "=";
+  const [colNumFilters, setColNumFilters] = createSignal<
+    Record<string, { op: NumOp; val: number }>
+  >({});
+  /// Leading number in a cell ("91%"→91, "9 (27d ago)"→9, "n/a"→null).
+  const cellNum = (v: string): number | null => {
+    const m = v.match(/-?\d+(?:\.\d+)?/);
+    if (!m) return null;
+    const n = parseFloat(m[0]);
+    return Number.isFinite(n) ? n : null;
+  };
+  /// A column is "numeric" if most non-blank sampled cells are plain
+  /// numbers (optionally a trailing %). Durations like "53d"/"4h20m" are
+  /// deliberately NOT numeric — comparing 4(h) vs 53(d) would be wrong.
+  const colIsNumeric = (name: string): boolean => {
+    const b = baseRows();
+    const ci = b.cols.indexOf(name);
+    if (ci < 0) return false;
+    let num = 0;
+    let tot = 0;
+    for (const r of b.rows.slice(0, 400)) {
+      const v = (r.cells[ci] ?? "").trim();
+      if (!v || v === "n/a" || v === "-" || v === "<none>") continue;
+      tot++;
+      if (/^-?\d+(?:\.\d+)?%?$/.test(v)) num++;
+    }
+    return tot >= 3 && num / tot >= 0.7;
+  };
+  function setColNum(name: string, op: NumOp, val: string) {
+    const next = { ...colNumFilters() };
+    const n = parseFloat(val);
+    if (val.trim() === "" || !Number.isFinite(n)) delete next[name];
+    else next[name] = { op, val: n };
+    setColNumFilters(next);
+  }
   function clearColFilter(name: string) {
     const next = { ...colFilters() };
     delete next[name];
     setColFilters(next);
+    const nn = { ...colNumFilters() };
+    delete nn[name];
+    setColNumFilters(nn);
   }
+  /// Whether a column has any active filter (value-set or numeric).
+  const colHasFilter = (name: string) =>
+    (colFilters()[name]?.size ?? 0) > 0 || !!colNumFilters()[name];
   const [cmdOpen, setCmdOpen] = createSignal(false);
   const [cmdText, setCmdText] = createSignal("");
   const [cmdIdx, setCmdIdx] = createSignal(0);
@@ -1645,6 +1688,7 @@ function App() {
     setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
     setColFilters({});
+    setColNumFilters({});
     setColMenu(null);
     setCursor(0);
     setMarked(new Set<string>());
@@ -2447,6 +2491,28 @@ function App() {
     if (activeCF.length) {
       out = out.filter((r) =>
         activeCF.every(([ci, set]) => set.has(r.cells[ci] ?? "")),
+      );
+    }
+    // Numeric comparison filters (>, ≥, <, ≤, =). A cell with no number
+    // (n/a, -) never satisfies a numeric filter.
+    const activeNF = Object.entries(colNumFilters())
+      .map(([name, f]) => [b.cols.indexOf(name), f] as const)
+      .filter(([ci]) => ci >= 0);
+    if (activeNF.length) {
+      out = out.filter((r) =>
+        activeNF.every(([ci, f]) => {
+          const n = cellNum(r.cells[ci] ?? "");
+          if (n === null) return false;
+          return f.op === ">"
+            ? n > f.val
+            : f.op === ">="
+              ? n >= f.val
+              : f.op === "<"
+                ? n < f.val
+                : f.op === "<="
+                  ? n <= f.val
+                  : n === f.val;
+        }),
       );
     }
 
@@ -4275,10 +4341,8 @@ function App() {
                               </span>
                               <button
                                 class="col-filt-btn"
-                                classList={{
-                                  on: (colFilters()[c]?.size ?? 0) > 0,
-                                }}
-                                title="filter this column's values"
+                                classList={{ on: colHasFilter(c) }}
+                                title="filter this column"
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   if (colMenu() === c) {
@@ -5349,51 +5413,102 @@ function App() {
               <div class="col-menu-head">
                 filter <b>{colMenu()}</b>
               </div>
-              <input
-                autocomplete="off"
-                autocorrect="off"
-                autocapitalize="off"
-                spellcheck={false}
-                class="search"
-                placeholder="filter values…"
-                ref={(el) => setTimeout(() => el.focus())}
-                value={colMenuQ()}
-                onInput={(e) => setColMenuQ(e.currentTarget.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") setColMenu(null);
-                }}
-              />
-              <div class="col-menu-list">
-                <For each={colMenuValues()}>
-                  {([val, count]) => (
-                    <button
-                      class="ns-item col-val"
-                      onClick={() => toggleColValue(colMenu()!, val)}
-                    >
-                      <span
-                        class="mark-box"
-                        classList={{
-                          on: colFilters()[colMenu()!]?.has(val) ?? false,
-                        }}
-                      />
-                      <span class="col-val-txt">{val || "∅ (empty)"}</span>
-                      <span class="dim col-val-n">{count}</span>
-                    </button>
-                  )}
-                </For>
-                <Show when={colMenuValues().length === 0}>
-                  <p class="dim" style={{ padding: "8px 12px" }}>
-                    no values
-                  </p>
-                </Show>
-              </div>
+              <Show
+                when={colIsNumeric(colMenu()!)}
+                fallback={
+                  <>
+                    <input
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="off"
+                      spellcheck={false}
+                      class="search"
+                      placeholder="filter values…"
+                      ref={(el) => setTimeout(() => el.focus())}
+                      value={colMenuQ()}
+                      onInput={(e) => setColMenuQ(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setColMenu(null);
+                      }}
+                    />
+                    <div class="col-menu-list">
+                      <For each={colMenuValues()}>
+                        {([val, count]) => (
+                          <button
+                            class="ns-item col-val"
+                            onClick={() => toggleColValue(colMenu()!, val)}
+                          >
+                            <span
+                              class="mark-box"
+                              classList={{
+                                on:
+                                  colFilters()[colMenu()!]?.has(val) ?? false,
+                              }}
+                            />
+                            <span class="col-val-txt">{val || "∅ (empty)"}</span>
+                            <span class="dim col-val-n">{count}</span>
+                          </button>
+                        )}
+                      </For>
+                      <Show when={colMenuValues().length === 0}>
+                        <p class="dim" style={{ padding: "8px 12px" }}>
+                          no values
+                        </p>
+                      </Show>
+                    </div>
+                  </>
+                }
+              >
+                {/* Numeric column: compare instead of listing every number. */}
+                <div class="col-num">
+                  <select
+                    class="col-num-op"
+                    value={colNumFilters()[colMenu()!]?.op ?? ">"}
+                    onChange={(e) =>
+                      setColNum(
+                        colMenu()!,
+                        e.currentTarget.value as NumOp,
+                        String(colNumFilters()[colMenu()!]?.val ?? ""),
+                      )
+                    }
+                  >
+                    <option value=">">&gt;</option>
+                    <option value=">=">&ge;</option>
+                    <option value="<">&lt;</option>
+                    <option value="<=">&le;</option>
+                    <option value="=">=</option>
+                  </select>
+                  <input
+                    type="number"
+                    class="search col-num-val"
+                    placeholder="value"
+                    ref={(el) => setTimeout(() => el.focus())}
+                    value={String(colNumFilters()[colMenu()!]?.val ?? "")}
+                    onInput={(e) =>
+                      setColNum(
+                        colMenu()!,
+                        colNumFilters()[colMenu()!]?.op ?? ">",
+                        e.currentTarget.value,
+                      )
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape" || e.key === "Enter")
+                        setColMenu(null);
+                    }}
+                  />
+                </div>
+                <p class="dim col-num-hint">
+                  rows where {colMenu()}{" "}
+                  {colNumFilters()[colMenu()!]?.op ?? ">"} value
+                </p>
+              </Show>
               <div class="col-menu-foot">
-                <Show when={(colFilters()[colMenu()!]?.size ?? 0) > 0}>
+                <Show when={colHasFilter(colMenu()!)}>
                   <button
                     class="btn sm"
                     onClick={() => clearColFilter(colMenu()!)}
                   >
-                    clear ({colFilters()[colMenu()!]?.size})
+                    clear
                   </button>
                 </Show>
                 <button class="btn sm" onClick={() => setColMenu(null)}>
