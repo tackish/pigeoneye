@@ -195,6 +195,28 @@ async fn restart_rollout(
 }
 
 #[tauri::command]
+async fn patch_resource(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+    name: String,
+    patch: serde_json::Value,
+) -> Result<(), String> {
+    k8s::patch_resource(&state, context, resource, namespace, name, patch).await
+}
+
+#[tauri::command]
+async fn trigger_cronjob(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: String,
+    name: String,
+) -> Result<String, String> {
+    k8s::trigger_cronjob(&state, context, namespace, name).await
+}
+
+#[tauri::command]
 async fn exec_start(
     state: State<'_, AppState>,
     context: String,
@@ -424,6 +446,8 @@ pub fn run() {
             drain_node,
             scale_resource,
             restart_rollout,
+            patch_resource,
+            trigger_cronjob,
             exec_start,
             node_shell_start,
             log_start,

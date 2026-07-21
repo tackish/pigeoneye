@@ -2840,6 +2840,68 @@ function App() {
     });
   }
 
+  const isCronJob = () => kindIs("batch", "CronJob");
+  const isJob = () => kindIs("batch", "Job");
+  const isArgoRollout = () => kindIs("argoproj.io", "Rollout");
+  const suspendable = () => isCronJob() || isJob();
+
+  function triggerCronJob(target?: Target) {
+    const d = target ?? currentTarget();
+    if (!d || !isCronJob()) return;
+    setDlgIdx(1);
+    setConfirm({
+      title: `Trigger ${d.name} now?`,
+      body: "Creates a one-off Job from the CronJob's template — like kubectl create job --from=cronjob.",
+      label: "Trigger",
+      danger: false,
+      run: () =>
+        void runAction("trigger", async () => {
+          const jn = await invoke<string>("trigger_cronjob", {
+            context: active(),
+            namespace: d.namespace,
+            name: d.name,
+          });
+          setActionMsg(`created ${jn} ✓`);
+        }),
+    });
+  }
+
+  function setSuspend(suspend: boolean, target?: Target) {
+    const d = target ?? currentTarget();
+    if (!d || !suspendable()) return;
+    void runAction(suspend ? "suspend" : "resume", () =>
+      invoke("patch_resource", {
+        context: active(),
+        resource: selected(),
+        namespace: d.namespace,
+        name: d.name,
+        patch: { spec: { suspend } },
+      }),
+    );
+  }
+
+  function restartArgoRollout(target?: Target) {
+    const d = target ?? currentTarget();
+    if (!d || !isArgoRollout()) return;
+    setDlgIdx(1);
+    setConfirm({
+      title: `Restart rollout ${d.name}?`,
+      body: "Sets spec.restartAt so Argo Rollouts restarts every pod.",
+      label: "Restart",
+      danger: false,
+      run: () =>
+        void runAction("restart", () =>
+          invoke("patch_resource", {
+            context: active(),
+            resource: selected(),
+            namespace: d.namespace,
+            name: d.name,
+            patch: { spec: { restartAt: new Date().toISOString() } },
+          }),
+        ),
+    });
+  }
+
   interface Target {
     namespace: string | null;
     name: string;
@@ -4722,6 +4784,16 @@ function App() {
                   </Show>
                   <Show when={restartable()}>
                     {actionBtn("restart", () => requestRestart())}
+                  </Show>
+                  <Show when={isArgoRollout()}>
+                    {actionBtn("restart", () => restartArgoRollout())}
+                  </Show>
+                  <Show when={isCronJob()}>
+                    {actionBtn("trigger", () => triggerCronJob())}
+                  </Show>
+                  <Show when={suspendable()}>
+                    {actionBtn("suspend", () => setSuspend(true))}
+                    {actionBtn("resume", () => setSuspend(false))}
                   </Show>
                   <Show when={isEvent() && detail()!.involved}>
                     {actionBtn(

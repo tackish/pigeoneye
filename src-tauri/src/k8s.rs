@@ -2251,6 +2251,77 @@ pub async fn restart_rollout(
     Ok(())
 }
 
+/// Generic merge-patch — drives suspend/resume (spec.suspend), Argo
+/// Rollout restart (spec.restartAt), and similar one-field edits.
+pub async fn patch_resource(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    name: String,
+    patch: serde_json::Value,
+) -> Result<(), String> {
+    require_namespace(&rt, &namespace)?;
+    let client = client(state, &context).await?;
+    let api = dyn_api(client, &rt, namespace.as_deref());
+    api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(err)?;
+    Ok(())
+}
+
+/// `kubectl create job --from=cronjob/<name>`: instantiate a one-off Job
+/// from a CronJob's jobTemplate, right now. Returns the new Job's name.
+pub async fn trigger_cronjob(
+    state: &AppState,
+    context: String,
+    namespace: String,
+    name: String,
+) -> Result<String, String> {
+    if namespace.is_empty() {
+        return Err("CronJob needs a namespace".into());
+    }
+    let client = client(state, &context).await?;
+    let cj_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("batch", "v1", "CronJob"));
+    let cj = Api::<DynamicObject>::namespaced_with(client.clone(), &namespace, &cj_ar)
+        .get(&name)
+        .await
+        .map_err(err)?;
+    let v = serde_json::to_value(&cj).map_err(err)?;
+    let spec = v
+        .pointer("/spec/jobTemplate/spec")
+        .cloned()
+        .ok_or("CronJob has no jobTemplate.spec")?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Job names are capped at 63 chars; leave room for the suffix.
+    let base: String = name.chars().take(40).collect();
+    let job_name = format!("{base}-manual-{:x}", nanos & 0xffff);
+    let mut meta = serde_json::json!({
+        "name": job_name,
+        "namespace": namespace,
+        "annotations": { "cronjob.kubernetes.io/instantiate": "manual" },
+    });
+    if let Some(uid) = v.pointer("/metadata/uid").and_then(|u| u.as_str()) {
+        meta["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "batch/v1", "kind": "CronJob", "name": name, "uid": uid,
+            "controller": true, "blockOwnerDeletion": true
+        }]);
+    }
+    let job_json = serde_json::json!({
+        "apiVersion": "batch/v1", "kind": "Job", "metadata": meta, "spec": spec,
+    });
+    let job: DynamicObject = serde_json::from_value(job_json).map_err(err)?;
+    let job_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("batch", "v1", "Job"));
+    Api::<DynamicObject>::namespaced_with(client, &namespace, &job_ar)
+        .create(&PostParams::default(), &job)
+        .await
+        .map_err(err)?;
+    Ok(job_name)
+}
+
 // ── shells ──────────────────────────────────────────────────────────
 
 /// Wire an attached TTY to the webview: stdout bytes stream out over a
