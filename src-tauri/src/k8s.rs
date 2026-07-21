@@ -1255,10 +1255,83 @@ pub async fn watch_stop(state: &AppState, id: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Map each node name to the space-joined, lowercased names of the pods
-/// scheduled on it. Uses the pod Table's NODE printer column (cells
-/// only, ~one pod-list's worth of bytes) rather than full pod objects,
-/// so enriching node search stays cheap even at 20k+ pods.
+/// Accumulator: per node, the pods on it. Names go in a flat string
+/// (each is unique enough) while namespaces are de-duped — a node runs
+/// dozens of pods but only a handful of namespaces, and repeating a
+/// namespace per pod would bloat the blob for no search benefit.
+#[derive(Default)]
+struct NodePods {
+    names: String,
+    namespaces: std::collections::BTreeSet<String>,
+}
+
+impl NodePods {
+    /// The searchable text folded into the node's blob: every pod name
+    /// plus each distinct namespace, all lowercase.
+    fn into_blob(self) -> String {
+        let mut s = self.names;
+        for ns in self.namespaces {
+            s.push_str(&ns);
+            s.push(' ');
+        }
+        s
+    }
+}
+
+/// Fold one page of the pod Table into `map` (nodeName → its pods).
+/// Reads the node from the NODE printer cell and the namespace/name from
+/// the row's PartialObjectMetadata, so it needs `includeObject=Metadata`
+/// (which still carries the printer cells). Pure and synchronous so it
+/// can be unit-tested without a cluster.
+fn fold_pod_page(
+    page: &serde_json::Value,
+    map: &mut std::collections::HashMap<String, NodePods>,
+) {
+    let node_idx = page["columnDefinitions"].as_array().and_then(|c| {
+        c.iter()
+            .position(|d| d["name"].as_str().map_or(false, |n| n.eq_ignore_ascii_case("node")))
+    });
+    let Some(ni) = node_idx else {
+        return; // no NODE column — nothing to attribute to a node
+    };
+    let Some(rows) = page["rows"].as_array() else {
+        return;
+    };
+    for r in rows {
+        let cells = r["cells"].as_array();
+        let node = cells
+            .and_then(|c| c.get(ni))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if node.is_empty() || node == "<none>" {
+            continue; // pending/unscheduled pod, not on a node yet
+        }
+        let name = r
+            .pointer("/object/metadata/name")
+            .and_then(|v| v.as_str())
+            .or_else(|| cells.and_then(|c| c.first()).and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let ns = r
+            .pointer("/object/metadata/namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let entry = map.entry(node.to_string()).or_default();
+        entry.names.push_str(&name.to_lowercase());
+        entry.names.push(' ');
+        if !ns.is_empty() {
+            entry.namespaces.insert(ns.to_lowercase());
+        }
+    }
+}
+
+/// Map each node name to the searchable text of the pods scheduled on
+/// it (pod names + their namespaces). Uses the pod Table with
+/// `includeObject=Metadata` — printer cells give the NODE column and the
+/// metadata gives the namespace — so it stays about one pod-list's worth
+/// of bytes rather than the full-object 100MB+.
 async fn pod_names_by_node(
     client: &Client,
 ) -> Result<std::collections::HashMap<String, String>, String> {
@@ -1271,40 +1344,14 @@ async fn pod_names_by_node(
         deletable: true,
         editable: true,
     };
-    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, NodePods> = std::collections::HashMap::new();
     let mut token: Option<String> = None;
     loop {
         // All namespaces: nodes are cluster-scoped, and a node hosts pods
         // from every namespace.
-        let page = fetch_table_page(client, &pod_rt, None, "None", None, token.as_deref()).await?;
-        let cols = page["columnDefinitions"].as_array();
-        let col_idx = |want: &str| {
-            cols.and_then(|c| {
-                c.iter()
-                    .position(|d| d["name"].as_str().map_or(false, |n| n.eq_ignore_ascii_case(want)))
-            })
-        };
-        let node_idx = col_idx("node");
-        let name_idx = col_idx("name").unwrap_or(0);
-        if let (Some(ni), Some(rows)) = (node_idx, page["rows"].as_array()) {
-            for r in rows {
-                let cells = r["cells"].as_array();
-                let node = cells
-                    .and_then(|c| c.get(ni))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let pod = cells
-                    .and_then(|c| c.get(name_idx))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if node.is_empty() || node == "<none>" || pod.is_empty() {
-                    continue; // unscheduled/pending pods have no node yet
-                }
-                let entry = map.entry(node.to_string()).or_default();
-                entry.push_str(&pod.to_lowercase());
-                entry.push(' ');
-            }
-        }
+        let page =
+            fetch_table_page(client, &pod_rt, None, "Metadata", None, token.as_deref()).await?;
+        fold_pod_page(&page, &mut map);
         token = page
             .pointer("/metadata/continue")
             .and_then(|c| c.as_str())
@@ -1314,7 +1361,7 @@ async fn pod_names_by_node(
             break;
         }
     }
-    Ok(map)
+    Ok(map.into_iter().map(|(k, v)| (k, v.into_blob())).collect())
 }
 
 /// Fetch full objects and upgrade the row blobs to a full-text index
@@ -2736,4 +2783,66 @@ pub async fn count_resources(
         }
     });
     Ok(join_all(tasks).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A pod Table page (includeObject=Metadata): printer cells carry the
+    /// NODE column, the row object carries namespace/name.
+    fn pod_page() -> serde_json::Value {
+        json!({
+            "columnDefinitions": [
+                {"name": "Name"}, {"name": "Ready"}, {"name": "Status"},
+                {"name": "Restarts"}, {"name": "Age"}, {"name": "IP"},
+                {"name": "Node"}, {"name": "Nominated Node"}
+            ],
+            "rows": [
+                {"cells": ["content-ranking-abc","2/2","Running",0,"5h","10.0.0.1","ip-node-a","<none>"],
+                 "object": {"metadata": {"namespace": "mlrecs-home-feed", "name": "content-ranking-abc"}}},
+                {"cells": ["vertical-ranking-xyz","2/2","Running",0,"5h","10.0.0.2","ip-node-a","<none>"],
+                 "object": {"metadata": {"namespace": "mlrecs-home-feed", "name": "vertical-ranking-xyz"}}},
+                {"cells": ["skanner-1","1/1","Running",0,"1h","10.0.0.3","ip-node-b","<none>"],
+                 "object": {"metadata": {"namespace": "skanner", "name": "skanner-1"}}},
+                // pending pod, not yet scheduled — must be ignored
+                {"cells": ["pending-pod","0/1","Pending",0,"1s","<none>","<none>","<none>"],
+                 "object": {"metadata": {"namespace": "misc", "name": "pending-pod"}}}
+            ]
+        })
+    }
+
+    #[test]
+    fn folds_pod_names_and_namespaces_by_node() {
+        let mut map = std::collections::HashMap::new();
+        fold_pod_page(&pod_page(), &mut map);
+        let a = map.remove("ip-node-a").expect("node-a present").into_blob();
+        // both pod names and the shared namespace, searchable
+        assert!(a.contains("content-ranking-abc"), "{a}");
+        assert!(a.contains("vertical-ranking-xyz"), "{a}");
+        assert!(a.contains("mlrecs-home-feed"), "{a}");
+        // namespace de-duped to a single occurrence
+        assert_eq!(a.matches("mlrecs-home-feed").count(), 1, "{a}");
+
+        let b = map.remove("ip-node-b").expect("node-b present").into_blob();
+        assert!(b.contains("skanner-1"), "{b}");
+        assert!(b.contains("skanner"), "{b}");
+
+        // the unscheduled pod's node (<none>) is not a key
+        assert!(!map.contains_key("<none>"));
+    }
+
+    #[test]
+    fn ignores_page_without_node_column() {
+        // A resource whose Table has no NODE column must not panic or
+        // invent entries.
+        let page = json!({
+            "columnDefinitions": [{"name": "Name"}, {"name": "Age"}],
+            "rows": [{"cells": ["x", "1h"], "object": {"metadata": {"name": "x"}}}]
+        });
+        let mut map = std::collections::HashMap::new();
+        fold_pod_page(&page, &mut map);
+        assert!(map.is_empty());
+    }
 }
