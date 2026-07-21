@@ -1731,7 +1731,23 @@ function App() {
       // watch. If the version is too old the server RESYNCs and the watch
       // handler does a full refreshList().
       listSeq++;
-      if (rt.group === "" && rt.kind === "Pod") void loadPodStats(ctx, ns);
+      if (rt.group === "" && rt.kind === "Pod") {
+        void loadPodStats(ctx, ns);
+        // cached_list re-seeds the search cache and clears pod_res, so the
+        // %request/%limit columns would read n/a. Rebuild the index in the
+        // background (non-blocking), then refresh stats so they fill in
+        // without needing a search.
+        if (!indexed && !indexPromise) {
+          indexPromise = invoke("ensure_index")
+            .then(() => {
+              if (active() === ctx && selected() === rt) void loadPodStats(ctx, ns);
+            })
+            .finally(() => {
+              indexed = true;
+              indexPromise = null;
+            });
+        }
+      }
       const started = await startWatch(
         ctx,
         rt,

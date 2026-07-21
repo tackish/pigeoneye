@@ -541,9 +541,10 @@ pub async fn discover(state: &AppState, context: String) -> Result<Vec<ResourceT
 const PAGE_LIMIT_CELLS: u32 = 2000;
 const PAGE_LIMIT_META: u32 = 500;
 /// Safety cap on how many rows the background streamer will pull for one
-/// list. Beyond this the list is served partial and left uncached. Set
-/// well above real clusters (~24k pods) so they finish and cache.
-const MAX_STREAM_ROWS: usize = 120_000;
+/// list. Beyond this the list is served partial (and left uncached) with
+/// a terminal done-marker so the UI stops spinning. Set above real
+/// clusters — 24k pods, ~170k+ events — so they finish and cache.
+const MAX_STREAM_ROWS: usize = 300_000;
 
 fn api_resource(rt: &ResourceType) -> KubeApiResource {
     KubeApiResource {
@@ -1106,7 +1107,19 @@ pub async fn list_resources(
                 // never completed and so never cached. This lets a 24k-pod
                 // cluster finish and be cached.
                 if all_rows.len() > MAX_STREAM_ROWS {
-                    return; // safety cap; a partial list is not cached
+                    // Safety cap hit: the list is partial and won't be
+                    // cached, but tell the UI we're done so the "loading…"
+                    // spinner clears instead of spinning forever.
+                    if still_current {
+                        let end = serde_json::to_value(RowPage {
+                            generation,
+                            rows: Vec::new(),
+                            done: true,
+                        })
+                        .unwrap_or_default();
+                        let _ = chan.send(end);
+                    }
+                    return;
                 }
                 let Ok(Ok(page)) = handle.await else {
                     return; // fetch failed; leave the list uncached
@@ -1335,11 +1348,11 @@ async fn build_index(
     let is_pod = rt.group.is_empty() && rt.kind == "Pod";
     let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut pod_res: std::collections::HashMap<String, PodRes> = std::collections::HashMap::new();
-    // The object projection pages at PAGE_LIMIT_META while the table
-    // holds up to PAGE_LIMIT_CELLS rows, so follow `continue` until
-    // every listed row is covered — otherwise search silently misses
-    // everything past the first page.
-    let target = { search.read().await.keys.len() };
+    // Page the object projection until the server's `continue` is
+    // exhausted, so the index and pod requests/limits cover the WHOLE
+    // list. (Previously this stopped at a snapshot of keys.len() taken
+    // before the row streamer had finished, leaving %CPU/MEM per-pod
+    // request/limit columns as n/a for everything past the first page.)
     let mut token: Option<String> = None;
     loop {
         let page = fetch_table_page(
@@ -1400,10 +1413,7 @@ async fn build_index(
             .and_then(|c| c.as_str())
             .filter(|c| !c.is_empty())
             .map(String::from);
-        if token.is_none()
-            || by_key.len() >= target
-            || search.read().await.generation != generation
-        {
+        if token.is_none() || search.read().await.generation != generation {
             break;
         }
     }
