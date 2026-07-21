@@ -148,6 +148,12 @@ pub struct TableRow {
     /// Server-side printer cells, same as `kubectl get` columns.
     pub cells: Vec<serde_json::Value>,
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Controller kind from the first ownerReference (e.g. "DaemonSet",
+    /// "ReplicaSet", "StatefulSet", "Job"). Only populated when the list
+    /// carries object metadata; the UI uses it to sink DaemonSet pods to
+    /// the bottom of an all-namespaces pod list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -644,6 +650,10 @@ fn row_from_object(obj: &serde_json::Value, cells: Vec<serde_json::Value>) -> Ta
             .pointer("/metadata/labels")
             .and_then(|l| serde_json::from_value(l.clone()).ok())
             .unwrap_or_default(),
+        owner_kind: obj
+            .pointer("/metadata/ownerReferences/0/kind")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 

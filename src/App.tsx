@@ -54,6 +54,7 @@ interface TableRow {
   namespace: string | null;
   cells: (string | number | null)[];
   labels: Record<string, string>;
+  owner_kind?: string | null;
 }
 
 interface ResourceTable {
@@ -2332,6 +2333,15 @@ function App() {
       out = [...out].sort(
         (x, y) => cmpCells(x.cells[sc] ?? "", y.cells[sc] ?? "") * dir,
       );
+    } else if (isPod() && !namespace()) {
+      // Default order for an all-namespaces pod list: sink DaemonSet pods
+      // (ebs-csi-node, kube-proxy, log/metrics agents — one per node, so
+      // thousands of them) to the bottom so the workloads you actually
+      // care about sit on top. A real column sort overrides this.
+      out = out
+        .map((r, i) => [r, r.row.owner_kind === "DaemonSet" ? 1 : 0, i] as const)
+        .sort((a, z) => a[1] - z[1] || a[2] - z[2])
+        .map(([r]) => r);
     }
 
     const hide = hiddenFor();
@@ -2346,6 +2356,14 @@ function App() {
 
   /// Row count for the header badge — the filtered set lives in view().
   const rowCount = createMemo(() => view().rows.length);
+  // DaemonSet pods in an all-namespaces pod list — shown in the badge so
+  // it's clear why the count is huge and where those rows went (bottom).
+  const dsCount = createMemo(() => {
+    if (!isPod() || namespace()) return 0;
+    let n = 0;
+    for (const r of view().rows) if (r.row.owner_kind === "DaemonSet") n++;
+    return n;
+  });
 
   /// Final display model: server columns + injected Namespace, live
   /// metric columns for pods, AZ for nodes — then column sorting.
@@ -3872,6 +3890,12 @@ function App() {
                     <span class="live-dot" title="live: updates arrive as they happen" />
                   </Show>
                   {rowCount()} items
+                  <Show when={dsCount() > 0}>
+                    <span class="dim" title="DaemonSet pods (one per node) are sunk to the bottom">
+                      {" "}
+                      · {dsCount()} daemonset ↓
+                    </span>
+                  </Show>
                   <Show when={streaming()}>
                     <span class="dim"> · loading more…</span>
                   </Show>
