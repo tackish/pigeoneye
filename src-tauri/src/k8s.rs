@@ -1256,22 +1256,24 @@ pub async fn watch_stop(state: &AppState, id: u32) -> Result<(), String> {
 }
 
 /// Accumulator: per node, the pods on it. Names go in a flat string
-/// (each is unique enough) while namespaces are de-duped — a node runs
-/// dozens of pods but only a handful of namespaces, and repeating a
-/// namespace per pod would bloat the blob for no search benefit.
+/// (each is unique enough); namespaces and label values are de-duped in
+/// `tags` — a node runs dozens of pods but only a handful of distinct
+/// namespaces/app labels, and repeating them per pod would bloat the
+/// blob for no search benefit. Labels matter because a workload's name
+/// (e.g. "skanner") often lives in an `app` label, not the pod name.
 #[derive(Default)]
 struct NodePods {
     names: String,
-    namespaces: std::collections::BTreeSet<String>,
+    tags: std::collections::BTreeSet<String>,
 }
 
 impl NodePods {
     /// The searchable text folded into the node's blob: every pod name
-    /// plus each distinct namespace, all lowercase.
+    /// plus each distinct namespace and label value, all lowercase.
     fn into_blob(self) -> String {
         let mut s = self.names;
-        for ns in self.namespaces {
-            s.push_str(&ns);
+        for t in self.tags {
+            s.push_str(&t);
             s.push(' ');
         }
         s
@@ -1322,7 +1324,20 @@ fn fold_pod_page(
         entry.names.push_str(&name.to_lowercase());
         entry.names.push(' ');
         if !ns.is_empty() {
-            entry.namespaces.insert(ns.to_lowercase());
+            entry.tags.insert(ns.to_lowercase());
+        }
+        // Label values (and keys) — this is where app/workload names like
+        // "skanner" usually live when they're not in the pod name.
+        if let Some(labels) = r
+            .pointer("/object/metadata/labels")
+            .and_then(|l| l.as_object())
+        {
+            for (k, v) in labels {
+                entry.tags.insert(k.to_lowercase());
+                if let Some(v) = v.as_str() {
+                    entry.tags.insert(v.to_lowercase());
+                }
+            }
         }
     }
 }
@@ -1484,6 +1499,15 @@ async fn build_index(
                     enriched,
                     by_key.len()
                 );
+                if enriched == 0 {
+                    // Key mismatch: show one of each so we can see why the
+                    // node names and the pods' NODE column don't line up.
+                    let node_key = by_key.keys().next().cloned().unwrap_or_default();
+                    let pod_key = pods.keys().next().cloned().unwrap_or_default();
+                    eprintln!(
+                        "[pigeoneye] node search: 0 matched — node key {node_key:?} vs pod NODE {pod_key:?}"
+                    );
+                }
             }
             Err(e) => eprintln!("[pigeoneye] node search: pod probe failed: {e}"),
         }
@@ -2864,8 +2888,10 @@ mod tests {
                  "object": {"metadata": {"namespace": "mlrecs-home-feed", "name": "content-ranking-abc"}}},
                 {"cells": ["vertical-ranking-xyz","2/2","Running",0,"5h","10.0.0.2","ip-node-a","<none>"],
                  "object": {"metadata": {"namespace": "mlrecs-home-feed", "name": "vertical-ranking-xyz"}}},
-                {"cells": ["skanner-1","1/1","Running",0,"1h","10.0.0.3","ip-node-b","<none>"],
-                 "object": {"metadata": {"namespace": "skanner", "name": "skanner-1"}}},
+                // workload name lives only in the app label, not the pod name
+                {"cells": ["worker-9f8","1/1","Running",0,"1h","10.0.0.3","ip-node-b","<none>"],
+                 "object": {"metadata": {"namespace": "team-x", "name": "worker-9f8",
+                                          "labels": {"app": "skanner"}}}},
                 // pending pod, not yet scheduled — must be ignored
                 {"cells": ["pending-pod","0/1","Pending",0,"1s","<none>","<none>","<none>"],
                  "object": {"metadata": {"namespace": "misc", "name": "pending-pod"}}}
@@ -2886,8 +2912,9 @@ mod tests {
         assert_eq!(a.matches("mlrecs-home-feed").count(), 1, "{a}");
 
         let b = map.remove("ip-node-b").expect("node-b present").into_blob();
-        assert!(b.contains("skanner-1"), "{b}");
+        // matched via the app label, even though no pod is named skanner
         assert!(b.contains("skanner"), "{b}");
+        assert!(b.contains("worker-9f8"), "{b}");
 
         // the unscheduled pod's node (<none>) is not a key
         assert!(!map.contains_key("<none>"));
