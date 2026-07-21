@@ -3958,16 +3958,34 @@ function App() {
               <Show
                 when={rowCount() > 0}
                 fallback={
-                  <div class="empty">
-                    <img class="mascot tilt" src={puzzledUrl} alt="" />
-                    <p>
-                      No resources found.
-                      <Show when={rowFilter().trim()}>
-                        {" "}
-                        Try a different filter.
-                      </Show>
-                    </p>
-                  </div>
+                  <Show
+                    when={indexing() && rowFilter().trim()}
+                    fallback={
+                      <div class="empty">
+                        <img class="mascot tilt" src={puzzledUrl} alt="" />
+                        <p>
+                          No resources found.
+                          <Show when={rowFilter().trim()}>
+                            {" "}
+                            Try a different filter.
+                          </Show>
+                        </p>
+                      </div>
+                    }
+                  >
+                    {/* Still building the deep index: we haven't finished
+                        looking, so this is "searching", not "empty". For
+                        nodes that means scanning which pods run where. */}
+                    <div class="empty">
+                      <img class="mascot sm loading-bird" src={lookUrl} alt="" />
+                      <span class="ring-spinner" />
+                      <p>
+                        {isNode()
+                          ? `Finding nodes running “${rowFilter().trim()}”…`
+                          : `Searching every field for “${rowFilter().trim()}”…`}
+                      </p>
+                    </div>
+                  </Show>
                 }
               >
                 <div
