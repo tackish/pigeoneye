@@ -2220,8 +2220,13 @@ details.fold[open] > summary::before {
   word-break: break-word;
 }
 
-/* Keyboard section highlight: the editor or the actions row owns focus. */
+/* Keyboard section highlight: namespace / editor / actions in turn. */
 .new-editor.cur {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.new-ns.cur .ns-btn {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }

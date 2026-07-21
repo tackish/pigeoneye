@@ -1103,8 +1103,17 @@ function App() {
   const [newNsQuery, setNewNsQuery] = createSignal("");
   // Which part of the New dialog the keyboard owns: the manifest editor
   // or the Create/Cancel actions. Esc steps editor → actions → close.
-  const [newSec, setNewSec] = createSignal<"editor" | "actions">("editor");
+  // Vertical keyboard sections of the New dialog, top → bottom.
+  const [newSec, setNewSec] = createSignal<"namespace" | "editor" | "actions">(
+    "editor",
+  );
   const [newDlgIdx, setNewDlgIdx] = createSignal(1); // 0=Cancel, 1=Create
+  let newEditorApi: { next: () => void; focus: () => void } | undefined;
+  // Sections present for this kind (namespace only for namespaced kinds).
+  const newSections = (): ("namespace" | "editor" | "actions")[] =>
+    selected()?.namespaced
+      ? ["namespace", "editor", "actions"]
+      : ["editor", "actions"];
   const newNsFiltered = createMemo(() => {
     const q = newNsQuery().toLowerCase().trim();
     return namespaces().filter((n) => !q || n.toLowerCase().includes(q));
@@ -2710,17 +2719,12 @@ function App() {
       return;
     }
     if (e.key === "Escape") {
-      // New dialog steps up its own hierarchy: namespace popup → editor →
-      // actions → close, so Esc never yanks you straight out of an edit.
       if (newOpen()) {
-        // The editor's own Esc keymap already moved us to the actions row
-        // (and blurred); don't also close on the same event.
+        // The editor's own Esc keymap blurred it and set nav mode; don't
+        // also close on the same event.
         if (e.defaultPrevented) return;
         if (newNsOpen()) setNewNsOpen(false);
-        else if (newSec() === "editor") {
-          setNewSec("actions");
-          (document.activeElement as HTMLElement | null)?.blur?.();
-        } else setNewOpen(false);
+        else setNewOpen(false);
         return;
       }
       if (pickMode()) setPickMode(null);
@@ -2744,27 +2748,43 @@ function App() {
       } else popHistory();
       return;
     }
-    // The New dialog owns the keyboard while open. ⌘/Ctrl+↵ creates from
-    // anywhere; in the actions row the arrows pick a button. The editor
-    // and namespace search handle their own keys (typing is true there).
+    // The New dialog owns the keyboard while open. ⌘/Ctrl+↵ always
+    // creates. The manifest editor and namespace search handle their own
+    // keys (typing is true there); everything else is section navigation.
     if (newOpen()) {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
         createResource();
         return;
       }
-      if (newSec() === "actions" && !typing) {
-        if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Tab") {
-          e.preventDefault();
-          setNewDlgIdx(e.key === "ArrowLeft" ? 0 : e.key === "ArrowRight" ? 1 : newDlgIdx() === 1 ? 0 : 1);
-        } else if (e.key === "Enter") {
-          e.preventDefault();
-          if (newDlgIdx() === 1) createResource();
-          else setNewOpen(false);
-        } else if (e.key === "ArrowUp") {
-          e.preventDefault();
-          setNewSec("editor");
-        }
+      // While the namespace dropdown or the editor holds focus, leave the
+      // keys to them.
+      if (newNsOpen() || typing) return;
+      // Nav mode: ↑/↓ move between namespace → editor → actions.
+      const secs = newSections();
+      const i = secs.indexOf(newSec());
+      if (e.key === "ArrowUp" || e.key === "k") {
+        e.preventDefault();
+        if (i > 0) setNewSec(secs[i - 1]);
+      } else if (e.key === "ArrowDown" || e.key === "j") {
+        e.preventDefault();
+        if (i < secs.length - 1) setNewSec(secs[i + 1]);
+      } else if (
+        newSec() === "actions" &&
+        (e.key === "ArrowLeft" || e.key === "ArrowRight")
+      ) {
+        e.preventDefault();
+        setNewDlgIdx(e.key === "ArrowLeft" ? 0 : 1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        // Activate the focused section.
+        if (newSec() === "namespace") {
+          setNewNsQuery("");
+          setNewNsOpen(true);
+        } else if (newSec() === "editor") {
+          newEditorApi?.focus();
+        } else if (newDlgIdx() === 1) createResource();
+        else setNewOpen(false);
       }
       return;
     }
@@ -5108,12 +5128,14 @@ function App() {
                   already taken.
                 </p>
                 <Show when={selected()?.namespaced}>
-                  <div class="new-ns">
+                  <div class="new-ns" classList={{ cur: newSec() === "namespace" }}>
                     <span class="meta-key">namespace</span>
                     <div class="ns-picker new-ns-picker">
                       <button
                         class="ctx ns-btn"
+                        classList={{ "btn-cursor": newSec() === "namespace" }}
                         onClick={() => {
+                          setNewSec("namespace");
                           setNewNsOpen(!newNsOpen());
                           setNewNsQuery("");
                         }}
@@ -5143,9 +5165,13 @@ function App() {
                                 setNewNsOpen(false);
                               }
                               if (e.key === "Enter") {
+                                e.stopPropagation();
                                 const first = newNsFiltered()[0];
                                 if (first) setNewNs(first);
                                 setNewNsOpen(false);
+                                // step down to the manifest next
+                                setNewSec("editor");
+                                newEditorApi?.focus();
                               }
                             }}
                           />
@@ -5185,13 +5211,12 @@ function App() {
                     theme={theme()}
                     readOnly={false}
                     autofocus
+                    api={(a) => (newEditorApi = a)}
                     onChange={setNewYaml}
                     onLeave={() => {
-                      // Esc in the editor steps out to the actions row;
-                      // blur so the next Esc reaches the dialog (closes it)
-                      // instead of the editor swallowing it again.
-                      setNewSec("actions");
-                      (document.activeElement as HTMLElement | null)?.blur?.();
+                      // Esc blurs the editor into nav mode (still on the
+                      // editor section); ↑/↓ then move to namespace/actions.
+                      setNewSec("editor");
                     }}
                   />
                 </div>
@@ -5219,9 +5244,7 @@ function App() {
                   </button>
                 </div>
                 <p class="dim new-foot">
-                  <b>esc</b> {newSec() === "editor" ? "→ buttons" : "→ close"}
-                  {"  ·  "}
-                  <b>⌘↵</b> create
+                  <b>↑↓</b> section · <b>↵</b> {newSec() === "editor" ? "edit" : newSec() === "namespace" ? "pick ns" : "run"} · <b>esc</b> {newNsOpen() ? "close list" : "close"} · <b>⌘↵</b> create
                 </p>
               </div>
             </div>
