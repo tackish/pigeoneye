@@ -1748,7 +1748,70 @@ fn related_links(v: &serde_json::Value, kind: &str) -> Vec<InvolvedRef> {
                 .and_then(|n| n.as_str()),
             ns.clone(),
         ),
+        "RoleBinding" | "ClusterRoleBinding" => {
+            // the role it grants…
+            let role_kind = v.pointer("/roleRef/kind").and_then(|k| k.as_str());
+            push(
+                role_kind,
+                v.pointer("/roleRef/name").and_then(|n| n.as_str()),
+                // a RoleBinding's Role is namespaced; a ClusterRole isn't
+                if role_kind == Some("Role") { ns.clone() } else { None },
+            );
+            // …and the subjects it grants it to
+            for s in v
+                .pointer("/subjects")
+                .and_then(|s| s.as_array())
+                .into_iter()
+                .flatten()
+            {
+                push(
+                    s.get("kind").and_then(|k| k.as_str()),
+                    s.get("name").and_then(|n| n.as_str()),
+                    s.get("namespace")
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                        .or_else(|| ns.clone()),
+                );
+            }
+        }
+        "ServiceAccount" => {
+            for sec in v.pointer("/secrets").and_then(|s| s.as_array()).into_iter().flatten() {
+                push(
+                    Some("Secret"),
+                    sec.get("name").and_then(|n| n.as_str()),
+                    ns.clone(),
+                );
+            }
+            for sec in v
+                .pointer("/imagePullSecrets")
+                .and_then(|s| s.as_array())
+                .into_iter()
+                .flatten()
+            {
+                push(
+                    Some("Secret"),
+                    sec.get("name").and_then(|n| n.as_str()),
+                    ns.clone(),
+                );
+            }
+        }
         _ => {}
+    }
+
+    // Cross-cutting links added regardless of the match above.
+    if kind == "Ingress" {
+        push(
+            Some("IngressClass"),
+            v.pointer("/spec/ingressClassName").and_then(|n| n.as_str()),
+            None,
+        );
+    }
+    if kind == "PersistentVolumeClaim" || kind == "PersistentVolume" {
+        push(
+            Some("StorageClass"),
+            v.pointer("/spec/storageClassName").and_then(|n| n.as_str()),
+            None,
+        );
     }
 
     // de-duplicate while keeping order
