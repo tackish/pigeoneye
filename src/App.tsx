@@ -376,7 +376,63 @@ function App() {
   let listSeq = 0;
   let watchId: number | null = null;
 
+  // Pending watch changes, keyed so repeated updates to one row
+  // collapse. Flushed on a timer, not per event.
+  const watchBuf = new Map<string, { del: boolean; row: TableRow }>();
+  let watchFlushTimer: number | undefined;
+
+  function scheduleWatchFlush(seq: number) {
+    if (watchFlushTimer != null) return;
+    watchFlushTimer = window.setTimeout(() => {
+      watchFlushTimer = undefined;
+      if (seq !== listSeq || !watchBuf.size) {
+        watchBuf.clear();
+        return;
+      }
+      const pending = new Map(watchBuf);
+      watchBuf.clear();
+      setTable((prev) => {
+        if (!prev) return prev;
+        // one index pass, then O(1) updates
+        const idx = new Map<string, number>();
+        for (let i = 0; i < prev.rows.length; i++) idx.set(rowKeyOf(prev.rows[i]), i);
+        let rows = prev.rows;
+        let copied = false;
+        const ensure = () => {
+          if (!copied) {
+            rows = prev.rows.slice();
+            copied = true;
+          }
+        };
+        const dels: number[] = [];
+        for (const [k, ch] of pending) {
+          const i = idx.get(k);
+          if (ch.del) {
+            if (i !== undefined) dels.push(i);
+          } else if (i !== undefined) {
+            ensure();
+            rows[i] = ch.row;
+          } else {
+            ensure();
+            rows.push(ch.row);
+          }
+        }
+        if (dels.length) {
+          ensure();
+          dels.sort((a, b) => b - a);
+          for (const i of dels) rows.splice(i, 1);
+        }
+        return copied ? { ...prev, rows } : prev;
+      });
+    }, 700);
+  }
+
   function stopWatch() {
+    if (watchFlushTimer != null) {
+      window.clearTimeout(watchFlushTimer);
+      watchFlushTimer = undefined;
+    }
+    watchBuf.clear();
     if (watchId != null) void invoke("watch_stop", { id: watchId }).catch(() => {});
     watchId = null;
     setLive(false);
@@ -408,22 +464,8 @@ function App() {
       }
       const incoming = ev.rows ?? [];
       if (!incoming.length) return;
-      setTable((prev) => {
-        if (!prev) return prev;
-        const rows = [...prev.rows];
-        for (const r of incoming) {
-          const k = rowKeyOf(r);
-          const i = rows.findIndex((x) => rowKeyOf(x) === k);
-          if (ev.type === "DELETED") {
-            if (i >= 0) rows.splice(i, 1);
-          } else if (i >= 0) {
-            rows[i] = r;
-          } else {
-            rows.push(r);
-          }
-        }
-        return { ...prev, rows };
-      });
+      for (const r of incoming) watchBuf.set(rowKeyOf(r), { del: ev.type === "DELETED", row: r });
+      scheduleWatchFlush(seq);
     };
     try {
       const id = await invoke<number>("watch_start", {
@@ -1829,6 +1871,9 @@ function App() {
   /// Display cells for every row, built once per list — not per
   /// keystroke. On a 24k-pod cluster rebuilding this while typing was
   /// what made search collapse.
+  // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
+  let dispCache = new Map<TableRow, DisplayRow>();
+  let dispCacheStats: Map<string, PodStat> | null = null;
   const baseRows = createMemo(() => {
     const t = table();
     const rt = selected();
@@ -1845,25 +1890,30 @@ function App() {
     const nodeView = rt.group === "" && rt.kind === "Node";
     if (nodeView) cols = [...cols, "AZ"];
 
+    // Reuse the display row for any TableRow object that hasn't
+    // changed identity — a watch flush replaces only touched rows, so
+    // this rebuilds a handful instead of all 24k.
+    const prev = dispCacheStats === stats ? dispCache : null;
     const rows: DisplayRow[] = t.rows.map((r) => {
+      const hit = prev?.get(r);
+      if (hit) return hit;
       let cells = r.cells.map((c) => String(c ?? ""));
       if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
       if (stats) {
-        const s = stats.get(`${r.namespace ?? ""}/${r.name}`);
-        const six = s
+        const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
+        const six = st
           ? [
-              fmtCpu(s.cpu),
-              pct(s.cpu, s.cpu_r),
-              pct(s.cpu, s.cpu_l),
-              fmtMem(s.mem),
-              pct(s.mem, s.mem_r),
-              pct(s.mem, s.mem_l),
+              fmtCpu(st.cpu),
+              pct(st.cpu, st.cpu_r),
+              pct(st.cpu, st.cpu_l),
+              fmtMem(st.mem),
+              pct(st.mem, st.mem_r),
+              pct(st.mem, st.mem_l),
             ]
           : ["-", "-", "-", "-", "-", "-"];
         cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
       }
       if (nodeView) cells = [...cells, zoneOf(r.labels)];
-      // one lowercase haystack per row, reused by every keystroke
       const hay = (
         cells.join(" ") +
         " " +
@@ -1873,6 +1923,10 @@ function App() {
       ).toLowerCase();
       return { row: r, cells, hay };
     });
+    const next = new Map<TableRow, DisplayRow>();
+    for (const d of rows) next.set(d.row, d);
+    dispCache = next;
+    dispCacheStats = stats;
     return { cols, rows };
   });
 
@@ -1933,7 +1987,7 @@ function App() {
   });
 
   /// Row count for the header badge — the filtered set lives in view().
-  const rows = createMemo(() => view().rows.map((r) => r.row));
+  const rowCount = createMemo(() => view().rows.length);
 
   /// Final display model: server columns + injected Namespace, live
   /// metric columns for pods, AZ for nodes — then column sorting.
@@ -3380,7 +3434,7 @@ function App() {
                   <Show when={live()}>
                     <span class="live-dot" title="live: updates arrive as they happen" />
                   </Show>
-                  {rows().length} items
+                  {rowCount()} items
                   <Show when={streaming()}>
                     <span class="dim"> · loading more…</span>
                   </Show>
@@ -3487,7 +3541,7 @@ function App() {
               }
             >
               <Show
-                when={rows().length > 0}
+                when={rowCount() > 0}
                 fallback={
                   <div class="empty">
                     <img class="mascot tilt" src={puzzledUrl} alt="" />
