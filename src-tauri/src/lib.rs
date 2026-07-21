@@ -130,6 +130,17 @@ async fn apply_resource(
 }
 
 #[tauri::command]
+async fn create_resource(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+    yaml: String,
+) -> Result<String, String> {
+    k8s::create_resource(&state, context, resource, namespace, yaml).await
+}
+
+#[tauri::command]
 async fn delete_resource(
     state: State<'_, AppState>,
     context: String,
@@ -388,6 +399,7 @@ pub fn run() {
             watch_stop,
             get_resource,
             apply_resource,
+            create_resource,
             delete_resource,
             cordon_node,
             drain_node,

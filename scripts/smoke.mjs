@@ -16,6 +16,7 @@ const dom = new JSDOM('<!doctype html><div id="root"></div>', {
 });
 global.window = dom.window;
 global.document = dom.window.document;
+global.Window = dom.window.Window || dom.window.constructor;
 global.HTMLElement = dom.window.HTMLElement;
 global.HTMLInputElement = dom.window.HTMLInputElement;
 global.HTMLTextAreaElement = dom.window.HTMLTextAreaElement;
@@ -89,6 +90,8 @@ dom.window.__TAURI_INTERNALS__ = {
         return Promise.resolve(["ns-5/pod-5"]);
       case "ensure_index":
         return Promise.resolve(null);
+      case "create_resource":
+        return Promise.resolve("my-pod");
       default:
         return Promise.resolve([]);
     }
@@ -171,5 +174,19 @@ const i5 = after.findIndex(isP5);
 if (i5 < i777)
   fail("deep-only hit outranked the name match", after.join(" | "));
 
-console.log(`smoke ok — table rendered ${rowsRendered} windowed rows, search ranked name over deep hit`);
+// New (create) flow: the "+ New" button opens a modal seeded with the
+// Pod starter manifest.
+const newBtn = [...root.querySelectorAll("button")].find(
+  (b) => b.textContent?.trim() === "+ New",
+);
+if (!newBtn) fail("no + New button for a kind with a template", html.replace(/<[^>]+>/g, ""));
+newBtn.click();
+await new Promise((r) => setTimeout(r, 200));
+if (crash) fail("crash opening New modal", crash);
+const modal = root.querySelector(".new-modal");
+if (!modal) fail("New modal did not open", root.innerHTML.replace(/<[^>]+>/g, "").slice(0, 400));
+if (!modal.textContent?.includes("New Pod"))
+  fail("New modal missing kind title", modal.textContent || "");
+
+console.log(`smoke ok — table rendered ${rowsRendered} windowed rows, search ranked name over deep hit, New modal opens`);
 process.exit(0); // the app keeps timers alive; we are done

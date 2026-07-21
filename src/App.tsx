@@ -217,6 +217,204 @@ const CATEGORIES: [string, [string, string][]][] = [
   ],
 ];
 
+/// Starter manifests for the "New" flow, keyed by `${group}/${kind}`.
+/// Deliberately minimal — just enough to be valid — with `# 👈` comments
+/// marking the handful of fields you actually need to change. Namespace
+/// is left out on purpose: the New dialog's picker supplies it, so
+/// there's nothing to keep in sync here. Only kinds people routinely
+/// hand-create are covered; everything else simply has no New button.
+const NEW_TEMPLATES: Record<string, string> = {
+  "/Pod": `apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod            # 👈 name
+  labels:
+    app: my-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:latest # 👈 image
+      ports:
+        - containerPort: 80   # 👈 port
+`,
+  "apps/Deployment": `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app            # 👈 name
+  labels:
+    app: my-app
+spec:
+  replicas: 1             # 👈 replicas
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest   # 👈 image
+          ports:
+            - containerPort: 80 # 👈 port
+`,
+  "apps/StatefulSet": `apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-set            # 👈 name
+spec:
+  serviceName: my-set     # 👈 headless service name
+  replicas: 1             # 👈 replicas
+  selector:
+    matchLabels:
+      app: my-set
+  template:
+    metadata:
+      labels:
+        app: my-set
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest   # 👈 image
+          ports:
+            - containerPort: 80
+`,
+  "/Service": `apiVersion: v1
+kind: Service
+metadata:
+  name: my-svc            # 👈 name
+spec:
+  type: ClusterIP         # 👈 ClusterIP | NodePort | LoadBalancer
+  selector:
+    app: my-app           # 👈 pods to target (match their labels)
+  ports:
+    - port: 80            # 👈 service port
+      targetPort: 80      # 👈 container port
+`,
+  "networking.k8s.io/Ingress": `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress        # 👈 name
+spec:
+  rules:
+    - host: example.com   # 👈 host
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-svc   # 👈 target service
+                port:
+                  number: 80   # 👈 service port
+`,
+  "/ConfigMap": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config         # 👈 name
+data:
+  key: value              # 👈 your key/values
+`,
+  "/Secret": `apiVersion: v1
+kind: Secret
+metadata:
+  name: my-secret         # 👈 name
+type: Opaque
+stringData:
+  key: value              # 👈 plaintext key/values (encoded for you)
+`,
+  "batch/Job": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job            # 👈 name
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: job
+          image: busybox:1.36        # 👈 image
+          command: ["sh", "-c", "echo hello"]  # 👈 command
+`,
+  "batch/CronJob": `apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: my-cronjob        # 👈 name
+spec:
+  schedule: "*/5 * * * *"  # 👈 cron schedule
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: busybox:1.36    # 👈 image
+              command: ["sh", "-c", "date"]   # 👈 command
+`,
+  "/Namespace": `apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-namespace      # 👈 name
+`,
+  "/PersistentVolumeClaim": `apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc            # 👈 name
+spec:
+  accessModes:
+    - ReadWriteOnce       # 👈 access mode
+  resources:
+    requests:
+      storage: 1Gi        # 👈 size
+`,
+  "autoscaling/HorizontalPodAutoscaler": `apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-hpa            # 👈 name
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app          # 👈 target workload
+  minReplicas: 1          # 👈 min
+  maxReplicas: 10         # 👈 max
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80   # 👈 target CPU %
+`,
+  "argoproj.io/Rollout": `apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: my-rollout        # 👈 name
+spec:
+  replicas: 1             # 👈 replicas
+  selector:
+    matchLabels:
+      app: my-rollout
+  template:
+    metadata:
+      labels:
+        app: my-rollout
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest   # 👈 image
+          ports:
+            - containerPort: 80
+  strategy:
+    canary:                # 👈 rollout strategy (canary | blueGreen)
+      steps:
+        - setWeight: 20
+        - pause: {}
+`,
+};
+
 const BUILTIN_GROUPS = new Set(["", "apps", "batch", "autoscaling", "policy"]);
 
 function isBuiltinGroup(group: string): boolean {
@@ -865,6 +1063,12 @@ function App() {
   const [detailKey, setDetailKey] = createSignal<string | null>(null);
   const [detailLoading, setDetailLoading] = createSignal(false);
   const [yamlText, setYamlText] = createSignal("");
+  // "New" (create) dialog state.
+  const [newOpen, setNewOpen] = createSignal(false);
+  const [newYaml, setNewYaml] = createSignal("");
+  const [newNs, setNewNs] = createSignal("");
+  const [newBusy, setNewBusy] = createSignal(false);
+  const [newErr, setNewErr] = createSignal<string | null>(null);
   const [actionBusy, setActionBusy] = createSignal<string | null>(null);
   const [actionMsg, setActionMsg] = createSignal<string | null>(null);
   const [actionErr, setActionErr] = createSignal<string | null>(null);
@@ -1779,6 +1983,46 @@ function App() {
   /// Apply without force first. A conflict means another manager owns
   /// a field you changed (an HPA's replicas, a controller's template) —
   /// the user should decide to take it over, not discover it later.
+  /// The starter manifest for a kind, or null if we don't offer create
+  /// for it (no New button in that case).
+  const templateFor = (rt: ResourceType | null) =>
+    rt ? (NEW_TEMPLATES[typeKey(rt)] ?? null) : null;
+
+  function openNew() {
+    const rt = selected();
+    const tpl = templateFor(rt);
+    if (!rt || !tpl) return;
+    setNewErr(null);
+    setNewYaml(tpl);
+    // Seed the namespace from the current filter, else "default".
+    setNewNs(rt.namespaced ? namespace() || "default" : "");
+    setNewOpen(true);
+  }
+
+  function createResource() {
+    const rt = selected();
+    const ctx = active();
+    if (!rt || !ctx || newBusy()) return;
+    setNewBusy(true);
+    setNewErr(null);
+    void invoke<string>("create_resource", {
+      context: ctx,
+      resource: rt,
+      namespace: rt.namespaced ? newNs() || null : null,
+      yaml: newYaml(),
+    })
+      .then(async (name) => {
+        setNewBusy(false);
+        setNewOpen(false);
+        setActionMsg(`created ${rt.kind}/${name} ✓`);
+        await refreshList();
+      })
+      .catch((e) => {
+        setNewBusy(false);
+        setNewErr(prettyError(String(e)));
+      });
+  }
+
   function applyYaml(force = false) {
     const rt = selected();
     const d = detail();
@@ -2357,7 +2601,8 @@ function App() {
       return;
     }
     if (e.key === "Escape") {
-      if (pickMode()) setPickMode(null);
+      if (newOpen()) setNewOpen(false);
+      else if (pickMode()) setPickMode(null);
       else if (scaleOpen()) setScaleOpen(false);
       else if (pfOpen()) setPfOpen(false);
       else if (helpOpen()) setHelpOpen(false);
@@ -2378,6 +2623,9 @@ function App() {
       } else popHistory();
       return;
     }
+    // The New dialog owns the keyboard while open (its editor handles its
+    // own keys); nothing may reach the table behind it.
+    if (newOpen()) return;
     // Any open dialog owns the keyboard completely: keys must never
     // reach the table behind it (pressing `c` behind a drain confirm
     // used to cordon a node with no prompt).
@@ -3533,6 +3781,15 @@ function App() {
                   </button>
                 </span>
               </Show>
+              <Show when={templateFor(selected())}>
+                <button
+                  class="btn sm primary"
+                  title="create a new resource from a starter manifest"
+                  onClick={openNew}
+                >
+                  + New
+                </button>
+              </Show>
               <Show when={table()}>
                 <Show when={kindIs("", "Namespace") && namespace()}>
                   <button
@@ -4651,6 +4908,65 @@ function App() {
                     }}
                   >
                     {confirm()!.label}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={newOpen()}>
+            <div class="modal-backdrop" onClick={() => setNewOpen(false)}>
+              <div
+                class="modal new-modal"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <h3>
+                  New {selected()?.kind}
+                  <span class="gv">
+                    {selected()?.group || "core"}/{selected()?.version}
+                  </span>
+                </h3>
+                <p class="dim new-hint">
+                  Edit the fields marked <span class="chg">👈</span>, then
+                  create. This is a plain create — it fails if the name is
+                  already taken.
+                </p>
+                <Show when={selected()?.namespaced}>
+                  <div class="new-ns">
+                    <span class="meta-key">namespace</span>
+                    <input
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="off"
+                      spellcheck={false}
+                      class="search grow"
+                      placeholder="default"
+                      value={newNs()}
+                      onInput={(e) => setNewNs(e.currentTarget.value)}
+                    />
+                  </div>
+                </Show>
+                <div class="new-editor">
+                  <YamlEditor
+                    value={newYaml()}
+                    theme={theme()}
+                    readOnly={false}
+                    onChange={setNewYaml}
+                  />
+                </div>
+                <Show when={newErr()}>
+                  <div class="new-err">{newErr()}</div>
+                </Show>
+                <div class="modal-actions">
+                  <button class="btn" onClick={() => setNewOpen(false)}>
+                    Cancel
+                  </button>
+                  <button
+                    class="btn primary"
+                    disabled={newBusy()}
+                    onClick={createResource}
+                  >
+                    {newBusy() ? "creating…" : "Create"}
                   </button>
                 </div>
               </div>

@@ -2145,6 +2145,59 @@ details.fold[open] > summary::before {
   width: min(560px, 92%);
 }
 
+.new-modal {
+  width: min(720px, 94%);
+  display: flex;
+  flex-direction: column;
+  max-height: 88vh;
+}
+
+.new-modal h3 .gv {
+  margin-left: 8px;
+}
+
+.new-hint {
+  margin-bottom: 12px;
+}
+
+.new-hint .chg {
+  font-style: normal;
+}
+
+.new-ns {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.new-ns .meta-key {
+  min-width: 74px;
+}
+
+/* Let the editor take the remaining height and scroll internally. */
+.new-editor {
+  flex: 1;
+  min-height: 260px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.new-editor .cm-editor {
+  height: 100%;
+}
+
+.new-err {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--danger-soft, rgba(220, 80, 80, 0.12));
+  color: var(--danger, #e06c6c);
+  font-size: 12.5px;
+  word-break: break-word;
+}
+
 .help-grid {
   display: grid;
   grid-template-columns: max-content 1fr;

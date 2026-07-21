@@ -1831,6 +1831,43 @@ pub async fn apply_resource(
     Ok(())
 }
 
+/// Create a brand-new object from a manifest (the "New" flow). A plain
+/// POST, so the API server rejects it if the name is already taken —
+/// exactly what you want for create, versus apply's upsert. Returns the
+/// created object's name for the success message.
+pub async fn create_resource(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    yaml: String,
+) -> Result<String, String> {
+    let value: serde_json::Value = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("The manifest isn't valid YAML: {e}"))?;
+    // The manifest's own namespace wins; fall back to the picker's.
+    let ns = value
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or(namespace)
+        .filter(|n| !n.is_empty());
+    require_namespace(&rt, &ns)?;
+    let name = value
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Err("metadata.name is required — fill it in before creating.".into());
+    }
+    let obj: DynamicObject = serde_json::from_value(value)
+        .map_err(|e| format!("The manifest isn't a valid object: {e}"))?;
+    let client = client(state, &context).await?;
+    let api = dyn_api(client, &rt, ns.as_deref());
+    api.create(&PostParams::default(), &obj).await.map_err(err)?;
+    Ok(name)
+}
+
 /// Namespace names only. Fetching the objects costs 2.4MB on a cluster
 /// with ~950 namespaces; the printer's cells are 117KB.
 pub async fn list_namespaces(state: &AppState, context: String) -> Result<Vec<String>, String> {
