@@ -84,7 +84,11 @@ dom.window.__TAURI_INTERNALS__ = {
       case "pod_stats":
         return Promise.resolve([]);
       case "filter_rows":
-        return Promise.resolve([]);
+        // A deep-field-only hit (name doesn't contain the query) keyed by
+        // namespace/name — the frontend must union it by key, not index.
+        return Promise.resolve(["ns-5/pod-5"]);
+      case "ensure_index":
+        return Promise.resolve(null);
       default:
         return Promise.resolve([]);
     }
@@ -145,5 +149,27 @@ if (rowsRendered === 0) {
   );
 }
 
-console.log(`smoke ok — table rendered ${rowsRendered} windowed rows`);
+// Search: a name match (pod-777) plus a deep-only backend hit (ns-5/pod-5).
+// The result must contain BOTH — proving the backend hit unions by key —
+// with the name match ranked above the deep-only one.
+const search = root.querySelector("input.search.wide");
+if (!search) fail("no search box", html.replace(/<[^>]+>/g, ""));
+search.value = "pod-777";
+search.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 300));
+if (crash) fail("crash while searching", crash);
+const names = () =>
+  [...root.querySelectorAll("tr.row")].map((tr) => tr.textContent || "");
+const after = names();
+const isP5 = (t) => /pod-5(?!\d)/.test(t); // pod-5, not pod-50/500
+const has777 = after.some((t) => t.includes("pod-777"));
+const has5 = after.some(isP5);
+if (!has777) fail("search dropped the name match pod-777", after.join(" | "));
+if (!has5) fail("search dropped the deep/keyed hit pod-5", after.join(" | "));
+const i777 = after.findIndex((t) => t.includes("pod-777"));
+const i5 = after.findIndex(isP5);
+if (i5 < i777)
+  fail("deep-only hit outranked the name match", after.join(" | "));
+
+console.log(`smoke ok — table rendered ${rowsRendered} windowed rows, search ranked name over deep hit`);
 process.exit(0); // the app keeps timers alive; we are done

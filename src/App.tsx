@@ -504,7 +504,9 @@ function App() {
   const [loading, setLoading] = createSignal(false);
   const [filter, setFilter] = createSignal("");
   const [rowFilter, setRowFilter] = createSignal("");
-  const [matched, setMatched] = createSignal<number[] | null>(null);
+  // Backend full-text hits, as row keys (namespace/name). Keys survive
+  // the watch informer reordering the list; positional indices would not.
+  const [matched, setMatched] = createSignal<Set<string> | null>(null);
   const [confirm, setConfirm] = createSignal<ConfirmState | null>(null);
   // 0 = Cancel, 1 = the action. Confirm dialogs open on the action so
   // Enter still means "yes", but ← makes backing out one keypress.
@@ -1298,8 +1300,8 @@ function App() {
     filterTimer = window.setTimeout(async () => {
       try {
         // Seeded matches (name/labels/cells) land instantly…
-        const quick = await invoke<number[]>("filter_rows", { query: value });
-        if (seq === filterSeq) setMatched(quick);
+        const quick = await invoke<string[]>("filter_rows", { query: value });
+        if (seq === filterSeq) setMatched(new Set(quick));
         // …then the full-object index is built once per list, so a
         // plain browse never pays for it.
         // Keystrokes during the build share one request and re-filter
@@ -1316,7 +1318,7 @@ function App() {
           await indexPromise;
           const latest = rowFilter();
           if (latest.trim()) {
-            setMatched(await invoke<number[]>("filter_rows", { query: latest }));
+            setMatched(new Set(await invoke<string[]>("filter_rows", { query: latest })));
           }
         }
       } catch {
@@ -2038,11 +2040,28 @@ function App() {
     if (!terms.length) {
       out = b.rows;
     } else {
-      const backend = matched();
-      const extra = backend ? new Set(backend) : null;
-      out = b.rows.filter(
-        (r, i) => terms.every((x) => r.hay.includes(x)) || extra?.has(i),
-      );
+      // A row survives if it matches on visible fields (name/namespace/
+      // cells/labels) OR the backend full-text index (deep fields:
+      // annotations, env, spec). The backend hits arrive keyed by
+      // namespace/name so they stay aligned through watch reordering.
+      const extra = matched();
+      const nameHit = (r: DisplayRow) =>
+        terms.every((x) => r.row.name.toLowerCase().includes(x));
+      const visibleHit = (r: DisplayRow) => terms.every((x) => r.hay.includes(x));
+      const deepHit = (r: DisplayRow) => extra?.has(rowKeyOf(r.row)) ?? false;
+      out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
+      // Rank by why it matched: name first, then other visible fields,
+      // then deep-field-only hits (which the user can't see, so they'd
+      // otherwise look like noise flooding out the real matches).
+      const sc0 = sortCol();
+      if (sc0 === null) {
+        const rankOf = (r: DisplayRow) =>
+          nameHit(r) ? 0 : visibleHit(r) ? 1 : 2;
+        out = out
+          .map((r, i) => [r, rankOf(r), i] as const)
+          .sort((a, z) => a[1] - z[1] || a[2] - z[2])
+          .map(([r]) => r);
+      }
     }
 
     const sc = sortCol();

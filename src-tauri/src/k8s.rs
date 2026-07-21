@@ -1384,18 +1384,22 @@ pub async fn ensure_index(state: &AppState) -> Result<(), String> {
     .await
 }
 
-pub async fn filter_rows(state: &AppState, query: String) -> Result<Vec<u32>, String> {
+pub async fn filter_rows(state: &AppState, query: String) -> Result<Vec<String>, String> {
     let terms: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
         .map(String::from)
         .collect();
     let s = state.search.read().await;
+    // Return the matched rows' keys (namespace/name), not positional
+    // indices: the frontend list is reordered by the watch informer
+    // independently of this cache, so an index would point at the wrong
+    // row. A key stays correct no matter how the list is spliced.
     Ok(s.blobs
         .iter()
         .enumerate()
         .filter(|(_, b)| terms.iter().all(|t| b.contains(t.as_str())))
-        .map(|(i, _)| i as u32)
+        .filter_map(|(i, _)| s.keys.get(i).cloned())
         .collect())
 }
 

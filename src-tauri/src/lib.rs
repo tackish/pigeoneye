@@ -313,7 +313,7 @@ async fn ensure_index(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn filter_rows(state: State<'_, AppState>, query: String) -> Result<Vec<u32>, String> {
+async fn filter_rows(state: State<'_, AppState>, query: String) -> Result<Vec<String>, String> {
     k8s::filter_rows(&state, query).await
 }
 
