@@ -2327,6 +2327,119 @@ pub async fn scale_resource(
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct Revision {
+    pub revision: i64,
+    pub name: String,
+    pub images: Vec<String>,
+    pub created: Option<String>,
+    pub current: bool,
+}
+
+/// Revision history of a Deployment (from its ReplicaSets), newest
+/// first — like `kubectl rollout history`.
+pub async fn rollout_history(
+    state: &AppState,
+    context: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<Vec<Revision>, String> {
+    let ns = namespace.filter(|n| !n.is_empty()).ok_or("needs a namespace")?;
+    let client = client(state, &context).await?;
+    let dep_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "Deployment"));
+    let dep = Api::<DynamicObject>::namespaced_with(client.clone(), &ns, &dep_ar)
+        .get(&name)
+        .await
+        .map_err(err)?;
+    let dv = serde_json::to_value(&dep).map_err(err)?;
+    let cur_rev = dv
+        .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+        .and_then(|r| r.as_str())
+        .and_then(|s| s.parse::<i64>().ok());
+    let rs_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "ReplicaSet"));
+    let rs_list = Api::<DynamicObject>::namespaced_with(client, &ns, &rs_ar)
+        .list(&ListParams::default())
+        .await
+        .map_err(err)?;
+    let mut out: Vec<Revision> = rs_list
+        .items
+        .iter()
+        .filter(|rs| {
+            rs.metadata
+                .owner_references
+                .as_ref()
+                .map(|o| o.iter().any(|r| r.kind == "Deployment" && r.name == name))
+                .unwrap_or(false)
+        })
+        .filter_map(|rs| {
+            let v = serde_json::to_value(rs).ok()?;
+            let revision = v
+                .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+                .and_then(|r| r.as_str())
+                .and_then(|s| s.parse::<i64>().ok())?;
+            let images = v
+                .pointer("/spec/template/spec/containers")
+                .and_then(|c| c.as_array())
+                .map(|cs| {
+                    cs.iter()
+                        .filter_map(|c| c.get("image").and_then(|i| i.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Revision {
+                revision,
+                name: rs.metadata.name.clone().unwrap_or_default(),
+                images,
+                created: v
+                    .pointer("/metadata/creationTimestamp")
+                    .and_then(|t| t.as_str())
+                    .map(String::from),
+                current: Some(revision) == cur_rev,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.revision.cmp(&a.revision));
+    Ok(out)
+}
+
+/// Roll a Deployment back to a prior revision's pod template — like
+/// `kubectl rollout undo`. Patches spec.template from the target
+/// ReplicaSet (the pod-template-hash label stripped so the controller
+/// recomputes it).
+pub async fn rollout_undo(
+    state: &AppState,
+    context: String,
+    namespace: Option<String>,
+    name: String,
+    rs_name: String,
+) -> Result<(), String> {
+    let ns = namespace.filter(|n| !n.is_empty()).ok_or("needs a namespace")?;
+    let client = client(state, &context).await?;
+    let rs_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "ReplicaSet"));
+    let rs = Api::<DynamicObject>::namespaced_with(client.clone(), &ns, &rs_ar)
+        .get(&rs_name)
+        .await
+        .map_err(err)?;
+    let rv = serde_json::to_value(&rs).map_err(err)?;
+    let mut template = rv
+        .pointer("/spec/template")
+        .cloned()
+        .ok_or("that revision has no pod template")?;
+    if let Some(labels) = template
+        .pointer_mut("/metadata/labels")
+        .and_then(|l| l.as_object_mut())
+    {
+        labels.remove("pod-template-hash");
+    }
+    let patch = serde_json::json!({ "spec": { "template": template } });
+    let dep_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "Deployment"));
+    Api::<DynamicObject>::namespaced_with(client, &ns, &dep_ar)
+        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(err)?;
+    Ok(())
+}
+
 /// Same mechanism as `kubectl rollout restart`: bump the pod template's
 /// restartedAt annotation and let the controller roll.
 pub async fn restart_rollout(

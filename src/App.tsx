@@ -120,6 +120,14 @@ interface NodeStat {
   mem_pct: number;
 }
 
+interface Revision {
+  revision: number;
+  name: string;
+  images: string[];
+  created: string | null;
+  current: boolean;
+}
+
 interface EventInfo {
   type_: string;
   reason: string;
@@ -2964,6 +2972,40 @@ function App() {
     });
   }
 
+  const [history, setHistory] = createSignal<Revision[] | null>(null);
+  function openHistory(target?: Target) {
+    const d = target ?? currentTarget();
+    if (!d || !kindIs("apps", "Deployment")) return;
+    void invoke<Revision[]>("rollout_history", {
+      context: active(),
+      namespace: d.namespace,
+      name: d.name,
+    })
+      .then((r) => setHistory(r))
+      .catch((e) => setActionErr(prettyError(String(e))));
+  }
+  function rollbackTo(rev: Revision) {
+    const d = currentTarget();
+    if (!d) return;
+    setHistory(null);
+    setDlgIdx(1);
+    setConfirm({
+      title: `Roll back to revision ${rev.revision}?`,
+      body: `Sets ${d.name}'s pod template to revision ${rev.revision} (${rev.images.join(", ")}).`,
+      label: "Roll back",
+      danger: true,
+      run: () =>
+        void runAction("rollback", () =>
+          invoke("rollout_undo", {
+            context: active(),
+            namespace: d.namespace,
+            name: d.name,
+            rsName: rev.name,
+          }),
+        ),
+    });
+  }
+
   interface Target {
     namespace: string | null;
     name: string;
@@ -3071,6 +3113,7 @@ function App() {
         return;
       }
       if (dryRun()) setDryRun(null);
+      else if (history()) setHistory(null);
       else if (colMenu()) setColMenu(null);
       else if (colsOpen()) setColsOpen(false);
       else if (settingsOpen()) setSettingsOpen(false);
@@ -4856,6 +4899,9 @@ function App() {
                   <Show when={restartable()}>
                     {actionBtn("restart", () => requestRestart())}
                   </Show>
+                  <Show when={kindIs("apps", "Deployment")}>
+                    {actionBtn("history", () => openHistory())}
+                  </Show>
                   <Show when={isArgoRollout()}>
                     {actionBtn("restart", () => restartArgoRollout())}
                   </Show>
@@ -5758,6 +5804,42 @@ function App() {
                 <p class="dim new-foot">
                   <b>↑↓</b> section · <b>↵</b> {newSec() === "editor" ? "edit" : newSec() === "namespace" ? "pick ns" : "run"} · <b>esc</b> {newNsOpen() ? "close list" : "close"} · <b>⌘↵</b> create
                 </p>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={history()}>
+            <div class="modal-backdrop" onClick={() => setHistory(null)}>
+              <div class="modal new-modal" onClick={(e) => e.stopPropagation()}>
+                <h3>Rollout history</h3>
+                <div class="rev-list">
+                  <For each={history()}>
+                    {(r) => (
+                      <div class="rev-row" classList={{ cur: r.current }}>
+                        <span class="rev-num">#{r.revision}</span>
+                        <span class="rev-imgs">{r.images.join(", ")}</span>
+                        <Show
+                          when={!r.current}
+                          fallback={<span class="dim">current</span>}
+                        >
+                          <button class="btn sm" onClick={() => rollbackTo(r)}>
+                            roll back
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                  <Show when={history()!.length === 0}>
+                    <p class="dim" style={{ padding: "8px" }}>
+                      no ReplicaSet revisions found
+                    </p>
+                  </Show>
+                </div>
+                <div class="modal-actions">
+                  <button class="btn" onClick={() => setHistory(null)}>
+                    close
+                  </button>
+                </div>
               </div>
             </div>
           </Show>

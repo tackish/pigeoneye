@@ -2005,6 +2005,39 @@ details.fold[open] > summary::before {
   margin: 6px 0 10px;
 }
 
+.rev-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 55vh;
+  overflow: auto;
+}
+
+.rev-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rev-row.cur {
+  background: var(--accent-soft);
+}
+
+.rev-num {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  min-width: 40px;
+}
+
+.rev-imgs {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  word-break: break-all;
+}
+
 .dryrun-out {
   font-family: var(--font-mono);
   font-size: 11.5px;

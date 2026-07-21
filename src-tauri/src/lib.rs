@@ -207,6 +207,27 @@ async fn restart_rollout(
 }
 
 #[tauri::command]
+async fn rollout_history(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: Option<String>,
+    name: String,
+) -> Result<Vec<k8s::Revision>, String> {
+    k8s::rollout_history(&state, context, namespace, name).await
+}
+
+#[tauri::command]
+async fn rollout_undo(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: Option<String>,
+    name: String,
+    rs_name: String,
+) -> Result<(), String> {
+    k8s::rollout_undo(&state, context, namespace, name, rs_name).await
+}
+
+#[tauri::command]
 async fn patch_resource(
     state: State<'_, AppState>,
     context: String,
@@ -472,6 +493,8 @@ pub fn run() {
             drain_node,
             scale_resource,
             restart_rollout,
+            rollout_history,
+            rollout_undo,
             patch_resource,
             trigger_cronjob,
             exec_start,
