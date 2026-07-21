@@ -160,6 +160,11 @@ const CATEGORIES: [string, [string, string][]][] = [
     "Workloads",
     [
       ["", "Pod"],
+      // Argo Rollouts is a progressive-delivery replacement for
+      // Deployment; where it's installed teams often reach for it more
+      // than Deployment, so pin it right up top. Only renders if the
+      // argoproj.io CRD is present in the cluster.
+      ["argoproj.io", "Rollout"],
       ["apps", "Deployment"],
       ["apps", "ReplicaSet"],
       ["apps", "StatefulSet"],
@@ -1880,11 +1885,14 @@ function App() {
     () => new Set(pinned().flatMap((c) => c.types.map(typeKey))),
   );
 
-  // Every non-builtin group is someone's CRD — surface them all, always.
+  // Every non-builtin group is someone's CRD — surface them all, always,
+  // except a CRD we've pinned into a category above (e.g. Argo Rollout in
+  // Workloads), so it doesn't also show under its raw group.
   const customGroups = createMemo(() => {
+    const pk = pinnedKeys();
     const byGroup = new Map<string, ResourceType[]>();
     for (const t of types()) {
-      if (isBuiltinGroup(t.group)) continue;
+      if (isBuiltinGroup(t.group) || pk.has(typeKey(t))) continue;
       if (!byGroup.has(t.group)) byGroup.set(t.group, []);
       byGroup.get(t.group)!.push(t);
     }

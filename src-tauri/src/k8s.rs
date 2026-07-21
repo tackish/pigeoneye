@@ -1346,11 +1346,20 @@ async fn pod_names_by_node(
     };
     let mut map: std::collections::HashMap<String, NodePods> = std::collections::HashMap::new();
     let mut token: Option<String> = None;
+    let mut pages = 0;
     loop {
         // All namespaces: nodes are cluster-scoped, and a node hosts pods
         // from every namespace.
         let page =
             fetch_table_page(client, &pod_rt, None, "Metadata", None, token.as_deref()).await?;
+        pages += 1;
+        if pages == 1 {
+            let cols: Vec<&str> = page["columnDefinitions"]
+                .as_array()
+                .map(|c| c.iter().filter_map(|d| d["name"].as_str()).collect())
+                .unwrap_or_default();
+            eprintln!("[pigeoneye] node search: pod Table columns = {cols:?}");
+        }
         fold_pod_page(&page, &mut map);
         token = page
             .pointer("/metadata/continue")
@@ -1361,6 +1370,7 @@ async fn pod_names_by_node(
             break;
         }
     }
+    eprintln!("[pigeoneye] node search: read {pages} pod page(s)");
     Ok(map.into_iter().map(|(k, v)| (k, v.into_blob())).collect())
 }
 
@@ -1455,14 +1465,25 @@ async fn build_index(
     // node object itself never mentions its pods, so without this the
     // relationship isn't searchable at all.
     if is_node && search.read().await.generation == generation {
-        if let Ok(pods) = pod_names_by_node(client).await {
-            for (key, blob) in by_key.iter_mut() {
-                let node = key.strip_prefix('/').unwrap_or(key.as_str());
-                if let Some(names) = pods.get(node) {
-                    blob.push(' ');
-                    blob.push_str(names);
+        match pod_names_by_node(client).await {
+            Ok(pods) => {
+                let mut enriched = 0;
+                for (key, blob) in by_key.iter_mut() {
+                    let node = key.strip_prefix('/').unwrap_or(key.as_str());
+                    if let Some(names) = pods.get(node) {
+                        blob.push(' ');
+                        blob.push_str(names);
+                        enriched += 1;
+                    }
                 }
+                eprintln!(
+                    "[pigeoneye] node search: mapped {} nodes from pods, enriched {}/{} node blobs",
+                    pods.len(),
+                    enriched,
+                    by_key.len()
+                );
             }
+            Err(e) => eprintln!("[pigeoneye] node search: pod probe failed: {e}"),
         }
     }
 
