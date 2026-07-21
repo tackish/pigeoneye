@@ -2201,6 +2201,41 @@ details.fold[open] > summary::before {
   word-break: break-word;
 }
 
+/* Keyboard section highlight: the editor or the actions row owns focus. */
+.new-editor.cur {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.new-modal .modal-actions.cur {
+  outline: 1px dashed var(--accent);
+  outline-offset: 6px;
+  border-radius: 6px;
+}
+
+.new-foot {
+  margin-top: 10px;
+  font-size: 11.5px;
+  text-align: right;
+}
+
+.new-foot b {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+/* Namespace dropdown sits inline in the New dialog. */
+.new-ns-picker {
+  position: relative;
+  flex: 1;
+}
+
+.new-ns-picker .ns-btn {
+  width: 100%;
+  justify-content: space-between;
+}
+
 .help-grid {
   display: grid;
   grid-template-columns: max-content 1fr;

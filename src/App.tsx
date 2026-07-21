@@ -1080,6 +1080,16 @@ function App() {
   const [newNs, setNewNs] = createSignal("");
   const [newBusy, setNewBusy] = createSignal(false);
   const [newErr, setNewErr] = createSignal<string | null>(null);
+  const [newNsOpen, setNewNsOpen] = createSignal(false);
+  const [newNsQuery, setNewNsQuery] = createSignal("");
+  // Which part of the New dialog the keyboard owns: the manifest editor
+  // or the Create/Cancel actions. Esc steps editor → actions → close.
+  const [newSec, setNewSec] = createSignal<"editor" | "actions">("editor");
+  const [newDlgIdx, setNewDlgIdx] = createSignal(1); // 0=Cancel, 1=Create
+  const newNsFiltered = createMemo(() => {
+    const q = newNsQuery().toLowerCase().trim();
+    return namespaces().filter((n) => !q || n.toLowerCase().includes(q));
+  });
   const [actionBusy, setActionBusy] = createSignal<string | null>(null);
   const [actionMsg, setActionMsg] = createSignal<string | null>(null);
   const [actionErr, setActionErr] = createSignal<string | null>(null);
@@ -2007,6 +2017,9 @@ function App() {
     setNewYaml(tpl);
     // Seed the namespace from the current filter, else "default".
     setNewNs(rt.namespaced ? namespace() || "default" : "");
+    setNewSec("editor");
+    setNewDlgIdx(1);
+    setNewNsOpen(false);
     setNewOpen(true);
   }
 
@@ -2654,8 +2667,20 @@ function App() {
       return;
     }
     if (e.key === "Escape") {
-      if (newOpen()) setNewOpen(false);
-      else if (pickMode()) setPickMode(null);
+      // New dialog steps up its own hierarchy: namespace popup → editor →
+      // actions → close, so Esc never yanks you straight out of an edit.
+      if (newOpen()) {
+        // The editor's own Esc keymap already moved us to the actions row
+        // (and blurred); don't also close on the same event.
+        if (e.defaultPrevented) return;
+        if (newNsOpen()) setNewNsOpen(false);
+        else if (newSec() === "editor") {
+          setNewSec("actions");
+          (document.activeElement as HTMLElement | null)?.blur?.();
+        } else setNewOpen(false);
+        return;
+      }
+      if (pickMode()) setPickMode(null);
       else if (scaleOpen()) setScaleOpen(false);
       else if (pfOpen()) setPfOpen(false);
       else if (helpOpen()) setHelpOpen(false);
@@ -2676,9 +2701,30 @@ function App() {
       } else popHistory();
       return;
     }
-    // The New dialog owns the keyboard while open (its editor handles its
-    // own keys); nothing may reach the table behind it.
-    if (newOpen()) return;
+    // The New dialog owns the keyboard while open. ⌘/Ctrl+↵ creates from
+    // anywhere; in the actions row the arrows pick a button. The editor
+    // and namespace search handle their own keys (typing is true there).
+    if (newOpen()) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        createResource();
+        return;
+      }
+      if (newSec() === "actions" && !typing) {
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Tab") {
+          e.preventDefault();
+          setNewDlgIdx(e.key === "ArrowLeft" ? 0 : e.key === "ArrowRight" ? 1 : newDlgIdx() === 1 ? 0 : 1);
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          if (newDlgIdx() === 1) createResource();
+          else setNewOpen(false);
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setNewSec("editor");
+        }
+      }
+      return;
+    }
     // Any open dialog owns the keyboard completely: keys must never
     // reach the table behind it (pressing `c` behind a drain confirm
     // used to cordon a node with no prompt).
@@ -3063,12 +3109,19 @@ function App() {
     } else if (e.key === "/") {
       e.preventDefault();
       rowSearchRef?.focus();
+    } else if (e.key === "n" && templateFor(selected())) {
+      // `n` = New, from the list, when this kind is creatable.
+      e.preventDefault();
+      openNew();
     } else if (e.key === "ArrowDown" || e.key === "j") {
       e.preventDefault();
       moveCursor(1);
     } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault();
-      moveCursor(-1);
+      // Past the top row, step up into the header: focus the search box
+      // (Tab from there reaches + New) — the list's parent level.
+      if (cursor() <= 0) rowSearchRef?.focus();
+      else moveCursor(-1);
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "d" || e.key === "D")) {
       // Destructive commands work straight off the list; both variants
       // go through the confirmation dialog.
@@ -3807,6 +3860,14 @@ function App() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === "Escape")
                     e.currentTarget.blur();
+                  // ArrowDown drops focus back into the list — the search
+                  // box is the header level above the rows.
+                  else if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    e.currentTarget.blur();
+                    tableFocusRef?.focus();
+                    setCursor(0);
+                  }
                 }}
               />
               <Show when={activeFieldSel()}>
@@ -4994,41 +5055,118 @@ function App() {
                 <Show when={selected()?.namespaced}>
                   <div class="new-ns">
                     <span class="meta-key">namespace</span>
-                    <input
-                      autocomplete="off"
-                      autocorrect="off"
-                      autocapitalize="off"
-                      spellcheck={false}
-                      class="search grow"
-                      placeholder="default"
-                      value={newNs()}
-                      onInput={(e) => setNewNs(e.currentTarget.value)}
-                    />
+                    <div class="ns-picker new-ns-picker">
+                      <button
+                        class="ctx ns-btn"
+                        onClick={() => {
+                          setNewNsOpen(!newNsOpen());
+                          setNewNsQuery("");
+                        }}
+                      >
+                        {newNs() || "(pick namespace)"}{" "}
+                        <span class="dim">▾</span>
+                      </button>
+                      <Show when={newNsOpen()}>
+                        <div
+                          class="ns-backdrop"
+                          onClick={() => setNewNsOpen(false)}
+                        />
+                        <div class="ns-pop">
+                          <input
+                            autocomplete="off"
+                            autocorrect="off"
+                            autocapitalize="off"
+                            spellcheck={false}
+                            class="search"
+                            placeholder="search namespaces…"
+                            ref={(el) => setTimeout(() => el.focus())}
+                            value={newNsQuery()}
+                            onInput={(e) => setNewNsQuery(e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Escape") {
+                                e.stopPropagation();
+                                setNewNsOpen(false);
+                              }
+                              if (e.key === "Enter") {
+                                const first = newNsFiltered()[0];
+                                if (first) setNewNs(first);
+                                setNewNsOpen(false);
+                              }
+                            }}
+                          />
+                          <div class="ns-list">
+                            <For each={newNsFiltered()}>
+                              {(n) => (
+                                <button
+                                  class="ns-item"
+                                  classList={{ active: newNs() === n }}
+                                  onClick={() => {
+                                    setNewNs(n);
+                                    setNewNsOpen(false);
+                                  }}
+                                >
+                                  {n}
+                                </button>
+                              )}
+                            </For>
+                            <Show when={newNsFiltered().length === 0}>
+                              <p class="dim" style={{ padding: "8px 10px" }}>
+                                no match — type an exact name to use it
+                              </p>
+                            </Show>
+                          </div>
+                        </div>
+                      </Show>
+                    </div>
                   </div>
                 </Show>
-                <div class="new-editor">
+                <div
+                  class="new-editor"
+                  classList={{ cur: newSec() === "editor" }}
+                  onClick={() => setNewSec("editor")}
+                >
                   <YamlEditor
                     value={newYaml()}
                     theme={theme()}
                     readOnly={false}
                     onChange={setNewYaml}
+                    onLeave={() => {
+                      // Esc in the editor steps out to the actions row;
+                      // blur so the next Esc reaches the dialog (closes it)
+                      // instead of the editor swallowing it again.
+                      setNewSec("actions");
+                      (document.activeElement as HTMLElement | null)?.blur?.();
+                    }}
                   />
                 </div>
                 <Show when={newErr()}>
                   <div class="new-err">{newErr()}</div>
                 </Show>
-                <div class="modal-actions">
-                  <button class="btn" onClick={() => setNewOpen(false)}>
+                <div
+                  class="modal-actions"
+                  classList={{ cur: newSec() === "actions" }}
+                >
+                  <button
+                    class="btn"
+                    classList={{ "btn-cursor": newSec() === "actions" && newDlgIdx() === 0 }}
+                    onClick={() => setNewOpen(false)}
+                  >
                     Cancel
                   </button>
                   <button
                     class="btn primary"
+                    classList={{ "btn-cursor": newSec() === "actions" && newDlgIdx() === 1 }}
                     disabled={newBusy()}
                     onClick={createResource}
                   >
                     {newBusy() ? "creating…" : "Create"}
                   </button>
                 </div>
+                <p class="dim new-foot">
+                  <b>esc</b> {newSec() === "editor" ? "→ buttons" : "→ close"}
+                  {"  ·  "}
+                  <b>⌘↵</b> create
+                </p>
               </div>
             </div>
           </Show>
