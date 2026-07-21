@@ -2478,6 +2478,91 @@ pub async fn exec_start(
     .await
 }
 
+/// `kubectl debug`: attach an ephemeral debug container (a full toolbox
+/// image) to a running pod without restarting it, then exec into it —
+/// the way to get a shell into a distroless/crashed pod that has none.
+pub async fn debug_start(
+    state: &AppState,
+    context: String,
+    namespace: String,
+    pod: String,
+    image: Option<String>,
+    target: Option<String>,
+    channel: Channel<String>,
+) -> Result<u32, String> {
+    if namespace.is_empty() {
+        return Err("debug needs a namespace".into());
+    }
+    let client = client(state, &context).await?;
+    let pods: Api<K8sPod> = Api::namespaced(client.clone(), &namespace);
+    let img = image
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "busybox:1.36".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let ec_name = format!("debugger-{:x}", nanos & 0xffff);
+    let mut ec = serde_json::json!({
+        "name": ec_name, "image": img, "stdin": true, "tty": true, "command": ["sh"]
+    });
+    if let Some(t) = target.filter(|s| !s.is_empty()) {
+        ec["targetContainerName"] = t.into();
+    }
+    let patch = serde_json::json!({ "spec": { "ephemeralContainers": [ec] } });
+    pods.patch_subresource(
+        "ephemeralcontainers",
+        &pod,
+        &PatchParams::default(),
+        &Patch::Strategic(patch),
+    )
+    .await
+    .map_err(err)?;
+    // Wait for the ephemeral container to start (image pull included).
+    let mut ready = false;
+    for _ in 0..120 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(p) = pods.get(&pod).await {
+            let v = serde_json::to_value(&p).unwrap_or_default();
+            if let Some(sts) = v
+                .pointer("/status/ephemeralContainerStatuses")
+                .and_then(|s| s.as_array())
+            {
+                for s in sts {
+                    if s.get("name").and_then(|n| n.as_str()) == Some(ec_name.as_str()) {
+                        if s.pointer("/state/running").is_some() {
+                            ready = true;
+                        } else if let Some(term) = s.pointer("/state/terminated") {
+                            let reason = term
+                                .get("reason")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("terminated");
+                            return Err(format!("debug container {reason}"));
+                        }
+                    }
+                }
+            }
+        }
+        if ready {
+            break;
+        }
+    }
+    if !ready {
+        return Err("debug container did not start within 60s".into());
+    }
+    start_exec_session(
+        state,
+        client,
+        &namespace,
+        &pod,
+        Some(ec_name),
+        vec!["sh".into()],
+        channel,
+        None,
+    )
+    .await
+}
+
 /// Follow a pod's logs into the same session plumbing the shells use —
 /// read-only (no stdin), \n normalized to \r\n for xterm.
 #[allow(clippy::too_many_arguments)]

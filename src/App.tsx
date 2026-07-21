@@ -4793,6 +4793,14 @@ function App() {
                   <Show when={isPod()}>
                     {actionBtn("shell", () => openPodSession("pod"))}
                     {actionBtn("logs", () => openPodSession("logs"))}
+                    {actionBtn("debug", () =>
+                      openShell({
+                        kind: "debug",
+                        context: active()!,
+                        namespace: detail()!.namespace ?? "default",
+                        name: detail()!.name,
+                      }),
+                    )}
                     {actionBtn("forward", () => {
                       setPfPort(String(detail()!.ports[0] ?? ""));
                       setPfOpen(true);

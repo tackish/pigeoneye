@@ -269,6 +269,19 @@ async fn node_shell_start(
 }
 
 #[tauri::command]
+async fn debug_start(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: String,
+    pod: String,
+    image: Option<String>,
+    target: Option<String>,
+    channel: Channel<String>,
+) -> Result<u32, String> {
+    k8s::debug_start(&state, context, namespace, pod, image, target, channel).await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn log_start(
     state: State<'_, AppState>,
@@ -462,6 +475,7 @@ pub fn run() {
             patch_resource,
             trigger_cronjob,
             exec_start,
+            debug_start,
             node_shell_start,
             log_start,
             logs_selector_start,

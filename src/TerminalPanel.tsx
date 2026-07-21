@@ -14,7 +14,7 @@ export interface ResourceTypeRef {
 }
 
 export interface ShellTarget {
-  kind: "pod" | "node" | "logs" | "wlogs";
+  kind: "pod" | "node" | "logs" | "wlogs" | "debug";
   context: string;
   namespace?: string;
   name: string;
@@ -164,6 +164,11 @@ export default function TerminalPanel(props: {
         `\x1b[90mstarting privileged helper pod on ${t.name}… (up to 30s)\x1b[0m\r\n`,
       );
     }
+    if (t.kind === "debug") {
+      term.write(
+        `\x1b[90mattaching ephemeral debug container to ${t.name}… (pulling ${t.image ?? "busybox:1.36"}, up to 60s)\x1b[0m\r\n`,
+      );
+    }
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
       if (d === "\u0000exit") {
@@ -184,6 +189,15 @@ export default function TerminalPanel(props: {
               command: t.command ?? null,
               channel: chan,
             })
+          : t.kind === "debug"
+            ? await invoke<number>("debug_start", {
+                context: t.context,
+                namespace: t.namespace,
+                pod: t.name,
+                image: t.image ?? null,
+                target: t.container ?? null,
+                channel: chan,
+              })
           : t.kind === "logs"
             ? await invoke<number>("log_start", {
                 context: t.context,
