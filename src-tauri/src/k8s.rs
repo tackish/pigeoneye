@@ -1335,31 +1335,30 @@ fn fold_pod_page(
 async fn pod_names_by_node(
     client: &Client,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let pod_rt = ResourceType {
-        group: String::new(),
-        version: "v1".into(),
-        kind: "Pod".into(),
-        plural: "pods".into(),
-        namespaced: true,
-        deletable: true,
-        editable: true,
-    };
+    // This probe is never rendered, so page it in big gulps: at 500/page
+    // a 24k-pod cluster is ~48 sequential round-trips (the first search
+    // appears to hang); large pages cut that to a handful.
+    const PROBE_LIMIT: u32 = 5000;
     let mut map: std::collections::HashMap<String, NodePods> = std::collections::HashMap::new();
     let mut token: Option<String> = None;
     let mut pages = 0;
     loop {
         // All namespaces: nodes are cluster-scoped, and a node hosts pods
         // from every namespace.
-        let page =
-            fetch_table_page(client, &pod_rt, None, "Metadata", None, token.as_deref()).await?;
-        pages += 1;
-        if pages == 1 {
-            let cols: Vec<&str> = page["columnDefinitions"]
-                .as_array()
-                .map(|c| c.iter().filter_map(|d| d["name"].as_str()).collect())
-                .unwrap_or_default();
-            eprintln!("[pigeoneye] node search: pod Table columns = {cols:?}");
+        let mut url = format!("/api/v1/pods?limit={PROBE_LIMIT}&includeObject=Metadata");
+        if let Some(tok) = token.as_deref().filter(|t| !t.is_empty()) {
+            url.push_str("&continue=");
+            url.push_str(&urlencode(tok));
         }
+        let req = http::Request::get(&url)
+            .header(
+                http::header::ACCEPT,
+                "application/json;as=Table;v=v1;g=meta.k8s.io, application/json",
+            )
+            .body(Vec::new())
+            .map_err(err)?;
+        let page: serde_json::Value = client.request(req).await.map_err(err)?;
+        pages += 1;
         fold_pod_page(&page, &mut map);
         token = page
             .pointer("/metadata/continue")
@@ -1370,7 +1369,10 @@ async fn pod_names_by_node(
             break;
         }
     }
-    eprintln!("[pigeoneye] node search: read {pages} pod page(s)");
+    eprintln!(
+        "[pigeoneye] node search: read {pages} pod page(s), mapped {} nodes",
+        map.len()
+    );
     Ok(map.into_iter().map(|(k, v)| (k, v.into_blob())).collect())
 }
 
