@@ -1010,7 +1010,10 @@ th.sorted {
   top: 0;
   right: 0;
   bottom: 0;
-  width: min(640px, 72%);
+  /* Grow with the viewport so wide manifests (long env values, checksums)
+     don't wrap on big monitors, while staying usable on small ones. */
+  width: clamp(560px, 46vw, 1080px);
+  max-width: 82%;
   background: var(--bg-drawer);
   border-left: 1px solid var(--drawer-border);
   display: flex;
