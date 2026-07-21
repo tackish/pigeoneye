@@ -2284,7 +2284,9 @@ function App() {
   const scalable = () =>
     kindIs("apps", "Deployment") ||
     kindIs("apps", "StatefulSet") ||
-    kindIs("apps", "ReplicaSet");
+    kindIs("apps", "ReplicaSet") ||
+    // Argo Rollout has spec.replicas; the generic scale patch works.
+    kindIs("argoproj.io", "Rollout");
   const restartable = () =>
     kindIs("apps", "Deployment") ||
     kindIs("apps", "StatefulSet") ||
@@ -2296,6 +2298,7 @@ function App() {
     kindIs("apps", "DaemonSet") ||
     kindIs("apps", "ReplicaSet") ||
     kindIs("batch", "Job") ||
+    kindIs("argoproj.io", "Rollout") ||
     kindIs("", "Service");
 
   function openWorkloadLogs(namespaceArg: string | null, name: string) {
@@ -5290,6 +5293,9 @@ function App() {
                   <b>enter · →</b><span>from the sidebar: open that kind</span>
                   <b>← →</b><span>pan wide tables · Home/End first/last column</span>
                   <b>Enter</b><span>open detail — on a namespace, scope to it and list its pods</span>
+                  <b>n</b><span>new resource (creatable kinds) · ⇧↑ on top row → search</span>
+                  <b>f</b><span>filter the sorted column (values or &gt;/&lt; for numbers)</span>
+                  <b>⌘F</b><span>focus the row search / find in the open detail</span>
                   <b>s</b><span>shell (pod / node)</span>
                   <b>l</b><span>logs (pod / workload aggregate)</span>
                   <b>e</b> / <b>y</b><span>edit manifest (YAML) of cursor row</span>
@@ -5299,7 +5305,6 @@ function App() {
                   <b>⌘/ctrl R</b><span>rollout restart of cursor row</span>
                   <b>c · ⇧D</b><span>cordon · drain the cursor node</span>
                   <b>d</b><span>delete (detail open)</span>
-                  <b>/</b><span>search — rows, or inside the open detail</span>
                   <b>⇧← ⇧→</b><span>pick the sort column</span>
                   <b>⇧↑ ⇧↓</b><span>sort ascending / descending</span>
                   <b>Shift A/N/S/R/T/C/M/I/O</b>
