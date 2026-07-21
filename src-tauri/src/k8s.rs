@@ -2575,6 +2575,21 @@ pub async fn pf_stop(state: &AppState, id: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Sanitize a user string into a DNS-1123 label prefix: lowercase,
+/// alphanumeric or '-', no leading/trailing '-', capped so the suffix fits.
+fn dns_label(s: &str) -> String {
+    let mut out: String = s
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').chars().take(40).collect()
+}
+
 /// Node shell via a privileged hostPID helper pod
 /// pinned to the node, then nsenter into the host's namespaces. The
 /// helper pod is deleted when the session closes. Image, namespace and
@@ -2583,6 +2598,7 @@ pub async fn node_shell_start(
     state: &AppState,
     context: String,
     node: String,
+    name: Option<String>,
     image: Option<String>,
     shell_namespace: Option<String>,
     cpu_limit: Option<String>,
@@ -2594,7 +2610,15 @@ pub async fn node_shell_start(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let name = format!("pigeoneye-node-shell-{:x}", nanos & 0xffff_ffff);
+    // A user-given name becomes the prefix (sanitized to DNS-1123); a
+    // short unique suffix is always appended so repeated shells and
+    // concurrent ones never collide.
+    let prefix = name
+        .as_deref()
+        .map(dns_label)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pigeoneye-node-shell".to_string());
+    let name = format!("{prefix}-{:x}", nanos & 0xffff_ffff);
     let image = image
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "busybox:1.36".to_string());

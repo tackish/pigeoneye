@@ -24,6 +24,7 @@ export interface ShellTarget {
   /// pod shells: override shell command ("bash || sh" by default)
   command?: string;
   /// node shells: helper-pod customization
+  podName?: string;
   image?: string;
   shellNamespace?: string;
   cpuLimit?: string;
@@ -185,6 +186,7 @@ export default function TerminalPanel(props: {
               : await invoke<number>("node_shell_start", {
                 context: t.context,
                 node: t.name,
+                name: t.podName ?? null,
                 image: t.image ?? null,
                 shellNamespace: t.shellNamespace ?? null,
                 cpuLimit: t.cpuLimit ?? null,

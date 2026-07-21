@@ -130,6 +130,7 @@ interface PfInfo {
 
 interface ShellCfg {
   podCommand?: string;
+  nodeName?: string;
   nodeImage?: string;
   nodeNamespace?: string;
   nodeCpu?: string;
@@ -1380,6 +1381,7 @@ function App() {
       target.command = cfg.podCommand.trim();
     }
     if (target.kind === "node") {
+      target.podName = cfg.nodeName?.trim() || undefined;
       target.image = cfg.nodeImage?.trim() || undefined;
       target.shellNamespace = cfg.nodeNamespace?.trim() || undefined;
       target.cpuLimit = cfg.nodeCpu?.trim() || undefined;
@@ -3516,9 +3518,6 @@ function App() {
           </div>
           <p class="settings-note">
             Pod shell defaults to kubectl-exec with bash→sh fallback.
-            Node shell launches a privileged hostPID helper pod
-            (busybox:1.36 in kube-system) and nsenters the host.
-            Override any of it here.
           </p>
           <div class="settings-grid">
             <span class="meta-key">pod shell command</span>
@@ -3527,6 +3526,13 @@ function App() {
               placeholder="command -v bash >/dev/null && exec bash || exec sh"
               value={shellCfg().podCommand ?? ""}
               onInput={(e) => saveShellCfg({ podCommand: e.currentTarget.value })}
+            />
+            <span class="meta-key">node shell name</span>
+            <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
+              class="search grow"
+              placeholder="pigeoneye-node-shell (a unique suffix is added)"
+              value={shellCfg().nodeName ?? ""}
+              onInput={(e) => saveShellCfg({ nodeName: e.currentTarget.value })}
             />
             <span class="meta-key">node shell image</span>
             <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
@@ -3559,6 +3565,34 @@ function App() {
                 onInput={(e) => saveShellCfg({ nodeMem: e.currentTarget.value })}
               />
             </span>
+          </div>
+          {/* Transparency: exactly what a node shell does. */}
+          <div class="node-shell-info">
+            <div class="nsi-title">What “node shell” runs</div>
+            <p>
+              Creates a Pod{" "}
+              <code>{(shellCfg().nodeName?.trim() || "pigeoneye-node-shell") + "-⟨id⟩"}</code>{" "}
+              in <code>{shellCfg().nodeNamespace?.trim() || "kube-system"}</code>,
+              pinned to the node, image{" "}
+              <code>{shellCfg().nodeImage?.trim() || "busybox:1.36"}</code>.
+            </p>
+            <div class="nsi-perms">
+              <span class="nsi-tag">privileged</span>
+              <span class="nsi-tag">hostPID</span>
+              <span class="nsi-tag">hostIPC</span>
+              <span class="nsi-tag">hostNetwork</span>
+              <span class="nsi-tag">tolerations: all</span>
+              <span class="nsi-tag">auto-delete 4h</span>
+            </div>
+            <p>Then execs into the host's namespaces (PID 1):</p>
+            <code class="nsi-cmd">
+              nsenter -t 1 -m -u -i -n -p -- sh -c "bash || sh"
+            </code>
+            <p class="dim">
+              The helper Pod is deleted when you close the session. It needs
+              privileged + hostPID; if your cluster forbids that (PSA/OPA),
+              the shell won't start.
+            </p>
           </div>
           <div class="section-title" style={{ "margin-top": "14px" }}>
             Add kubeconfig

@@ -2000,6 +2000,61 @@ details.fold[open] > summary::before {
   margin: 6px 0 10px;
 }
 
+.node-shell-info {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.node-shell-info p {
+  color: var(--dim);
+  margin: 4px 0;
+}
+
+.nsi-title {
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 4px;
+}
+
+.node-shell-info code {
+  font-family: var(--font-mono);
+  background: var(--bg3);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--fg);
+  font-size: 11.5px;
+}
+
+.nsi-cmd {
+  display: block;
+  margin: 4px 0;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.nsi-perms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 6px 0;
+}
+
+.nsi-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--primary-border);
+}
+
 .settings-row {
   display: flex;
   align-items: center;
