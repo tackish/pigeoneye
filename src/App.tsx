@@ -1052,6 +1052,7 @@ function App() {
   const [colMenuAt, setColMenuAt] = createSignal<{ x: number; y: number } | null>(
     null,
   );
+  const [colMenuIdx, setColMenuIdx] = createSignal(-1); // keyboard cursor in the value list
   // Distinct values (+counts) of the open column, filtered by the search.
   const colMenuValues = createMemo<[string, number][]>(() => {
     const name = colMenu();
@@ -2854,6 +2855,8 @@ function App() {
         return;
       }
       if (colMenu()) setColMenu(null);
+      else if (colsOpen()) setColsOpen(false);
+      else if (settingsOpen()) setSettingsOpen(false);
       else if (pickMode()) setPickMode(null);
       else if (scaleOpen()) setScaleOpen(false);
       else if (pfOpen()) setPfOpen(false);
@@ -2937,7 +2940,36 @@ function App() {
       }
       return;
     }
-    if (helpOpen() || scaleOpen() || pfOpen()) return;
+    // Any open popup owns the keyboard: keys must never reach the table
+    // behind it (else ⌘D would delete the row under a column menu).
+    if (helpOpen() || scaleOpen() || pfOpen() || colsOpen() || settingsOpen())
+      return;
+    // The per-column filter menu has its own keyboard nav below; block the
+    // table only for keys it doesn't handle. Numeric columns use their own
+    // focused input, so only categorical (value-list) columns navigate here.
+    if (colMenu()) {
+      if (colIsNumeric(colMenu()!)) return;
+      const vals = colMenuValues();
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const n = vals.length;
+        if (n) {
+          const cur = colMenuIdx();
+          setColMenuIdx(
+            e.key === "ArrowDown"
+              ? cur < 0
+                ? 0
+                : Math.min(cur + 1, n - 1)
+              : Math.max((cur < 0 ? 0 : cur) - 1, 0),
+          );
+        }
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const v = vals[colMenuIdx()];
+        if (v) toggleColValue(colMenu()!, v[0]);
+      }
+      return;
+    }
 
     // An open dialog owns the keyboard: arrows pick a button, Enter
     // runs the picked one.
@@ -3312,6 +3344,19 @@ function App() {
       // `n` = New, from the list, when this kind is creatable.
       e.preventDefault();
       openNew();
+    } else if (e.key === "f" && view().cols.length) {
+      // `f` = filter the sorted column (or the first column) by keyboard.
+      e.preventDefault();
+      const ci = sortCol() ?? 0;
+      const name = view().cols[ci];
+      if (name) {
+        const th = tableFocusRef?.querySelector(`th[data-col="${ci}"]`);
+        const r = th?.getBoundingClientRect();
+        setColMenuAt(r ? { x: r.left, y: r.bottom + 4 } : { x: 220, y: 130 });
+        setColMenuQ("");
+        setColMenuIdx(-1);
+        setColMenu(name);
+      }
     } else if (e.key === "ArrowDown" || e.key === "j") {
       e.preventDefault();
       moveCursor(1);
@@ -4387,6 +4432,7 @@ function App() {
                                     e.currentTarget.getBoundingClientRect();
                                   setColMenuAt({ x: r.left, y: r.bottom + 4 });
                                   setColMenuQ("");
+                                  setColMenuIdx(-1);
                                   setColMenu(c);
                                 }}
                               >
@@ -5460,16 +5506,20 @@ function App() {
                       placeholder="filter values…"
                       ref={(el) => setTimeout(() => el.focus())}
                       value={colMenuQ()}
-                      onInput={(e) => setColMenuQ(e.currentTarget.value)}
+                      onInput={(e) => {
+                        setColMenuQ(e.currentTarget.value);
+                        setColMenuIdx(-1);
+                      }}
                       onKeyDown={(e) => {
                         if (e.key === "Escape") setColMenu(null);
                       }}
                     />
                     <div class="col-menu-list">
                       <For each={colMenuValues()}>
-                        {([val, count]) => (
+                        {([val, count], vi) => (
                           <button
                             class="ns-item col-val"
+                            classList={{ "kb-cursor": colMenuIdx() === vi() }}
                             onClick={() => toggleColValue(colMenu()!, val)}
                           >
                             <span

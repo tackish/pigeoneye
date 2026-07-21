@@ -1082,6 +1082,11 @@ th:hover .col-filt-btn {
   font-size: 11px;
 }
 
+.col-menu-list .kb-cursor {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .col-menu-foot {
   display: flex;
   justify-content: flex-end;
