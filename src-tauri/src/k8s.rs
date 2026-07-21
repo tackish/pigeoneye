@@ -1255,6 +1255,68 @@ pub async fn watch_stop(state: &AppState, id: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Map each node name to the space-joined, lowercased names of the pods
+/// scheduled on it. Uses the pod Table's NODE printer column (cells
+/// only, ~one pod-list's worth of bytes) rather than full pod objects,
+/// so enriching node search stays cheap even at 20k+ pods.
+async fn pod_names_by_node(
+    client: &Client,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let pod_rt = ResourceType {
+        group: String::new(),
+        version: "v1".into(),
+        kind: "Pod".into(),
+        plural: "pods".into(),
+        namespaced: true,
+        deletable: true,
+        editable: true,
+    };
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut token: Option<String> = None;
+    loop {
+        // All namespaces: nodes are cluster-scoped, and a node hosts pods
+        // from every namespace.
+        let page = fetch_table_page(client, &pod_rt, None, "None", None, token.as_deref()).await?;
+        let cols = page["columnDefinitions"].as_array();
+        let col_idx = |want: &str| {
+            cols.and_then(|c| {
+                c.iter()
+                    .position(|d| d["name"].as_str().map_or(false, |n| n.eq_ignore_ascii_case(want)))
+            })
+        };
+        let node_idx = col_idx("node");
+        let name_idx = col_idx("name").unwrap_or(0);
+        if let (Some(ni), Some(rows)) = (node_idx, page["rows"].as_array()) {
+            for r in rows {
+                let cells = r["cells"].as_array();
+                let node = cells
+                    .and_then(|c| c.get(ni))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let pod = cells
+                    .and_then(|c| c.get(name_idx))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if node.is_empty() || node == "<none>" || pod.is_empty() {
+                    continue; // unscheduled/pending pods have no node yet
+                }
+                let entry = map.entry(node.to_string()).or_default();
+                entry.push_str(&pod.to_lowercase());
+                entry.push(' ');
+            }
+        }
+        token = page
+            .pointer("/metadata/continue")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(String::from);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(map)
+}
+
 /// Fetch full objects and upgrade the row blobs to a full-text index
 /// (and, for pods, harvest requests/limits).
 async fn build_index(
@@ -1266,6 +1328,7 @@ async fn build_index(
     generation: u64,
 ) -> Result<(), String> {
     let is_pod = rt.group.is_empty() && rt.kind == "Pod";
+    let is_node = rt.group.is_empty() && rt.kind == "Node";
     let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut pod_res: std::collections::HashMap<String, PodRes> = std::collections::HashMap::new();
     // The object projection pages at PAGE_LIMIT_META while the table
@@ -1340,6 +1403,22 @@ async fn build_index(
             break;
         }
     }
+    // On a node list, fold in the names of the pods scheduled on each
+    // node so searching a pod (or workload) name surfaces its node. The
+    // node object itself never mentions its pods, so without this the
+    // relationship isn't searchable at all.
+    if is_node && search.read().await.generation == generation {
+        if let Ok(pods) = pod_names_by_node(client).await {
+            for (key, blob) in by_key.iter_mut() {
+                let node = key.strip_prefix('/').unwrap_or(key.as_str());
+                if let Some(names) = pods.get(node) {
+                    blob.push(' ');
+                    blob.push_str(names);
+                }
+            }
+        }
+    }
+
     let mut s = search.write().await;
     if s.generation != generation {
         return Ok(()); // user has moved on; drop the stale index
