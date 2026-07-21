@@ -3995,17 +3995,13 @@ function App() {
                       </div>
                     }
                   >
-                    {/* Still building the deep index: we haven't finished
-                        looking, so this is "searching", not "empty". For
-                        nodes that means scanning which pods run where. */}
+                    {/* Still building the deep index (annotations, env,
+                        spec): we haven't finished looking, so this is
+                        "searching", not "empty". */}
                     <div class="empty">
                       <img class="mascot sm loading-bird" src={lookUrl} alt="" />
                       <span class="ring-spinner" />
-                      <p>
-                        {isNode()
-                          ? `Finding nodes running “${rowFilter().trim()}”…`
-                          : `Searching every field for “${rowFilter().trim()}”…`}
-                      </p>
+                      <p>Searching every field for “{rowFilter().trim()}”…</p>
                     </div>
                   </Show>
                 }
