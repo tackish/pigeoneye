@@ -32,7 +32,9 @@ pub struct AppState {
     pub watches: RwLock<std::collections::HashMap<u32, tokio::task::AbortHandle>>,
     /// Recently viewed lists, so going back to a view paints from
     /// memory instead of refetching (an Events list can be 20k rows).
-    pub lists: RwLock<Vec<(String, CachedList)>>,
+    /// Arc so the background page-streamer can cache the completed list
+    /// once every page is in.
+    pub lists: std::sync::Arc<RwLock<Vec<(String, CachedList)>>>,
 }
 
 pub struct ExecSession {
@@ -852,14 +854,22 @@ async fn seed_search_from_rows(
     s.generation
 }
 
-async fn cache_list(state: &AppState, key: String, entry: CachedList) {
-    let mut c = state.lists.write().await;
+async fn store_cached(
+    lists: &RwLock<Vec<(String, CachedList)>>,
+    key: String,
+    entry: CachedList,
+) {
+    let mut c = lists.write().await;
     c.retain(|(k, _)| k != &key);
     c.push((key, entry));
     let over = c.len().saturating_sub(LIST_CACHE_MAX);
     if over > 0 {
         c.drain(0..over);
     }
+}
+
+async fn cache_list(state: &AppState, key: String, entry: CachedList) {
+    store_cached(&state.lists, key, entry).await;
 }
 
 /// Rows already seen for this view, if any.
@@ -1050,6 +1060,17 @@ pub async fn list_resources(
         let ns2 = namespace.clone();
         let fs2 = field_selector.clone();
         let search = state.search.clone();
+        // Everything the completed list needs to be cached, so returning
+        // to it later resumes the watch instead of re-streaming.
+        let lists = state.lists.clone();
+        let cache_key = list_key(&context, &rt, namespace.as_deref(), field_selector.as_deref());
+        let cache_cols = columns.clone();
+        let cache_inc = include.to_string();
+        let cache_rv = table
+            .pointer("/metadata/resourceVersion")
+            .and_then(|r| r.as_str())
+            .map(String::from);
+        let mut all_rows = rows.clone();
         let first_token = table
             .pointer("/metadata/continue")
             .and_then(|c| c.as_str())
@@ -1102,13 +1123,32 @@ pub async fn list_resources(
                     // new rows are not in the full-text index yet
                     sc.indexed = false;
                 }
+                let done = token.is_none();
+                all_rows.extend(rows.iter().cloned());
                 let payload = serde_json::to_value(RowPage {
                     generation,
                     rows: std::mem::take(&mut rows),
-                    done: token.is_none(),
+                    done,
                 })
                 .unwrap_or_default();
                 if chan.send(payload).is_err() {
+                    return;
+                }
+                if done {
+                    // Whole list is in — cache the complete snapshot + its
+                    // resourceVersion so revisiting resumes the watch from
+                    // here instead of re-streaming everything.
+                    store_cached(
+                        &lists,
+                        cache_key,
+                        CachedList {
+                            columns: cache_cols,
+                            rows: all_rows,
+                            resource_version: cache_rv,
+                            include: cache_inc,
+                        },
+                    )
+                    .await;
                     return;
                 }
             }

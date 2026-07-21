@@ -669,6 +669,9 @@ function App() {
   /// Keep the open list current by receiving only what changed. The
   /// events arrive in the same projection the list used, so a changed
   /// row is already printed with the server's columns.
+  /// Returns true if the watch started (or was superseded by a newer
+  /// navigation), false only if the server refused it — the caller uses
+  /// that to decide whether cached rows still need a full revalidation.
   async function startWatch(
     ctx: string,
     rt: ResourceType,
@@ -676,9 +679,9 @@ function App() {
     fieldSelector: string | null,
     rv: string | null,
     include: string,
-  ) {
+  ): Promise<boolean> {
     stopWatch();
-    if (!rv) return;
+    if (!rv) return false;
     const seq = listSeq;
     const chan = new Channel<{ type: string; rows?: TableRow[] }>();
     chan.onmessage = (ev) => {
@@ -707,12 +710,14 @@ function App() {
       });
       if (seq !== listSeq) {
         void invoke("watch_stop", { id }).catch(() => {});
-        return;
+        return true; // superseded, not failed
       }
       watchId = id;
       setLive(true);
+      return true;
     } catch {
       setLive(false); // watch permission missing: the list still works
+      return false;
     }
   }
   // A server-side narrowing (e.g. pods of one node). Field selectors
@@ -1597,25 +1602,49 @@ function App() {
     closeDetail();
     setError(null);
     const ns = rt.namespaced && namespace() ? namespace() : null;
-    // Coming back to a view should not refetch 20k rows before showing
-    // anything: paint the cached rows, then revalidate underneath.
-    let warm = false;
+    // Coming back to a view should not refetch 20k rows. Paint the cached
+    // rows, then — instead of re-listing everything — resume the watch
+    // from the cached snapshot's resourceVersion so only what changed
+    // since arrives (an informer catch-up).
+    let cached: ResourceTable | null = null;
     try {
-      const cached = await invoke<ResourceTable | null>("cached_list", {
+      cached = await invoke<ResourceTable | null>("cached_list", {
         context: ctx,
         resource: rt,
         namespace: ns,
         fieldSelector: fieldSelector ?? null,
       });
-      if (cached && active() === ctx && selected() === rt) {
-        setTable(cached);
-        setLoading(false);
-        warm = true;
-      }
     } catch {
       /* no cache is fine */
     }
-    if (!warm) setLoading(true);
+    if (
+      cached &&
+      cached.resource_version &&
+      active() === ctx &&
+      selected() === rt
+    ) {
+      setTable(cached);
+      setLoading(false);
+      setStreaming(false);
+      // Bump the sequence so any prior stream is ignored, then resume the
+      // watch. If the version is too old the server RESYNCs and the watch
+      // handler does a full refreshList().
+      listSeq++;
+      if (rt.group === "" && rt.kind === "Pod") void loadPodStats(ctx, ns);
+      const started = await startWatch(
+        ctx,
+        rt,
+        ns,
+        fieldSelector ?? null,
+        cached.resource_version,
+        cached.include,
+      );
+      // No watch (server refused it): cached rows would never revalidate,
+      // so fall back to a full fetch.
+      if (!started && active() === ctx && selected() === rt) void refreshList();
+      return;
+    }
+    setLoading(true);
     try {
       // Big clusters do not fit in one page: the first page renders
       // immediately and the rest arrives on this channel, so search
