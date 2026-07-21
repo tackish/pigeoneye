@@ -19,6 +19,16 @@ async fn connect(
 }
 
 #[tauri::command]
+async fn auth_hint(context: String, path: Option<String>) -> Result<k8s::AuthHint, String> {
+    k8s::auth_hint(context, path).await
+}
+
+#[tauri::command]
+async fn auth_login(context: String, path: Option<String>) -> Result<(), String> {
+    k8s::auth_login(context, path).await
+}
+
+#[tauri::command]
 async fn disconnect(state: State<'_, AppState>, context: String) -> Result<(), String> {
     k8s::disconnect(&state, context).await
 }
@@ -369,6 +379,8 @@ pub fn run() {
             list_contexts,
             connect,
             disconnect,
+            auth_hint,
+            auth_login,
             discover,
             list_resources,
             cached_list,

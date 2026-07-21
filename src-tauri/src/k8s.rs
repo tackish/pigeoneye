@@ -240,6 +240,151 @@ pub async fn list_contexts(paths: Vec<String>) -> Result<Vec<ContextInfo>, Strin
     Ok(out)
 }
 
+#[derive(Serialize)]
+pub struct AuthHint {
+    /// Machine tag: aws-sso | aws | gcloud | exec | none
+    pub kind: String,
+    /// One line telling the user what's wrong and what will happen.
+    pub message: String,
+    /// The login command we would run (shown before running).
+    pub command: Option<String>,
+    /// True when we know how to run it and re-authenticate in place.
+    pub can_login: bool,
+}
+
+/// The login command that fixes a given context's credentials, derived
+/// from its kubeconfig exec block — never from arbitrary error text.
+/// We only recognise commands we can run safely and that open their own
+/// browser flow: `aws sso login` and `gcloud auth login`.
+fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> AuthHint {
+    let profile = env
+        .iter()
+        .find(|(k, _)| k == "AWS_PROFILE")
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            args.windows(2)
+                .find(|w| w[0] == "--profile")
+                .map(|w| w[1].clone())
+        });
+    let base = exec_command.rsplit('/').next().unwrap_or(exec_command);
+
+    if base == "aws" || args.iter().any(|a| a == "eks") {
+        let cmd = match &profile {
+            Some(p) => format!("aws sso login --profile {p}"),
+            None => "aws sso login".to_string(),
+        };
+        return AuthHint {
+            kind: "aws-sso".into(),
+            message: format!(
+                "AWS credentials for this cluster have expired.{} Logging in opens your browser to renew the SSO session.",
+                profile
+                    .as_ref()
+                    .map(|p| format!(" (profile {p})"))
+                    .unwrap_or_default()
+            ),
+            command: Some(cmd),
+            can_login: true,
+        };
+    }
+    if base == "gke-gcloud-auth-plugin" || base == "gcloud" {
+        return AuthHint {
+            kind: "gcloud".into(),
+            message: "Google Cloud credentials have expired. Logging in opens your browser.".into(),
+            command: Some("gcloud auth login".into()),
+            can_login: true,
+        };
+    }
+    // an exec plugin we don't recognise: tell the user how it authenticates
+    AuthHint {
+        kind: "exec".into(),
+        message: format!(
+            "This cluster authenticates with `{}`. Re-run its login, then reconnect.",
+            exec_command
+        ),
+        command: None,
+        can_login: false,
+    }
+}
+
+/// Inspect a context's kubeconfig to explain an auth failure and, when
+/// possible, offer a one-click login.
+pub async fn auth_hint(
+    context: String,
+    path: Option<String>,
+) -> Result<AuthHint, String> {
+    let kc = match path.filter(|p| !p.is_empty()) {
+        Some(p) => Kubeconfig::read_from(shellexpand_home(&p)).map_err(err)?,
+        None => Kubeconfig::read().map_err(err)?,
+    };
+    let user = kc
+        .contexts
+        .iter()
+        .find(|c| c.name == context)
+        .and_then(|c| c.context.as_ref())
+        .and_then(|c| c.user.clone());
+    let auth = user.and_then(|u| {
+        kc.auth_infos
+            .iter()
+            .find(|a| a.name == u)
+            .and_then(|a| a.auth_info.as_ref())
+    });
+    let Some(exec) = auth.and_then(|a| a.exec.as_ref()) else {
+        return Ok(AuthHint {
+            kind: "none".into(),
+            message: "This cluster uses static credentials — nothing to refresh here.".into(),
+            command: None,
+            can_login: false,
+        });
+    };
+    let env: Vec<(String, String)> = exec
+        .env
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .filter_map(|m| {
+                    Some((m.get("name")?.clone(), m.get("value")?.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(login_plan(
+        exec.command.as_deref().unwrap_or(""),
+        exec.args.as_deref().unwrap_or(&[]),
+        &env,
+    ))
+}
+
+/// Run the login command from a hint and wait for it. It opens its own
+/// browser window; we just report when it finishes so the UI can
+/// reconnect.
+pub async fn auth_login(context: String, path: Option<String>) -> Result<(), String> {
+    let hint = auth_hint(context, path).await?;
+    let Some(cmd) = hint.command.filter(|_| hint.can_login) else {
+        return Err("no automatic login is available for this cluster".into());
+    };
+    // We built this string ourselves from a fixed template, so a plain
+    // shell split is safe here.
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let program = parts.first().ok_or("empty login command")?.to_string();
+    let rest: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    let cmd2 = cmd.clone();
+    // the login CLI blocks while the browser flow runs; keep it off the
+    // async runtime
+    tokio::task::spawn_blocking(move || {
+        let status = std::process::Command::new(&program)
+            .args(&rest)
+            .status()
+            .map_err(|e| format!("could not run `{cmd2}`: {e}"))?;
+        if !status.success() {
+            return Err(format!("`{cmd2}` exited with {status}"));
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(err)??;
+    Ok(())
+}
+
 fn shellexpand_home(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {

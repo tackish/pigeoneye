@@ -541,6 +541,50 @@ function App() {
   let nextShellKey = 1;
   const [failed, setFailed] = createSignal<{ name: string; error: string }[]>([]);
   const failedTabs: { name: string; error: string }[] = [];
+  const [authHint, setAuthHint] = createSignal<{
+    context: string;
+    kind: string;
+    message: string;
+    command: string | null;
+    can_login: boolean;
+  } | null>(null);
+  const [loggingIn, setLoggingIn] = createSignal(false);
+
+  /// On an auth failure, ask the backend how this context logs in and
+  /// offer to do it — an expired SSO session is a browser click away.
+  async function offerLogin(name: string) {
+    try {
+      const hint = await invoke<{
+        kind: string;
+        message: string;
+        command: string | null;
+        can_login: boolean;
+      }>("auth_hint", { context: name, path: sourceOf(name) || null });
+      setAuthHint({ context: name, ...hint });
+    } catch {
+      /* no hint available; the error banner still shows the raw cause */
+    }
+  }
+
+  /// Run the login flow (opens the browser), then reconnect.
+  async function runLogin() {
+    const h = authHint();
+    if (!h) return;
+    setLoggingIn(true);
+    setError(null);
+    try {
+      await invoke("auth_login", {
+        context: h.context,
+        path: sourceOf(h.context) || null,
+      });
+      setAuthHint(null);
+      await reconnect(h.context);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoggingIn(false);
+    }
+  }
   const isAuthError = (msg: string) =>
     /401|403|Unauthorized|Forbidden|credential|token|expired|exec plugin|no such host|refused|timed out|certificate/i.test(
       msg,
@@ -557,9 +601,12 @@ function App() {
       await setupContext(name);
       if (!tabs().includes(name)) setTabs([...tabs(), name]);
       setFailed(failed().filter((f) => f.name !== name));
+      setAuthHint(null);
       activate(name);
     } catch (e) {
-      setError(`could not connect to ${name}: ${String(e)}`);
+      const msg = String(e);
+      setError(`could not connect to ${name}: ${msg}`);
+      if (isAuthError(msg)) void offerLogin(name);
     } finally {
       setConnecting(null);
     }
@@ -1118,8 +1165,10 @@ function App() {
       setTabs([...tabs(), name]);
       activate(name);
     } catch (e) {
-      setError(`could not connect to ${name}: ${String(e)}`);
-      setFailed([...failed().filter((f) => f.name !== name), { name, error: String(e) }]);
+      const msg = String(e);
+      setError(`could not connect to ${name}: ${msg}`);
+      setFailed([...failed().filter((f) => f.name !== name), { name, error: msg }]);
+      if (isAuthError(msg)) void offerLogin(name);
     } finally {
       setConnecting(null);
     }
@@ -1187,6 +1236,8 @@ function App() {
               .join("\n"),
           );
           setFailed([...failedTabs]);
+          const authFail = failedTabs.find((f) => isAuthError(f.error));
+          if (authFail) void offerLogin(authFail.name);
           failedTabs.length = 0;
         }
         setTabs(opened);
@@ -1334,7 +1385,10 @@ function App() {
         const msg = String(e);
         setError(`${rt.kind}: ${msg}`);
         // An expired token invalidates the whole tab, not just this list.
-        if (isAuthError(msg)) setFailed([{ name: ctx, error: msg }]);
+        if (isAuthError(msg)) {
+          setFailed([{ name: ctx, error: msg }]);
+          void offerLogin(ctx);
+        }
         setTable(null);
       }
     } finally {
@@ -3159,6 +3213,29 @@ function App() {
             </Show>
             {error()}
           </div>
+          <Show when={authHint()?.can_login}>
+            <div class="auth-login">
+              <div class="auth-msg">{authHint()!.message}</div>
+              <div class="auth-actions">
+                <button
+                  class="btn primary"
+                  disabled={loggingIn()}
+                  onClick={() => void runLogin()}
+                >
+                  {loggingIn()
+                    ? "logging in…"
+                    : authHint()!.kind === "aws-sso"
+                      ? "Log in with SSO"
+                      : "Log in"}
+                </button>
+                <Show when={authHint()!.command}>
+                  <code class="auth-cmd" title="the command that runs">
+                    {authHint()!.command}
+                  </code>
+                </Show>
+              </div>
+            </div>
+          </Show>
           <div class="error-actions">
             <For each={failed().length ? failed().map((f) => f.name) : active() ? [active()!] : []}>
               {(name) => (
