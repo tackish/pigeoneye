@@ -2606,6 +2606,40 @@ function App() {
     void select(t);
   }
 
+  /// Surface a kind in the sidebar: open the panel, clear any kind
+  /// filter, expand the CRD/More group that holds it, then scroll to it
+  /// and land the cursor there. Used after the `:` palette selects a kind
+  /// so you can pin it straight away.
+  function revealInSidebar(t: ResourceType) {
+    const k = typeKey(t);
+    if (!sidebarOpen()) {
+      setSidebarOpen(true);
+      localStorage.setItem("pigeoneye.sidebar", "open");
+    }
+    setFilter("");
+    const custom = customGroups().find(([, ts]) =>
+      ts.some((x) => typeKey(x) === k),
+    );
+    if (custom) {
+      if (!groupOpen(custom[0])) toggleGroup(custom[0]);
+    } else if (
+      restGroups().some(([, ts]) => ts.some((x) => typeKey(x) === k))
+    ) {
+      if (!groupOpen("__more")) toggleGroup("__more");
+    }
+    // group expansion changes sidebarItems(); wait a frame for it to
+    // settle before locating the row.
+    requestAnimationFrame(() => {
+      const idx = sidebarItems().findIndex((x) => typeKey(x) === k);
+      if (idx < 0) return;
+      setPane("sidebar");
+      setSideIdx(idx);
+      document
+        .querySelector(`.kind[data-sk="${idx}"]`)
+        ?.scrollIntoView({ block: "center" });
+    });
+  }
+
   /// Display cells for every row, built once per list — not per
   /// keystroke. On a 24k-pod cluster rebuilding this while typing was
   /// what made search collapse.
@@ -2953,7 +2987,12 @@ function App() {
     return hits.slice(0, 12).map((t) => ({
       label: t.kind,
       hint: t.group || "core",
-      run: () => void select(t),
+      // open the table AND reveal the kind in the sidebar so it's one
+      // keystroke away from being pinned.
+      run: () => {
+        void select(t);
+        revealInSidebar(t);
+      },
     }));
   });
 
@@ -3533,6 +3572,17 @@ function App() {
       if (e.key === "/") {
         e.preventDefault();
         kindFilterRef?.focus();
+        return;
+      }
+      // `p` pins / unpins the kind under the cursor — pairs with the
+      // `:` palette revealing a CRD here, so you can find-then-pin
+      // without leaving the keyboard.
+      if (e.key === "p") {
+        const t = sidebarItems()[sideIdx()];
+        if (t) {
+          e.preventDefault();
+          toggleFav(t);
+        }
         return;
       }
     }

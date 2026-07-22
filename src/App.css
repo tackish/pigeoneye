@@ -523,7 +523,8 @@ body {
   opacity: 0;
   transition: opacity 0.1s, color 0.1s;
 }
-.kind:hover .pin {
+.kind:hover .pin,
+.kind.cursor .pin {
   opacity: 0.55;
 }
 .pin:hover {
