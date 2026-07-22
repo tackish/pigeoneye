@@ -9,6 +9,14 @@ async fn list_contexts(paths: Option<Vec<String>>) -> Result<Vec<ContextInfo>, S
     k8s::list_contexts(paths.unwrap_or_default()).await
 }
 
+/// Write text to a path the user chose in a save dialog — the webview's
+/// own download attribute is a no-op in Tauri, so log/YAML saving goes
+/// through here.
+#[tauri::command]
+async fn write_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn connect(
     state: State<'_, AppState>,
@@ -487,6 +495,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_contexts,
+            write_file,
             connect,
             disconnect,
             auth_hint,

@@ -2715,13 +2715,45 @@ pub async fn debug_start(
     let img = image
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "busybox:1.36".to_string());
+    // Read the target pod's security posture so the debug container fits
+    // the same admission policy (PodSecurity restricted, Kyverno, etc.) —
+    // otherwise a pod with runAsNonRoot rejects a root busybox.
+    let pv = pods
+        .get(&pod)
+        .await
+        .map_err(err)
+        .and_then(|p| serde_json::to_value(&p).map_err(err))?;
+    let field = |p: &str| -> Option<serde_json::Value> {
+        pv.pointer(&format!("/spec/securityContext/{p}"))
+            .or_else(|| pv.pointer(&format!("/spec/containers/0/securityContext/{p}")))
+            .cloned()
+    };
+    let nonroot = field("runAsNonRoot")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let run_as_user = field("runAsUser").and_then(|v| v.as_i64());
+    let mut sc = serde_json::json!({
+        // Baseline the restricted PodSecurity profile requires; harmless
+        // in permissive namespaces.
+        "allowPrivilegeEscalation": false,
+        "capabilities": { "drop": ["ALL"] },
+        "seccompProfile": field("seccompProfile")
+            .unwrap_or_else(|| serde_json::json!({ "type": "RuntimeDefault" })),
+    });
+    if nonroot || run_as_user.is_some() {
+        sc["runAsNonRoot"] = true.into();
+        // A root busybox violates runAsNonRoot, so pin a non-zero UID —
+        // the pod's own if it set one, else 1000.
+        sc["runAsUser"] = run_as_user.filter(|u| *u != 0).unwrap_or(1000).into();
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let ec_name = format!("debugger-{:x}", nanos & 0xffff);
     let mut ec = serde_json::json!({
-        "name": ec_name, "image": img, "stdin": true, "tty": true, "command": ["sh"]
+        "name": ec_name, "image": img, "stdin": true, "tty": true, "command": ["sh"],
+        "securityContext": sc,
     });
     if let Some(t) = target.filter(|s| !s.is_empty()) {
         ec["targetContainerName"] = t.into();

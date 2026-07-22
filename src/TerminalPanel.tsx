@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -102,6 +103,8 @@ export default function TerminalPanel(props: {
       fontFamily: '"SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace',
       fontSize: 12,
       cursorBlink: true,
+      // Deep scrollback for logs so search/scroll reaches far back.
+      scrollback: isLogs ? 200000 : 2000,
       theme: TERM_THEMES[props.theme],
     });
     fit = new FitAddon();
@@ -297,14 +300,31 @@ export default function TerminalPanel(props: {
     else search.findNext(q);
   };
 
-  function downloadLogs() {
-    const blob = new Blob([logBuf], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${props.target.name}.log`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const [saved, setSaved] = createSignal(false);
+  const [copied, setCopied] = createSignal(false);
+  async function downloadLogs() {
+    // The webview ignores <a download>; save through the native dialog.
+    const path = await save({
+      defaultPath: `${props.target.name}.log`,
+      filters: [{ name: "log", extensions: ["log", "txt"] }],
+    });
+    if (!path) return;
+    try {
+      await invoke("write_file", { path, content: logBuf });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      term?.write(`\r\n\x1b[31mcould not save: ${String(e)}\x1b[0m\r\n`);
+    }
+  }
+  async function copyLogs() {
+    try {
+      await navigator.clipboard.writeText(logBuf);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard blocked */
+    }
   }
 
   return (
@@ -374,8 +394,11 @@ export default function TerminalPanel(props: {
             </select>
           </Show>
           <span class="log-sep" />
-          <button class="btn sm" title="download the buffered logs" onClick={downloadLogs}>
-            download
+          <button class="btn sm" title="copy the whole buffer to the clipboard" onClick={copyLogs}>
+            {copied() ? "copied ✓" : "copy"}
+          </button>
+          <button class="btn sm" title="save the whole buffer to a file" onClick={downloadLogs}>
+            {saved() ? "saved ✓" : "download"}
           </button>
         </div>
       </Show>
