@@ -83,7 +83,7 @@ jobs:
           node -e "const f='src-tauri/tauri.conf.json',j=require('./'+f);j.version='$V';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
           perl -pi -e "s/^version = \".*\"/version = \"$V\"/ if 1..10" src-tauri/Cargo.toml
 
-      - run: npm ci
+      - run: npm ci --registry=https://registry.npmjs.org/
       - run: npm run build
       - run: npm run smoke
 
