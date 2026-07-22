@@ -50,8 +50,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
+
+      # The lockfile is written by npm 11 (lockfileVersion 3); node 20's
+      # bundled npm 10.8 crashes reading it ("Exit handler never called").
+      # Pull a current npm so `npm ci` matches what generated the lockfile.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
