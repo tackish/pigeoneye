@@ -76,8 +76,17 @@ export default function TerminalPanel(props: {
   let search: SearchAddon | undefined;
   let sessionId: number | null = null;
   const isLogs = props.target.kind === "logs" || props.target.kind === "wlogs";
-  // Buffer the streamed log text so it can be downloaded.
+  // Buffer the streamed log text (for copy/download). Capped so a
+  // long-lived followed log can't grow the buffer without bound, and
+  // ANSI colour codes (the wlogs per-pod prefix) are stripped so the
+  // saved file / clipboard is plain text.
   let logBuf = "";
+  const LOG_BUF_MAX = 8_000_000; // ~8 MB retained
+  const pushLog = (d: string) => {
+    logBuf += d.replace(/\r\n/g, "\n").replace(/\x1b\[[0-9;]*m/g, "");
+    if (logBuf.length > LOG_BUF_MAX)
+      logBuf = logBuf.slice(logBuf.length - LOG_BUF_MAX);
+  };
   const [logPrev, setLogPrev] = createSignal(!!props.target.logPrevious);
   const [logTs, setLogTs] = createSignal(!!props.target.logTimestamps);
   const [logSince, setLogSince] = createSignal(props.target.logSince ?? 0);
@@ -179,7 +188,7 @@ export default function TerminalPanel(props: {
         props.onExit();
         return;
       }
-      if (isLogs) logBuf += d.replace(/\r\n/g, "\n");
+      if (isLogs) pushLog(d);
       term?.write(d);
     };
     try {
@@ -285,7 +294,7 @@ export default function TerminalPanel(props: {
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
       if (d === "\u0000exit") return;
-      logBuf += d.replace(/\r\n/g, "\n");
+      pushLog(d);
       term?.write(d);
     };
     try {

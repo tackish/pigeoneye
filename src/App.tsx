@@ -509,6 +509,9 @@ function sortVal(v: string): number | null {
   // percentages (%CPU, %MEM columns)
   const pctm = s.match(/^(-?\d+(?:\.\d+)?)%$/);
   if (pctm) return +pctm[1];
+  // "5 (3h ago)" — the RESTARTS column on modern kube. Sort by the count.
+  const paren = s.match(/^(\d+)\s+\(.*\)$/);
+  if (paren) return +paren[1];
   const ready = s.match(/^(\d+)\/(\d+)$/);
   if (ready) return +ready[1] + +ready[2] / 1e6;
   const dur = s.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
@@ -1062,6 +1065,18 @@ function App() {
     }
   }
   const [sortCol, setSortCol] = createSignal<number | null>(null);
+  // Pod-stat columns (CPU/%…/MEM/%…) splice into the MIDDLE of the column
+  // list when metrics load, which would shift a positional sort onto the
+  // wrong column. Reset the sort on that one layout change (a rare click
+  // in the first second beats silently mis-sorting).
+  let hadPodStats = false;
+  createEffect(() => {
+    const has = podStats() !== null;
+    if (has !== hadPodStats) {
+      hadPodStats = has;
+      if (sortCol() !== null) setSortCol(null);
+    }
+  });
   const [colsOpen, setColsOpen] = createSignal(false);
   const [hiddenCols, setHiddenCols] = createSignal<Record<string, string[]>>(
     JSON.parse(localStorage.getItem("pigeoneye.cols") ?? "{}"),
@@ -1672,6 +1687,7 @@ function App() {
         setSelected(null);
         setTable(null);
         closeDetail();
+        stopWatch(); // no view left to feed — don't leak the watch
       }
     }
     persist();
@@ -1774,7 +1790,12 @@ function App() {
         if (!indexed) {
           if (!indexPromise) {
             setIndexing(true);
+            const buildSeq = listSeq;
             indexPromise = invoke("ensure_index").finally(() => {
+              // A resource switch during the build bumps listSeq and
+              // resets these flags; don't let this stale build mark the
+              // new list as indexed.
+              if (buildSeq !== listSeq) return;
               indexed = true;
               indexPromise = null;
               setIndexing(false);
@@ -1858,11 +1879,13 @@ function App() {
         // background (non-blocking), then refresh stats so they fill in
         // without needing a search.
         if (!indexed && !indexPromise) {
+          const buildSeq = listSeq;
           indexPromise = invoke("ensure_index")
             .then(() => {
               if (active() === ctx && selected() === rt) void loadPodStats(ctx, ns);
             })
             .finally(() => {
+              if (buildSeq !== listSeq) return; // superseded by a switch
               indexed = true;
               indexPromise = null;
             });
@@ -1944,8 +1967,14 @@ function App() {
           namespace: ns,
         });
         if (active() !== ctx || !isPod()) return;
-        setPodStats(new Map(stats.map((s) => [s.key, s])));
-        if (stats.some((s) => s.cpu_r || s.cpu_l || s.mem_r || s.mem_l)) return;
+        const hasReq = stats.some((s) => s.cpu_r || s.cpu_l || s.mem_r || s.mem_l);
+        // Set on the first pass (live CPU/MEM) and once requests/limits
+        // land; skip the noisy intermediate re-sets that would rebuild all
+        // 24k display rows just for jittering live values.
+        if (attempt === 0 || hasReq) {
+          setPodStats(new Map(stats.map((s) => [s.key, s])));
+        }
+        if (hasReq) return;
       } catch {
         return; // metrics-server not installed — columns just stay off
       }
@@ -3246,8 +3275,20 @@ function App() {
       return;
     }
     // Any open popup owns the keyboard: keys must never reach the table
-    // behind it (else ⌘D would delete the row under a column menu).
-    if (helpOpen() || scaleOpen() || pfOpen() || colsOpen() || settingsOpen())
+    // behind it (else ⌘D would delete the row under a column menu). Every
+    // overlay that doesn't run its own nav belongs here.
+    if (
+      helpOpen() ||
+      scaleOpen() ||
+      pfOpen() ||
+      colsOpen() ||
+      settingsOpen() ||
+      dryRun() ||
+      access() ||
+      history() ||
+      nsOpen() ||
+      cmdOpen()
+    )
       return;
     // The per-column filter menu has its own keyboard nav below; block the
     // table only for keys it doesn't handle. Numeric columns use their own

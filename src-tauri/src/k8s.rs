@@ -835,6 +835,22 @@ pub struct RowPage {
     pub done: bool,
 }
 
+/// Tell the frontend the stream is finished (clears its "loading…"
+/// spinner). Sent on completion, the safety cap, or a mid-stream error —
+/// never leave the UI spinning.
+fn send_stream_done(chan: &Channel<serde_json::Value>, generation: u64, still_current: bool) {
+    if !still_current {
+        return; // the view moved on; nobody's listening
+    }
+    let end = serde_json::to_value(RowPage {
+        generation,
+        rows: Vec::new(),
+        done: true,
+    })
+    .unwrap_or_default();
+    let _ = chan.send(end);
+}
+
 fn list_key(
     context: &str,
     rt: &ResourceType,
@@ -1127,19 +1143,15 @@ pub async fn list_resources(
                     // Safety cap hit: the list is partial and won't be
                     // cached, but tell the UI we're done so the "loading…"
                     // spinner clears instead of spinning forever.
-                    if still_current {
-                        let end = serde_json::to_value(RowPage {
-                            generation,
-                            rows: Vec::new(),
-                            done: true,
-                        })
-                        .unwrap_or_default();
-                        let _ = chan.send(end);
-                    }
+                    send_stream_done(&chan, generation, still_current);
                     return;
                 }
                 let Ok(Ok(page)) = handle.await else {
-                    return; // fetch failed; leave the list uncached
+                    // A page fetch failed mid-stream (e.g. a `continue`
+                    // token expired → 410). Tell the UI we're done so the
+                    // spinner clears; the list stays uncached (partial).
+                    send_stream_done(&chan, generation, still_current);
+                    return;
                 };
                 let token = continue_token(&page);
                 // fire the next request before parsing this one
@@ -1154,6 +1166,7 @@ pub async fn list_resources(
                     })
                     .await
                 else {
+                    send_stream_done(&chan, generation, still_current);
                     return;
                 };
                 if still_current {
@@ -1872,9 +1885,11 @@ pub async fn dry_run_apply(
     let value: serde_json::Value = serde_yaml::from_str(&yaml).map_err(err)?;
     let client = client(state, &context).await?;
     let api = dyn_api(client, &rt, namespace.as_deref());
+    // Match the real apply (force:false) so a field-ownership conflict
+    // surfaces in the preview instead of the dry run falsely passing.
     let pp = PatchParams {
         dry_run: true,
-        force: true,
+        force: false,
         field_manager: Some("pigeoneye".into()),
         ..Default::default()
     };
@@ -2433,8 +2448,11 @@ pub async fn rollout_undo(
     }
     let patch = serde_json::json!({ "spec": { "template": template } });
     let dep_ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("apps", "v1", "Deployment"));
+    // Strategic merge (kubectl's mechanism) so fields the current template
+    // added since the target revision are reconciled away, not left behind
+    // as a JSON merge-patch would.
     Api::<DynamicObject>::namespaced_with(client, &ns, &dep_ar)
-        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .patch(&name, &PatchParams::default(), &Patch::Strategic(patch))
         .await
         .map_err(err)?;
     Ok(())
