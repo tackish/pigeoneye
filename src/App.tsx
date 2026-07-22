@@ -5644,7 +5644,7 @@ function App() {
               <div class="modal help" onClick={(e) => e.stopPropagation()}>
                 <h3>Keyboard shortcuts</h3>
                 <div class="help-grid">
-                  <b class="help-sec">table</b><span />
+                  <b class="help-sec">table</b>
                   <b>:</b><span>command palette (kinds · ns · ctx)</span>
                   <b>/</b><span>search rows (any field value)</span>
                   <b>esc</b><span>step up: detail → table → sidebar</span>
@@ -5657,7 +5657,7 @@ function App() {
                   <b>⌘F</b><span>focus the row search / find in the open detail</span>
                   <b>s</b><span>shell (pod / node)</span>
                   <b>l</b><span>logs (pod / workload aggregate)</span>
-                  <b>e</b> / <b>y</b><span>edit manifest (YAML) of cursor row</span>
+                  <b>e / y</b><span>edit manifest (YAML) of cursor row</span>
                   <b>⌘C</b><span>copy the manifest (detail open, nothing selected)</span>
                   <b>space</b><span>mark a row · ⌘A all · esc clears</span>
                   <b>⌘/ctrl D</b><span>delete marked rows, or the cursor row (⇧ adds force)</span>
@@ -5669,7 +5669,7 @@ function App() {
                   <b>Shift A/N/S/R/T/C/M/I/O</b>
                   <span>sort by age · name · status · ready · restarts · cpu · mem · ip · node</span>
                   <b>Esc</b><span>close → clear filter → view history back</span>
-                  <b class="help-sec">detail panel</b><span />
+                  <b class="help-sec">detail panel</b>
                   <b>↑ ↓ · j k</b><span>move between sections</span>
                   <b>Enter</b><span>open the focused section (folds · editor)</span>
                   <b>← h</b><span>back to the table</span>
@@ -5681,7 +5681,7 @@ function App() {
                   <b>p</b><span>node ↔ its pods</span>
                   <b>⇧F</b><span>port-forward input (pods)</span>
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
-                  <b class="help-sec">app</b><span />
+                  <b class="help-sec">app</b>
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
                   <b>⌘0</b><span>back to all namespaces</span>
                   <b>⌘,</b><span>settings (kubeconfig, shell)</span>
