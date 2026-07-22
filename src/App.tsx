@@ -551,6 +551,12 @@ function parseQuery(raw: string): {
   return { poss, res, negs };
 }
 
+/// A cell with no real value — sorts to the bottom in either direction.
+function isBlankCell(s: string): boolean {
+  const t = s.trim();
+  return t === "" || t === "-" || t === "n/a" || t === "<none>";
+}
+
 function cmpCells(a: string, b: string): number {
   const ka = sortVal(a);
   const kb = sortVal(b);
@@ -2697,9 +2703,16 @@ function App() {
         : -1;
     if (sortIdx >= 0) {
       const dir = sortDir();
-      out = [...out].sort(
-        (x, y) => cmpCells(x.cells[sortIdx] ?? "", y.cells[sortIdx] ?? "") * dir,
-      );
+      out = [...out].sort((x, y) => {
+        const av = x.cells[sortIdx] ?? "";
+        const bv = y.cells[sortIdx] ?? "";
+        // Blanks (n/a, -, <none>, empty) always sink, so a descending
+        // sort doesn't float the not-yet-loaded / metric-less rows to top.
+        const ab = isBlankCell(av);
+        const bb = isBlankCell(bv);
+        if (ab || bb) return ab && bb ? 0 : ab ? 1 : -1;
+        return cmpCells(av, bv) * dir;
+      });
     } else if (isPod() && !namespace()) {
       // Default order for an all-namespaces pod list: sink DaemonSet pods
       // (ebs-csi-node, kube-proxy, log/metrics agents — one per node, so
