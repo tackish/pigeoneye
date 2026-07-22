@@ -3278,11 +3278,20 @@ function App() {
       }
       return;
     }
+    // The help sheet owns the keyboard while open, but "?" should toggle
+    // it shut (it's the same key that opened it) — Escape closes it too,
+    // handled in the Escape chain above.
+    if (helpOpen()) {
+      if (e.key === "?") {
+        e.preventDefault();
+        setHelpOpen(false);
+      }
+      return;
+    }
     // Any open popup owns the keyboard: keys must never reach the table
     // behind it (else ⌘D would delete the row under a column menu). Every
     // overlay that doesn't run its own nav belongs here.
     if (
-      helpOpen() ||
       scaleOpen() ||
       pfOpen() ||
       colsOpen() ||
