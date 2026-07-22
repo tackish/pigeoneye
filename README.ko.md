@@ -92,7 +92,7 @@ watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
 **macOS — Homebrew**
 
 ```sh
-brew tap tackish/pigeoneye https://github.com/tackish/pigeoneye
+brew tap tackish/pigeoneye
 brew install --cask peye
 ```
 

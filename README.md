@@ -99,7 +99,7 @@ is one click via related-object jumps.
 **macOS — Homebrew**
 
 ```sh
-brew tap tackish/pigeoneye https://github.com/tackish/pigeoneye
+brew tap tackish/pigeoneye
 brew install --cask peye
 ```
 

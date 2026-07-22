@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - 'Casks/**'
       - '**.md'
 
 permissions:
@@ -130,14 +129,26 @@ jobs:
           git push origin $TAG
           gh release create $TAG dist/* --title "$TAG" --generate-notes
 
-      - name: Update Homebrew cask
+      # The cask lives in the tap repo (tackish/homebrew-pigeoneye) so that
+      # `brew tap tackish/pigeoneye` resolves without a URL. Push the freshly
+      # built shas there over a write-scoped deploy key (TAP_DEPLOY_KEY).
+      - name: Update Homebrew tap
+        env:
+          DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           V=${{ needs.version.outputs.version }}
           ARM=$(sha256sum dist/PigeonEye-darwin-arm64.tar.gz | awk '{print $1}')
           AMD=$(sha256sum dist/PigeonEye-darwin-x86_64.tar.gz | awk '{print $1}')
-          python3 scripts/update-cask.py "$V" "$ARM" "$AMD"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+          git clone git@github.com:tackish/homebrew-pigeoneye.git tap
+          python3 scripts/update-cask.py "$V" "$ARM" "$AMD" tap/Casks/peye.rb
+          cd tap
           git config user.name "Tek"
           git config user.email "realblack86@gmail.com"
           git add Casks/peye.rb
-          git commit -m "brew: update cask to ${V}" || exit 0
+          git commit -m "peye: update to ${V}" || { echo "cask unchanged"; exit 0; }
           git push origin HEAD:main
