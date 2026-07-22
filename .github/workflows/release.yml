@@ -94,7 +94,9 @@ jobs:
         shell: bash
         run: |
           V=${{ needs.version.outputs.version }}
-          mkdir -p dist
+          # Collect into out/, NOT dist/ — dist/ is vite's web bundle, and
+          # sweeping it into the release litters the page with .js/.css/.svg.
+          mkdir -p out
           B=src-tauri/target/${{ matrix.target }}/release/bundle
           if [ "${{ runner.os }}" = "macOS" ]; then
             # Ad-hoc sign the whole bundle. Without any signature a
@@ -104,17 +106,17 @@ jobs:
             codesign --force --deep --sign - "$B/macos/PigeonEye.app"
             codesign --verify --deep --strict "$B/macos/PigeonEye.app" || true
             # ship the .app as a tarball: a cask can install it directly
-            tar -czf "dist/PigeonEye-${{ matrix.label }}.tar.gz" -C "$B/macos" PigeonEye.app
+            tar -czf "out/PigeonEye-${{ matrix.label }}.tar.gz" -C "$B/macos" PigeonEye.app
           else
-            find "$B/deb" -name '*.deb' -exec cp {} "dist/PigeonEye-${V}-linux-x86_64.deb" \;
-            find "$B/appimage" -name '*.AppImage' -exec cp {} "dist/PigeonEye-${V}-linux-x86_64.AppImage" \; || true
+            find "$B/deb" -name '*.deb' -exec cp {} "out/PigeonEye-${V}-linux-x86_64.deb" \;
+            find "$B/appimage" -name '*.AppImage' -exec cp {} "out/PigeonEye-${V}-linux-x86_64.AppImage" \; || true
           fi
-          ls -la dist
+          ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: dist/*
+          path: out/*
 
   release:
     needs: [version, build]
