@@ -93,7 +93,13 @@ watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
 
 ```sh
 brew tap tackish/pigeoneye https://github.com/tackish/pigeoneye
-brew install --cask pigeoneye
+brew install --cask peye
+```
+
+설치 후에는 Spotlight로 실행하거나, 터미널에서 `peye`만 치면 앱이 열립니다:
+
+```sh
+peye
 ```
 
 **Linux** — [Releases](https://github.com/tackish/pigeoneye/releases)에서

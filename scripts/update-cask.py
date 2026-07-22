@@ -9,7 +9,7 @@ import re
 import sys
 
 version, arm, amd = sys.argv[1], sys.argv[2], sys.argv[3]
-path = "Casks/pigeoneye.rb"
+path = "Casks/peye.rb"
 src = open(path).read()
 
 src, n = re.subn(r'version "[^"]*"', f'version "{version}"', src, count=1)

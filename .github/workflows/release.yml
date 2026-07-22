@@ -138,6 +138,6 @@ jobs:
           python3 scripts/update-cask.py "$V" "$ARM" "$AMD"
           git config user.name "Tek"
           git config user.email "realblack86@gmail.com"
-          git add Casks/pigeoneye.rb
+          git add Casks/peye.rb
           git commit -m "brew: update cask to ${V}" || exit 0
           git push origin HEAD:main

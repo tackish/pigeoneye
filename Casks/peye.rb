@@ -1,4 +1,4 @@
-cask "pigeoneye" do
+cask "peye" do
   version "0.1.0"
 
   on_arm do
@@ -15,6 +15,9 @@ cask "pigeoneye" do
   homepage "https://github.com/tackish/pigeoneye"
 
   app "PigeonEye.app"
+  # Launch it from the terminal like k9s: `peye` opens the app. Symlinks
+  # the app's own executable, so it's a real launcher, not a wrapper.
+  binary "#{appdir}/PigeonEye.app/Contents/MacOS/PigeonEye", target: "peye"
 
   zap trash: [
     "~/Library/Application Support/dev.tackish.pigeoneye",

@@ -100,7 +100,13 @@ is one click via related-object jumps.
 
 ```sh
 brew tap tackish/pigeoneye https://github.com/tackish/pigeoneye
-brew install --cask pigeoneye
+brew install --cask peye
+```
+
+Then launch it from anywhere — Spotlight, or just type `peye` in a terminal:
+
+```sh
+peye
 ```
 
 **Linux** — download the `.deb` / `.rpm` / `.AppImage` from
