@@ -512,6 +512,10 @@ function sortVal(v: string): number | null {
   // "5 (3h ago)" — the RESTARTS column on modern kube. Sort by the count.
   const paren = s.match(/^(\d+)\s+\(.*\)$/);
   if (paren) return +paren[1];
+  // IPv4 → a single ordered number so 10.x sorts after 9.x, not before.
+  const ip = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ip && ip.slice(1).every((o) => +o <= 255))
+    return ((+ip[1] * 256 + +ip[2]) * 256 + +ip[3]) * 256 + +ip[4];
   const ready = s.match(/^(\d+)\/(\d+)$/);
   if (ready) return +ready[1] + +ready[2] / 1e6;
   const dur = s.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
@@ -5426,7 +5430,7 @@ function App() {
                 </div>
                 <span class="term-hint">
                   {termFocused()
-                    ? "esc leave · ⇧tab next · ⇧⌘W close · ⌘T hide"
+                    ? "esc leave · ⌘←/→ or ⇧tab switch · ⇧⌘W close · ⌘T hide"
                     : "⌘T or click to type here"}
                 </span>
                 <button

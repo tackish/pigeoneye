@@ -158,6 +158,14 @@ export default function TerminalPanel(props: {
         props.onCycleTab(ev.ctrlKey ? -1 : 1);
         return false;
       }
+      // ⌘←/⌘→ (Ctrl+Shift+←/→ off-Mac) also walk the tabs: plain arrows
+      // belong to the shell (history/cursor), so the app-mod carves out
+      // an arrow-key path that doesn't collide with what you're typing.
+      if (appMod && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
+        ev.preventDefault();
+        props.onCycleTab(ev.key === "ArrowRight" ? 1 : -1);
+        return false;
+      }
       if (
         ev.key === "Escape" ||
         (ev.metaKey && ev.key === "ArrowUp") ||
