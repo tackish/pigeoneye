@@ -97,6 +97,12 @@ jobs:
           mkdir -p dist
           B=src-tauri/target/${{ matrix.target }}/release/bundle
           if [ "${{ runner.os }}" = "macOS" ]; then
+            # Ad-hoc sign the whole bundle. Without any signature a
+            # quarantined app reads as "damaged" on Apple Silicon (not just
+            # "unidentified developer"); an ad-hoc signature makes it a
+            # normal Gatekeeper prompt, which the cask's postflight clears.
+            codesign --force --deep --sign - "$B/macos/PigeonEye.app"
+            codesign --verify --deep --strict "$B/macos/PigeonEye.app" || true
             # ship the .app as a tarball: a cask can install it directly
             tar -czf "dist/PigeonEye-${{ matrix.label }}.tar.gz" -C "$B/macos" PigeonEye.app
           else
