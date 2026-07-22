@@ -274,6 +274,7 @@ pub struct AuthHint {
 /// We only recognise commands we can run safely and that open their own
 /// browser flow: `aws sso login` and `gcloud auth login`.
 fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> AuthHint {
+    let base = exec_command.rsplit('/').next().unwrap_or(exec_command);
     let profile = env
         .iter()
         .find(|(k, _)| k == "AWS_PROFILE")
@@ -282,10 +283,24 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             args.windows(2)
                 .find(|w| w[0] == "--profile")
                 .map(|w| w[1].clone())
+        })
+        // aws-vault carries the profile as the first positional after
+        // `exec` (e.g. `aws-vault exec daangn/prod -- aws eks get-token`),
+        // not as --profile or $AWS_PROFILE. Without it we'd emit a bare
+        // `aws sso login`, which errors out (exit 253) with no profile.
+        .or_else(|| {
+            if base == "aws-vault" {
+                args.iter()
+                    .skip_while(|a| *a != "exec")
+                    .skip(1)
+                    .find(|a| !a.starts_with('-'))
+                    .cloned()
+            } else {
+                None
+            }
         });
-    let base = exec_command.rsplit('/').next().unwrap_or(exec_command);
 
-    if base == "aws" || args.iter().any(|a| a == "eks") {
+    if base == "aws" || base == "aws-vault" || args.iter().any(|a| a == "eks") {
         let cmd = match &profile {
             Some(p) => format!("aws sso login --profile {p}"),
             None => "aws sso login".to_string(),
