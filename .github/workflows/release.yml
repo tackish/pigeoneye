@@ -136,12 +136,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=${{ needs.version.outputs.tag }}
+          # Build the changelog from the commits since the previous tag, so
+          # the release notes plainly list what changed (commit subjects).
+          PREV=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV" ]; then
+            NOTES=$(git log --no-merges --pretty='- %s' "${PREV}..HEAD")
+          else
+            NOTES=$(git log --no-merges --pretty='- %s')
+          fi
+          [ -z "$NOTES" ] && NOTES="- ${TAG}"
           git tag -d $TAG 2>/dev/null || true
           git push origin :refs/tags/$TAG 2>/dev/null || true
           gh release delete $TAG --yes 2>/dev/null || true
           git tag $TAG
           git push origin $TAG
-          gh release create $TAG dist/* --title "$TAG" --generate-notes
+          printf 'What changed in %s:\n\n%s\n' "$TAG" "$NOTES" > /tmp/notes.md
+          gh release create $TAG dist/* --title "$TAG" --notes-file /tmp/notes.md
 
       # The cask lives in the tap repo (tackish/homebrew-pigeoneye) so that
       # `brew tap tackish/pigeoneye` resolves without a URL. Push the freshly
