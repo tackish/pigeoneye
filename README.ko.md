@@ -93,6 +93,7 @@ watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
 
 ```sh
 brew tap tackish/pigeoneye
+brew trust tackish/pigeoneye   # 서드파티 tap은 최초 1회 신뢰 등록 필요
 brew install --cask peye
 ```
 

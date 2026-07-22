@@ -100,6 +100,7 @@ is one click via related-object jumps.
 
 ```sh
 brew tap tackish/pigeoneye
+brew trust tackish/pigeoneye   # third-party taps need a one-time trust
 brew install --cask peye
 ```
 
