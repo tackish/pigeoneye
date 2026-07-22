@@ -506,6 +506,9 @@ function sortVal(v: string): number | null {
   const s = v.trim();
   if (!s || s === "-" || s === "<none>" || s === "n/a") return null;
   if (/^-?\d+(\.\d+)?$/.test(s)) return +s;
+  // percentages (%CPU, %MEM columns)
+  const pctm = s.match(/^(-?\d+(?:\.\d+)?)%$/);
+  if (pctm) return +pctm[1];
   const ready = s.match(/^(\d+)\/(\d+)$/);
   if (ready) return +ready[1] + +ready[2] / 1e6;
   const dur = s.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
@@ -2681,11 +2684,21 @@ function App() {
       );
     }
 
+    const hide = hiddenFor();
+    // The sort index comes from the DISPLAYED columns (thead iterates
+    // view().cols), but cells here are still the full pre-hide set — map
+    // the displayed index back to the full-cells index by column name, or
+    // hiding a column would sort a different (shifted) column.
+    const shownCols = hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols;
     const sc = sortCol();
-    if (sc !== null && sc >= 0 && sc < b.cols.length) {
+    const sortIdx =
+      sc !== null && sc >= 0 && sc < shownCols.length
+        ? b.cols.indexOf(shownCols[sc])
+        : -1;
+    if (sortIdx >= 0) {
       const dir = sortDir();
       out = [...out].sort(
-        (x, y) => cmpCells(x.cells[sc] ?? "", y.cells[sc] ?? "") * dir,
+        (x, y) => cmpCells(x.cells[sortIdx] ?? "", y.cells[sortIdx] ?? "") * dir,
       );
     } else if (isPod() && !namespace()) {
       // Default order for an all-namespaces pod list: sink DaemonSet pods
@@ -2698,7 +2711,6 @@ function App() {
         .map(([r]) => r);
     }
 
-    const hide = hiddenFor();
     if (!hide.size) return { cols: b.cols, allCols: b.cols, rows: out };
     const keep = b.cols.map((c, i) => [c, i] as const).filter(([c]) => !hide.has(c));
     return {
