@@ -5303,7 +5303,16 @@ function App() {
                       class="btn"
                       title="server dry-run: validate without persisting"
                       disabled={actionBusy() !== null}
-                      onClick={runDryRun}
+                      onClick={() => {
+                        setDlgIdx(1);
+                        setConfirm({
+                          title: "Run a server dry-run?",
+                          body: "This only CHECKS — nothing is applied or persisted. The manifest is sent to the API server, which runs full validation (schema, admission webhooks like Kyverno/OPA, defaulting, quota, RBAC) and returns the result, then discards it.",
+                          label: "Run check",
+                          danger: false,
+                          run: () => runDryRun(),
+                        });
+                      }}
                     >
                       {actionBusy() === "dryrun" ? "checking…" : "dry-run"}
                     </button>
