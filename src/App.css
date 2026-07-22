@@ -2453,6 +2453,37 @@ details.fold[open] > summary::before {
   margin: 0 2px;
 }
 
+/* segmented toggle: current | previous */
+.log-seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.log-seg button {
+  background: var(--bg3);
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: var(--font-ui);
+  padding: 3px 10px;
+}
+
+.log-seg button + button {
+  border-left: 1px solid var(--border);
+}
+
+.log-seg button:hover {
+  color: var(--fg);
+}
+
+.log-seg button.active {
+  background: var(--primary-bg);
+  color: var(--primary-fg);
+}
+
 /* ── confirm modal ───────────────────────────────────── */
 
 .modal-backdrop {

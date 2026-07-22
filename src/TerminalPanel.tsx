@@ -172,6 +172,7 @@ export default function TerminalPanel(props: {
         `\x1b[90mattaching ephemeral debug container to ${t.name}… (pulling ${t.image ?? "busybox:1.36"}, up to 60s)\x1b[0m\r\n`,
       );
     }
+    if (t.kind === "logs") term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
       if (d === "\u0000exit") {
@@ -260,6 +261,17 @@ export default function TerminalPanel(props: {
     term?.dispose();
   });
 
+  // A banner at the top of the stream so it's unmistakable which
+  // instance you're reading — the running container or its dead one.
+  const logHeaderLine = () => {
+    const c = props.target.container
+      ? `container "${props.target.container}"`
+      : "the container";
+    return logPrev()
+      ? `\x1b[30;43m PREVIOUS \x1b[0m \x1b[33mdead instance of ${c} — the crash right before the last restart (only the most recent one)\x1b[0m\r\n`
+      : `\x1b[30;42m CURRENT \x1b[0m \x1b[90mrunning instance of ${c}\x1b[0m\r\n`;
+  };
+
   // Re-open a pod-log stream with the current toolbar options.
   async function reloadLogs() {
     if (props.target.kind !== "logs" || !term) return;
@@ -269,6 +281,7 @@ export default function TerminalPanel(props: {
     }
     term.clear();
     logBuf = "";
+    term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
       if (d === "\u0000exit") return;
@@ -355,17 +368,33 @@ export default function TerminalPanel(props: {
           </button>
           <Show when={props.target.kind === "logs"}>
             <span class="log-sep" />
-            <button
-              class="btn sm"
-              classList={{ primary: logPrev() }}
-              title="logs of this container's previous, now-terminated instance (kubectl logs --previous) — the crash before the last restart"
-              onClick={() => {
-                setLogPrev(!logPrev());
-                void reloadLogs();
-              }}
+            <span
+              class="log-seg"
+              title="current = the running container. previous = its last terminated instance only (kubectl logs --previous), i.e. the crash right before the last restart — not older restarts."
             >
-              previous (prior container)
-            </button>
+              <button
+                classList={{ active: !logPrev() }}
+                onClick={() => {
+                  if (logPrev()) {
+                    setLogPrev(false);
+                    void reloadLogs();
+                  }
+                }}
+              >
+                current
+              </button>
+              <button
+                classList={{ active: logPrev() }}
+                onClick={() => {
+                  if (!logPrev()) {
+                    setLogPrev(true);
+                    void reloadLogs();
+                  }
+                }}
+              >
+                previous (dead)
+              </button>
+            </span>
             <button
               class="btn sm"
               classList={{ primary: logTs() }}
