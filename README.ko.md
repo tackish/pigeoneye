@@ -25,7 +25,60 @@ PigeonEye는 빠른 네이티브 Kubernetes GUI입니다. 클러스터가 서빙
 
 테이블은 화면에 보이는 행만 렌더(가상 스크롤)하므로, 2만 4천 행 목록을
 필터링해도 **키 입력당 ~0.5ms**입니다. 열린 목록은 watch로 **실시간**
-갱신되고, 다시 방문하면 캐시에서 즉시 그려집니다.
+갱신되고, 다시 방문하면 **캐시된 resourceVersion부터 watch를 재개**해 그
+사이 변경분만 받습니다(전체 재조회 없음).
+
+**속도의 비결:** 서버사이드 프린터 컬럼(Table API — 뷰당 요청 1회, 전체
+오브젝트 동기화 없음), 스트리밍 페이징, 가상 스크롤, 지연 구축 전문 인덱스,
+watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
+
+## 주요 기능
+
+- **모든 리소스, 설정 0.** kind는 Discovery API에서 오므로 **모든 CRD·집계
+  API가 자동 표시**되고, `kubectl get`과 동일한 컬럼을 씁니다. 하드코딩 없음.
+- **제대로 찾는 검색.** 모든 필드(라벨·어노·env·이미지·IP…) 전문 검색 +
+  **정규식**·**`!`제외** 토큰, **컬럼별 값 필터**, 숫자 컬럼 **부등호 비교**
+  (`> 500`). 고카디널리티 컬럼은 정렬로 폴백.
+- **진짜 로그 뷰어.** follow, 크래시용 **previous(이전 컨테이너)**,
+  **since** 윈도, 타임스탬프, **인-뷰 검색·복사·다운로드**, 그리고 워크로드/
+  Service의 **전 파드 통합 로그**.
+- **정책에 맞는 셸·디버깅.** 파드 exec(컨테이너 선택), **노드 셸**(privileged
+  `nsenter`, 설정에서 완전 투명), **ephemeral 디버그 컨테이너**(distroless/
+  크래시 파드용) — 디버그 컨테이너가 파드의 securityContext를 따라가 restricted
+  PodSecurity / Kyverno에서도 통과.
+- **안전한 편집.** 인앱 YAML → **서버사이드 apply**(충돌 처리), 적용 전
+  **서버 dry-run** 검증, **템플릿 생성**(`+ New`, Argo Rollout 포함).
+- **운영.** 스케일, 롤아웃 **restart / history / undo**, cordon/drain,
+  CronJob **trigger/suspend**, Job suspend, Secret **디코드/reveal**,
+  **포트포워드** 관리, **파드·노드 메트릭**(`top`), **`auth can-i`**(내 권한).
+- **키보드 우선**, 멀티 클러스터 탭, 라이트/다크, 토큰 만료 시 **원클릭
+  SSO/gcloud 재로그인**.
+
+## k9s · Lens 비교
+
+|  | PigeonEye | k9s | Lens/OpenLens |
+|---|---|---|---|
+| 네이티브 GUI | ✅ | 터미널 | Electron |
+| 2.4만 파드 초기 로딩 | **~0.35초 첫 화면** | 빠름 | 느림(전체 동기화) |
+| 모든 CRD/집계 API, 무설정 | ✅ | ✅ | ✅ |
+| 정규식/제외/숫자/컬럼별 필터 | ✅ | 정규식/`!` | 기본 |
+| 로그 previous·since·검색·다운로드 | ✅ | ✅ | ✅(Lens만) |
+| 워크로드/Service 통합 로그 | ✅ | ✅ | 일부 |
+| ephemeral **디버그** 컨테이너(정책 안전) | ✅ | — | — |
+| **노드 셸**(nsenter) | ✅ | 옵션 | ✅ |
+| Secret 디코드 | ✅ | ✅ | ✅ |
+| 적용 전 서버 **dry-run** | ✅ | — | — |
+| 템플릿 생성 | ✅ | 빈 YAML | ✅ |
+| 롤아웃 history/undo | ✅ | ✅ | ✅ |
+| CronJob trigger/suspend | ✅ | ✅ | — |
+| 노드·파드 **메트릭 컬럼** | ✅ | ✅ | Prometheus 필요 |
+| `auth can-i` / 권한 | ✅ | 역조회 | RBAC 뷰 |
+| 인증 자동 로그인(AWS SSO/gcloud) | ✅ | — | — |
+| 시계열 메트릭 차트 | — | — | ✅(Prometheus) |
+| Helm/확장/xray 트리/린터 | — | xray/popeye/plugins | Helm/확장 |
+
+메트릭 그래프, Helm, owner **xray 트리**, 클러스터 린터가 아직 없는 주요
+항목입니다. owner↔children 탐색은 관련 리소스 점프로 한 번에 됩니다.
 
 ## 지원 플랫폼
 | 플랫폼 | 상태 |
@@ -196,7 +249,7 @@ metrics-server가 있으면 Pod 뷰에 실시간 메트릭 칼럼(CPU,
 
 ## 로드맵
 
-실시간 watch 갱신(informer) → 재시작을 넘어가는 로그 추적 → Helm 릴리스.
+시계열 메트릭 차트 → owner **xray** 트리 뷰 → Helm 릴리스.
 
 ## 라이선스
 
