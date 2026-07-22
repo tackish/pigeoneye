@@ -358,13 +358,13 @@ export default function TerminalPanel(props: {
             <button
               class="btn sm"
               classList={{ primary: logPrev() }}
-              title="show the previous (crashed) container's logs"
+              title="logs of this container's previous, now-terminated instance (kubectl logs --previous) — the crash before the last restart"
               onClick={() => {
                 setLogPrev(!logPrev());
                 void reloadLogs();
               }}
             >
-              previous
+              previous (prior container)
             </button>
             <button
               class="btn sm"

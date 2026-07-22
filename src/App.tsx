@@ -4462,10 +4462,10 @@ function App() {
               <Show when={selected()}>
                 <button
                   class="btn sm"
-                  title="which verbs you may perform on this kind (auth can-i)"
+                  title="which actions you're allowed to perform on this kind (kubectl auth can-i)"
                   onClick={openAccess}
                 >
-                  access
+                  my permissions
                 </button>
               </Show>
               <Show when={table()}>
@@ -5853,7 +5853,7 @@ function App() {
             <div class="modal-backdrop" onClick={() => setAccess(null)}>
               <div class="modal" onClick={(e) => e.stopPropagation()}>
                 <h3>
-                  Can I… {selected()?.plural}
+                  My permissions · {selected()?.plural}
                   <span class="dim gv">
                     {selected()?.namespaced ? namespace() || "all ns" : "cluster"}
                   </span>
