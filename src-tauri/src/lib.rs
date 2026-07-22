@@ -453,7 +453,74 @@ async fn count_resources(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// A GUI launched from Finder/Spotlight/the dock inherits a bare PATH
+/// (`/usr/bin:/bin:…`) that omits Homebrew, asdf, the gcloud SDK, etc.
+/// kubeconfig `exec` auth plugins (aws, gke-gcloud-auth-plugin, tsh…)
+/// then fail with "No such file or directory". Rebuild PATH from the
+/// user's login shell — the same one their terminal uses — and fold in
+/// the usual bin dirs, so exec-based auth resolves the same as in a
+/// terminal. Launching via the `peye` symlink already inherits the shell
+/// PATH; this makes the GUI launch behave identically.
+fn augment_path() {
+    let mut dirs: Vec<String> = Vec::new();
+    let push = |d: String, dirs: &mut Vec<String>| {
+        if !d.is_empty() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    };
+
+    // Ask the login+interactive shell what PATH it exports (picks up
+    // .zprofile and .zshrc). Run it off-thread with a timeout so a slow
+    // or input-waiting rc can never hang startup.
+    if let Ok(shell) = std::env::var("SHELL") {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(&shell)
+                .args(["-ilc", "printf %s \"$PATH\""])
+                .output();
+            let _ = tx.send(out);
+        });
+        if let Ok(Ok(out)) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    for p in s.trim().split(':') {
+                        push(p.to_string(), &mut dirs);
+                    }
+                }
+            }
+        }
+    }
+
+    // Keep whatever we were launched with, then guarantee the common
+    // locations even if the shell probe came up short.
+    if let Ok(cur) = std::env::var("PATH") {
+        for p in cur.split(':') {
+            push(p.to_string(), &mut dirs);
+        }
+    }
+    for d in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push(d.to_string(), &mut dirs);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for d in [".local/bin", "bin", ".krew/bin", "google-cloud-sdk/bin"] {
+            push(format!("{home}/{d}"), &mut dirs);
+        }
+    }
+
+    std::env::set_var("PATH", dirs.join(":"));
+}
+
 pub fn run() {
+    augment_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
