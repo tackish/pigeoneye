@@ -438,6 +438,52 @@ pub async fn connect(
 }
 
 pub async fn disconnect(state: &AppState, context: String) -> Result<(), String> {
+    // Reap this context's sessions BEFORE dropping the client — otherwise
+    // a node shell's privileged helper pod lingers until its 4h deadline.
+    let mut reap: Vec<(String, String)> = Vec::new();
+    {
+        let mut exec = state.exec.write().await;
+        let ids: Vec<u32> = exec
+            .iter()
+            .filter(|(_, s)| {
+                s.cleanup.as_ref().map(|(c, _, _)| c == &context).unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(s) = exec.remove(&id) {
+                for a in &s.aborts {
+                    a.abort();
+                }
+                if let Some((_, ns, pod)) = s.cleanup {
+                    reap.push((ns, pod));
+                }
+            }
+        }
+    }
+    // Abort this context's port-forwards (they hold their own client).
+    {
+        let mut fw = state.forwards.write().await;
+        let ids: Vec<u32> = fw
+            .iter()
+            .filter(|(_, s)| s.info.context == context)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(s) = fw.remove(&id) {
+                s.abort.abort();
+                for c in s.conns.lock().unwrap().drain(..) {
+                    c.abort();
+                }
+            }
+        }
+    }
+    if let Ok(client) = client(state, &context).await {
+        for (ns, pod) in reap {
+            let pods: Api<K8sPod> = Api::namespaced(client.clone(), &ns);
+            let _ = pods.delete(&pod, &DeleteParams::default().grace_period(0)).await;
+        }
+    }
     state.clients.write().await.remove(&context);
     Ok(())
 }
