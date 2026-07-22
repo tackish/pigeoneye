@@ -326,6 +326,41 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             can_login: true,
         };
     }
+    // Teleport: the exec command is usually the absolute path to `tsh`.
+    if base == "tsh" {
+        return AuthHint {
+            kind: "teleport".into(),
+            message: "Teleport session expired. Logging in opens your browser to re-authenticate.".into(),
+            command: Some("tsh login".into()),
+            can_login: true,
+        };
+    }
+    if base == "az" {
+        return AuthHint {
+            kind: "azure".into(),
+            message: "Azure credentials have expired. Logging in opens your browser.".into(),
+            command: Some("az login".into()),
+            can_login: true,
+        };
+    }
+    // kubelogin / oidc-login (kubectl OIDC): re-running fetches a token via
+    // the browser device flow.
+    if base == "kubelogin" || base == "oidc-login" || base == "kubectl-oidc_login" {
+        return AuthHint {
+            kind: "oidc".into(),
+            message: "OIDC token expired. Logging in opens your browser to re-authenticate.".into(),
+            command: Some(format!("{exec_command} {}", args.join(" ")).trim().to_string()),
+            can_login: true,
+        };
+    }
+    if base == "doctl" {
+        return AuthHint {
+            kind: "doctl".into(),
+            message: "DigitalOcean credentials expired. Re-run `doctl auth init`.".into(),
+            command: Some("doctl auth init".into()),
+            can_login: true,
+        };
+    }
     // an exec plugin we don't recognise: tell the user how it authenticates
     AuthHint {
         kind: "exec".into(),
@@ -831,7 +866,7 @@ async fn fetch_table(
     include_object: &str,
     field_selector: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    fetch_table_page(client, rt, namespace, include_object, field_selector, None).await
+    fetch_table_page(client, rt, namespace, include_object, field_selector, None, None).await
 }
 
 async fn fetch_table_page(
@@ -841,12 +876,13 @@ async fn fetch_table_page(
     include_object: &str,
     field_selector: Option<&str>,
     continue_token: Option<&str>,
+    limit_override: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    let limit = if include_object == "None" {
+    let limit = limit_override.unwrap_or(if include_object == "None" {
         PAGE_LIMIT_CELLS
     } else {
         PAGE_LIMIT_META
-    };
+    });
     let mut url = format!(
         "{}?limit={}&includeObject={}",
         resource_url(rt, namespace),
@@ -1184,7 +1220,7 @@ pub async fn list_resources(
                 let (c, r, n, f) = (client2.clone(), rt2.clone(), ns2.clone(), fs2.clone());
                 let inc = include.to_string();
                 tokio::spawn(async move {
-                    fetch_table_page(&c, &r, n.as_deref(), &inc, f.as_deref(), Some(&tok)).await
+                    fetch_table_page(&c, &r, n.as_deref(), &inc, f.as_deref(), Some(&tok), None).await
                 })
             };
             let mut in_flight = first_token.map(spawn_fetch);
@@ -1458,6 +1494,7 @@ async fn build_index(
             "Object",
             field_selector,
             token.as_deref(),
+            None,
         )
         .await?;
         // Flattening every field of a few thousand objects is the
@@ -3380,7 +3417,10 @@ pub async fn exec_stdin(state: &AppState, id: u32, data: String) -> Result<(), S
         .get(&id)
         .and_then(|s| s.stdin.clone());
     if let Some(tx) = tx {
-        tx.send(data.into_bytes()).await.map_err(err)?;
+        // A dropped receiver means the shell already exited; that's not a
+        // command failure, so don't surface it (it would reject the invoke
+        // as "channel closed"). exec_resize already ignores its send.
+        let _ = tx.send(data.into_bytes()).await;
     }
     Ok(())
 }
@@ -3422,6 +3462,209 @@ pub async fn exec_stop(state: &AppState, id: u32) -> Result<(), String> {
 /// Row counts for many resource types at once (sidebar badges).
 /// Fired concurrently so a sidebar full of hundreds of types still
 /// resolves in roughly one round-trip.
+/// Translate a kubectl-style JSONPath into the RFC 9535 syntax
+/// `serde_json_path` parses:
+///   - kubectl paths start with `.`; JSONPath wants a `$` root.
+///   - kubectl filters read `[?(@.type=="Ready")]`; RFC 9535 has no
+///     inner parens: `[?@.type=="Ready"]`.
+/// Bracket-quoted keys (`['node.kubernetes.io/instance-type']`) already
+/// match, so dotted label keys work when written that way.
+fn parse_kubectl_path(p: &str) -> Result<serde_json_path::JsonPath, String> {
+    let mut s = p.trim().to_string();
+    if s.starts_with('.') {
+        s.insert(0, '$');
+    } else if !s.starts_with('$') {
+        s.insert_str(0, "$.");
+    }
+    s = s.replace("[?(", "[?").replace(")]", "]");
+    serde_json_path::JsonPath::parse(&s).map_err(|e| format!("bad path `{p}`: {e}"))
+}
+
+/// Render every match of one path against one object as a single cell.
+fn eval_cell(obj: &serde_json::Value, path: &serde_json_path::JsonPath) -> String {
+    let nodes = path.query(obj).all();
+    nodes
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Evaluate user-defined custom columns against the full objects of a
+/// list. Runs its own paged includeObject=Object fetch — only called when
+/// a kind actually has custom columns, so the slim default path pays
+/// nothing. Returns key(`ns/name`) → one cell per column, in order.
+pub async fn custom_columns(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+    paths: Vec<String>,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let compiled: Vec<serde_json_path::JsonPath> = paths
+        .iter()
+        .map(|p| parse_kubectl_path(p))
+        .collect::<Result<_, _>>()?;
+    let client = client(state, &context).await?;
+    let ns = namespace.filter(|n| !n.is_empty());
+    let fs = field_selector.filter(|f| !f.is_empty());
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = fetch_table_page(
+            &client,
+            &rt,
+            ns.as_deref(),
+            "Object",
+            fs.as_deref(),
+            token.as_deref(),
+            None,
+        )
+        .await?;
+        if let Some(rows) = page["rows"].as_array() {
+            for r in rows {
+                let obj = &r["object"];
+                let key = format!(
+                    "{}/{}",
+                    obj.pointer("/metadata/namespace")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    obj.pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                );
+                let cells = compiled.iter().map(|p| eval_cell(obj, p)).collect();
+                out.push((key, cells));
+            }
+        }
+        token = page
+            .pointer("/metadata/continue")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(String::from);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Walk one object into pickable kubectl-JSONPath leaf paths. Arrays of
+/// objects that share a discriminator (`type`/`name`) become filter paths
+/// (`conditions[?(@.type=="Ready")].status`) so conditions/addresses come
+/// out exactly like a `kubectl -o custom-columns` query; other arrays use
+/// `[0]`. Skips the noisy bits (managedFields, labels — labels have their
+/// own picker).
+fn flatten_paths(
+    v: &serde_json::Value,
+    prefix: &str,
+    depth: u32,
+    arr_depth: u32,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    // Go deep and wide — flattening a handful of sample objects is cheap
+    // (never on the hot path), and the UI only renders a filtered slice.
+    if depth > 12 || out.len() > 2000 {
+        return;
+    }
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, val) in m {
+                if k == "managedFields" {
+                    continue;
+                }
+                // labels have their own picker; annotations are noisy and
+                // often huge — both are better reached via Advanced.
+                if prefix == ".metadata" && (k == "labels" || k == "annotations") {
+                    continue;
+                }
+                flatten_paths(val, &format!("{prefix}.{k}"), depth + 1, arr_depth, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            // Expand an array by its type/name discriminator down to two
+            // array levels (containers[] → env[]), so deep fields are
+            // reachable; below that, collapse to [0] so a pathological
+            // array-of-arrays can't blow up.
+            let disc = if arr_depth < 2 {
+                ["type", "name", "key"].into_iter().find(|d| {
+                    !a.is_empty()
+                        && a.iter().all(|e| e.get(d).and_then(|x| x.as_str()).is_some())
+                })
+            } else {
+                None
+            };
+            if let Some(d) = disc {
+                let mut seen = std::collections::BTreeSet::new();
+                for e in a {
+                    if seen.len() >= 12 {
+                        break; // cap distinct values so a big array can't explode
+                    }
+                    if let Some(val) = e.get(d).and_then(|x| x.as_str()) {
+                        if seen.insert(val.to_string()) {
+                            flatten_paths(
+                                e,
+                                &format!("{prefix}[?(@.{d}==\"{val}\")]"),
+                                depth + 1,
+                                arr_depth + 1,
+                                out,
+                            );
+                        }
+                    }
+                }
+            } else if let Some(first) = a.first() {
+                flatten_paths(first, &format!("{prefix}[0]"), depth + 1, arr_depth + 1, out);
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => {
+            // A leaf with an actual value — skip empties so the picker
+            // never offers a column that would render blank.
+            if prefix.is_empty() {
+                return;
+            }
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if s.trim().is_empty() {
+                return;
+            }
+            out.entry(prefix.to_string()).or_insert(s);
+        }
+    }
+}
+
+/// Sample a few full objects and return the union of their pickable field
+/// paths, each with a representative value, so the UI can offer a
+/// searchable field list (with a preview) instead of making the user
+/// hand-write JSONPath. Paths with no value anywhere in the sample are
+/// omitted.
+pub async fn sample_fields(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let client = client(state, &context).await?;
+    let ns = namespace.filter(|n| !n.is_empty());
+    // A handful of objects is plenty to sample field paths — don't pull
+    // the whole 500-object / ~18 MB page just to read 8.
+    let page = fetch_table_page(&client, &rt, ns.as_deref(), "Object", None, None, Some(12)).await?;
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(rows) = page["rows"].as_array() {
+        for r in rows.iter().take(8) {
+            flatten_paths(&r["object"], "", 0, 0, &mut map);
+        }
+    }
+    Ok(map.into_iter().collect())
+}
+
 pub async fn count_resources(
     state: &AppState,
     context: String,
@@ -3448,4 +3691,29 @@ pub async fn count_resources(
         }
     });
     Ok(join_all(tasks).await)
+}
+
+#[cfg(test)]
+mod cc_tests {
+    use super::{eval_cell, parse_kubectl_path};
+    fn node() -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name":"n1","labels":{"node.kubernetes.io/instance-type":"m5.large","group":"gpu"},"creationTimestamp":"2026-01-01T00:00:00Z"},
+            "spec": {"providerID":"aws:///x/i-123","unschedulable": true},
+            "status": {
+                "addresses":[{"type":"Hostname","address":"n1.local"},{"type":"InternalIP","address":"10.0.0.5"}],
+                "conditions":[{"type":"MemoryPressure","status":"False"},{"type":"Ready","status":"True"}]
+            }
+        })
+    }
+    fn ev(p: &str) -> String { eval_cell(&node(), &parse_kubectl_path(p).unwrap()) }
+    #[test]
+    fn paths() {
+        assert_eq!(ev(".status.addresses[?(@.type==\"InternalIP\")].address"), "10.0.0.5");
+        assert_eq!(ev(".status.conditions[?(@.type==\"Ready\")].status"), "True");
+        assert_eq!(ev(".spec.providerID"), "aws:///x/i-123");
+        assert_eq!(ev(".spec.unschedulable"), "true");
+        assert_eq!(ev(".metadata.labels['node.kubernetes.io/instance-type']"), "m5.large");
+        assert_eq!(ev(".metadata.creationTimestamp"), "2026-01-01T00:00:00Z");
+    }
 }

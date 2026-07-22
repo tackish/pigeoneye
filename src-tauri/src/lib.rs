@@ -452,6 +452,28 @@ async fn count_resources(
     k8s::count_resources(&state, context, types).await
 }
 
+#[tauri::command]
+async fn custom_columns(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+    paths: Vec<String>,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    k8s::custom_columns(&state, context, resource, namespace, field_selector, paths).await
+}
+
+#[tauri::command]
+async fn sample_fields(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    k8s::sample_fields(&state, context, resource, namespace).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// A GUI launched from Finder/Spotlight/the dock inherits a bare PATH
 /// (`/usr/bin:/bin:…`) that omits Homebrew, asdf, the gcloud SDK, etc.
@@ -469,25 +491,34 @@ fn augment_path() {
         }
     };
 
-    // Ask the login+interactive shell what PATH it exports (picks up
-    // .zprofile and .zshrc). Run it off-thread with a timeout so a slow
-    // or input-waiting rc can never hang startup.
+    // Ask the login+interactive shell (picks up .zprofile/.zshrc) for the
+    // PATH *and* the auth-relevant vars a GUI launch never inherits — most
+    // importantly $KUBECONFIG, so clusters that live only in a
+    // $KUBECONFIG-listed file are visible. One newline-separated probe;
+    // off-thread with a timeout so a slow rc can't hang startup.
+    let mut shell_vars: Vec<String> = Vec::new();
     if let Ok(shell) = std::env::var("SHELL") {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let out = std::process::Command::new(&shell)
-                .args(["-ilc", "printf %s \"$PATH\""])
+                .args([
+                    "-ilc",
+                    "printf '%s\\n%s\\n%s\\n%s' \"$PATH\" \"$KUBECONFIG\" \"$AWS_PROFILE\" \"$AWS_CONFIG_FILE\"",
+                ])
                 .output();
             let _ = tx.send(out);
         });
         if let Ok(Ok(out)) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
             if out.status.success() {
                 if let Ok(s) = String::from_utf8(out.stdout) {
-                    for p in s.trim().split(':') {
-                        push(p.to_string(), &mut dirs);
-                    }
+                    shell_vars = s.split('\n').map(|x| x.trim().to_string()).collect();
                 }
             }
+        }
+    }
+    if let Some(path) = shell_vars.first() {
+        for p in path.split(':') {
+            push(p.to_string(), &mut dirs);
         }
     }
 
@@ -517,6 +548,15 @@ fn augment_path() {
     }
 
     std::env::set_var("PATH", dirs.join(":"));
+
+    // Import the auth vars from the login shell when the process lacks them.
+    for (name, idx) in [("KUBECONFIG", 1), ("AWS_PROFILE", 2), ("AWS_CONFIG_FILE", 3)] {
+        if std::env::var_os(name).is_none() {
+            if let Some(v) = shell_vars.get(idx).filter(|v| !v.is_empty()) {
+                std::env::set_var(name, v);
+            }
+        }
+    }
 }
 
 pub fn run() {
@@ -603,7 +643,9 @@ pub fn run() {
             ensure_index,
             filter_rows,
             list_namespaces,
-            count_resources
+            count_resources,
+            custom_columns,
+            sample_fields
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
