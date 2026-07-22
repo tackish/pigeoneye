@@ -1111,6 +1111,36 @@ function App() {
     JSON.parse(localStorage.getItem("pigeoneye.cols") ?? "{}"),
   );
 
+  // Per-kind column order (visible column names, in the user's drag
+  // order). Persisted; columns not listed — new server columns, or ones
+  // just un-hidden — append at the end in their original order.
+  const [colOrder, setColOrderRaw] = createSignal<Record<string, string[]>>(
+    JSON.parse(localStorage.getItem("pigeoneye.colorder") ?? "{}"),
+  );
+  const setColOrder = (next: Record<string, string[]>) => {
+    setColOrderRaw(next);
+    localStorage.setItem("pigeoneye.colorder", JSON.stringify(next));
+  };
+  const applyColOrder = (shown: string[]): string[] => {
+    const ord = colOrder()[colKey()];
+    if (!ord || !ord.length) return shown;
+    const set = new Set(shown);
+    const front = ord.filter((c) => set.has(c));
+    const seen = new Set(front);
+    return [...front, ...shown.filter((c) => !seen.has(c))];
+  };
+  // Header column being dragged (its name), or null.
+  const [dragCol, setDragCol] = createSignal<string | null>(null);
+  // Move `from` so it lands just before `target` in the visible order.
+  function moveColumn(from: string, target: string) {
+    if (from === target) return;
+    const next = view().cols.filter((c) => c !== from);
+    const i = next.indexOf(target);
+    next.splice(i < 0 ? next.length : i, 0, from);
+    setColOrder({ ...colOrder(), [colKey()]: next });
+    setSortCol(null);
+  }
+
   const colKey = () => (selected() ? typeKey(selected()!) : "");
 
   /// Columns the API server marks as wide-only (priority > 0) — the
@@ -1148,6 +1178,10 @@ function App() {
     delete next[colKey()];
     setHiddenCols(next);
     localStorage.setItem("pigeoneye.cols", JSON.stringify(next));
+    // also drop any custom drag order for this kind
+    const ord = { ...colOrder() };
+    delete ord[colKey()];
+    setColOrder(ord);
     setSortCol(null);
   }
   const [sortDir, setSortDir] = createSignal<1 | -1>(1);
@@ -2718,13 +2752,27 @@ function App() {
 
   /// Column widths follow the data, but sampling the first rows is
   /// enough — scanning 24k rows on every change is not.
+  // Display column order: base columns minus hidden, then the user's drag
+  // order. Independent of the row filter so headers/widths don't rebuild
+  // on every keystroke. The header, widths and view() all read this so
+  // they can never disagree on order.
+  const displayCols = createMemo(() => {
+    const b = baseRows();
+    const hide = hiddenFor();
+    return applyColOrder(
+      hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols,
+    );
+  });
+
   const colWidths = createMemo(() => {
     const b = baseRows();
+    const idxOf = new Map(b.cols.map((c, i) => [c, i] as const));
     const sample = b.rows.slice(0, 600);
-    return b.cols.map((c, i) => {
+    return displayCols().map((c) => {
+      const bi = idxOf.get(c) ?? -1;
       let max = c.length + 2;
       for (const r of sample) {
-        const len = r.cells[i]?.length ?? 0;
+        const len = bi >= 0 ? (r.cells[bi]?.length ?? 0) : 0;
         if (len > max) max = len;
       }
       return Math.min(Math.max(max * 7.4 + 28, 76), 460);
@@ -2812,12 +2860,11 @@ function App() {
       );
     }
 
-    const hide = hiddenFor();
     // The sort index comes from the DISPLAYED columns (thead iterates
-    // view().cols), but cells here are still the full pre-hide set — map
-    // the displayed index back to the full-cells index by column name, or
-    // hiding a column would sort a different (shifted) column.
-    const shownCols = hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols;
+    // view().cols), but cells here are still the full base set — map the
+    // displayed index back to the base-cells index by column name, or
+    // hiding/reordering a column would sort a different one.
+    const shownCols = displayCols();
     const sc = sortCol();
     const sortIdx =
       sc !== null && sc >= 0 && sc < shownCols.length
@@ -2846,12 +2893,16 @@ function App() {
         .map(([r]) => r);
     }
 
-    if (!hide.size) return { cols: b.cols, allCols: b.cols, rows: out };
-    const keep = b.cols.map((c, i) => [c, i] as const).filter(([c]) => !hide.has(c));
+    // Fast path: nothing hidden and order unchanged → ship base cells.
+    const identity =
+      shownCols.length === b.cols.length &&
+      shownCols.every((c, i) => c === b.cols[i]);
+    if (identity) return { cols: b.cols, allCols: b.cols, rows: out };
+    const keepIdx = shownCols.map((c) => b.cols.indexOf(c));
     return {
-      cols: keep.map(([c]) => c),
+      cols: shownCols,
       allCols: b.cols,
-      rows: out.map((r) => ({ ...r, cells: keep.map(([, i]) => r.cells[i]) })),
+      rows: out.map((r) => ({ ...r, cells: keepIdx.map((i) => r.cells[i]) })),
     };
   });
 
@@ -4928,8 +4979,30 @@ function App() {
                           {(c, i) => (
                             <th
                               class="sortable"
+                              draggable={true}
                               data-col={i()}
-                              classList={{ sorted: sortCol() === i() }}
+                              classList={{
+                                sorted: sortCol() === i(),
+                                coldrag: dragCol() === c,
+                                coldrop: !!dragCol() && dragCol() !== c,
+                              }}
+                              onDragStart={(e) => {
+                                setDragCol(c);
+                                e.dataTransfer?.setData("text/plain", c);
+                                if (e.dataTransfer)
+                                  e.dataTransfer.effectAllowed = "move";
+                              }}
+                              onDragEnd={() => setDragCol(null)}
+                              onDragOver={(e) =>
+                                dragCol() && dragCol() !== c && e.preventDefault()
+                              }
+                              onDrop={(e) => {
+                                const from = dragCol();
+                                if (from) {
+                                  e.preventDefault();
+                                  moveColumn(from, c);
+                                }
+                              }}
                             >
                               <span
                                 class="th-text"

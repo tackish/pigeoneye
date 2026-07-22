@@ -1030,6 +1030,17 @@ th.sortable:hover {
   color: var(--fg);
 }
 
+/* column drag-to-reorder: dim the one being dragged, mark drop targets */
+th.coldrag {
+  opacity: 0.4;
+}
+th.coldrop {
+  cursor: grabbing;
+}
+th.coldrop:hover {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .sort-ind {
   /* reserved width: the arrow appearing must not reflow the header */
   display: inline-block;
