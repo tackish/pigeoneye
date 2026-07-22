@@ -505,6 +505,57 @@ body {
   line-height: 1.5;
 }
 
+/* kind name takes the slack so the scope + pin badges cluster on the right */
+.kname {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ★ pin toggle: hidden until you hover the row, lit when pinned */
+.pin {
+  flex: none;
+  margin-left: 6px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--dim);
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s;
+}
+.kind:hover .pin {
+  opacity: 0.55;
+}
+.pin:hover {
+  opacity: 1 !important;
+  color: var(--accent);
+}
+.kind.fav .pin {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* ★ Pinned section: a drop zone that also reveals itself while dragging */
+.pinned-group {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+}
+.pinned-group.drop-live {
+  outline: 1px dashed var(--accent);
+  outline-offset: -3px;
+  border-radius: 6px;
+}
+.pin-slot {
+  display: block;
+}
+.pin-hint {
+  color: var(--dim);
+  font-size: 11px;
+  padding: 4px 12px 4px 16px;
+  font-style: italic;
+}
+
 /* ── content / table ─────────────────────────────────── */
 
 .content {

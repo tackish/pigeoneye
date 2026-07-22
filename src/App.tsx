@@ -833,6 +833,31 @@ function App() {
     setSidebarOpen(v);
     localStorage.setItem("pigeoneye.sidebar", v ? "open" : "closed");
   }
+
+  // Global pin list: an ordered set of typeKeys (`group/kind`) the user
+  // dragged/starred to the top. Global across clusters — a pinned CRD
+  // that a given cluster doesn't have simply doesn't render, but stays
+  // pinned for the clusters that do. Persisted so it survives restarts.
+  const readPins = (): string[] => {
+    try {
+      const v = JSON.parse(localStorage.getItem("pigeoneye.pins") ?? "[]");
+      return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  };
+  const [favs, setFavsRaw] = createSignal<string[]>(readPins());
+  const setFavs = (next: string[]) => {
+    setFavsRaw(next);
+    localStorage.setItem("pigeoneye.pins", JSON.stringify(next));
+  };
+  // The kind currently being dragged (its typeKey), or null. Kept in a
+  // signal, not in DataTransfer: WKWebView/Safari drop custom MIME types,
+  // so the drop logic must never depend on reading them back. `dragging`
+  // also reveals the drop zone while a drag is in flight.
+  const [dragKey, setDragKey] = createSignal<string | null>(null);
+  const dragging = () => dragKey() !== null;
+
   let nextShellKey = 1;
   const [failed, setFailed] = createSignal<{ name: string; error: string }[]>([]);
   const failedTabs: { name: string; error: string }[] = [];
@@ -2466,29 +2491,45 @@ function App() {
     });
   }
 
-  // Essential panel: pinned categories resolved against what discovery found.
+  // The user's pins, resolved against what discovery found. A pinned CRD
+  // that this cluster doesn't have is skipped here but kept in favs(), so
+  // it comes back on a cluster that does have it.
+  const favKeys = createMemo(() => new Set(favs()));
+  const favTypes = createMemo<ResourceType[]>(() => {
+    const byKey = new Map(types().map((t) => [typeKey(t), t]));
+    return favs()
+      .map((k) => byKey.get(k))
+      .filter((t): t is ResourceType => !!t);
+  });
+
+  // Essential panel: curated categories resolved against discovery, minus
+  // anything the user pinned (a pin is promoted into ★ Pinned above, not
+  // shown twice).
   const pinned = createMemo(() => {
     const byKey = new Map(types().map((t) => [typeKey(t), t]));
+    const fk = favKeys();
     return CATEGORIES.map(([name, kinds]) => ({
       name,
       types: kinds
         .map(([g, k]) => byKey.get(`${g}/${k}`))
-        .filter((t): t is ResourceType => !!t),
+        .filter((t): t is ResourceType => !!t && !fk.has(typeKey(t))),
     })).filter((c) => c.types.length > 0);
   });
 
-  const pinnedKeys = createMemo(
-    () => new Set(pinned().flatMap((c) => c.types.map(typeKey))),
+  // Everything already shown above the CRD/More groups: curated pins plus
+  // user favorites. Those groups exclude these so nothing shows twice.
+  const shownKeys = createMemo(
+    () => new Set([...pinned().flatMap((c) => c.types.map(typeKey)), ...favs()]),
   );
 
   // Every non-builtin group is someone's CRD — surface them all, always,
-  // except a CRD we've pinned into a category above (e.g. Argo Rollout in
-  // Workloads), so it doesn't also show under its raw group.
+  // except a kind already shown above (curated or pinned) so it doesn't
+  // also show under its raw group.
   const customGroups = createMemo(() => {
-    const pk = pinnedKeys();
+    const sk = shownKeys();
     const byGroup = new Map<string, ResourceType[]>();
     for (const t of types()) {
-      if (isBuiltinGroup(t.group) || pk.has(typeKey(t))) continue;
+      if (isBuiltinGroup(t.group) || sk.has(typeKey(t))) continue;
       if (!byGroup.has(t.group)) byGroup.set(t.group, []);
       byGroup.get(t.group)!.push(t);
     }
@@ -2497,16 +2538,30 @@ function App() {
 
   // Builtins that didn't make the pinned cut, tucked under "More".
   const restGroups = createMemo(() => {
-    const pk = pinnedKeys();
+    const sk = shownKeys();
     const byGroup = new Map<string, ResourceType[]>();
     for (const t of types()) {
-      if (!isBuiltinGroup(t.group) || pk.has(typeKey(t))) continue;
+      if (!isBuiltinGroup(t.group) || sk.has(typeKey(t))) continue;
       const key = t.group || "core";
       if (!byGroup.has(key)) byGroup.set(key, []);
       byGroup.get(key)!.push(t);
     }
     return [...byGroup.entries()];
   });
+
+  const isFav = (t: ResourceType) => favKeys().has(typeKey(t));
+  function toggleFav(t: ResourceType) {
+    const k = typeKey(t);
+    setFavs(favs().includes(k) ? favs().filter((x) => x !== k) : [...favs(), k]);
+  }
+  // Insert (or move) a pin so it lands at visual position `index` within
+  // the pinned list — the drag-and-drop reorder primitive.
+  function pinAt(key: string, index: number) {
+    const rest = favs().filter((x) => x !== key);
+    const i = Math.max(0, Math.min(index, rest.length));
+    rest.splice(i, 0, key);
+    setFavs(rest);
+  }
 
   // Typing in the kind filter searches everything discovery returned.
   const filteredGroups = createMemo(() => {
@@ -2526,7 +2581,7 @@ function App() {
   /// keyboard cursor and the rendering can never disagree.
   const sidebarItems = createMemo<ResourceType[]>(() => {
     if (filter()) return filteredGroups().flatMap(([, ts]) => ts);
-    const out = pinned().flatMap((c) => c.types);
+    const out = [...favTypes(), ...pinned().flatMap((c) => c.types)];
     for (const [group, ts] of customGroups()) {
       if (groupOpen(group)) out.push(...ts);
     }
@@ -3855,23 +3910,42 @@ function App() {
   const kindButton = (t: ResourceType) => (
     <button
       class="kind"
+      draggable={true}
       data-sk={sidebarItems().indexOf(t)}
       classList={{
         active: selected() === t,
         cursor: pane() === "sidebar" && sidebarItems()[sideIdx()] === t,
+        fav: isFav(t),
       }}
+      onDragStart={(e) => {
+        setDragKey(typeKey(t));
+        // set text/plain too so the drag actually initiates everywhere
+        e.dataTransfer?.setData("text/plain", typeKey(t));
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={() => setDragKey(null)}
       onClick={() => {
         setPane("table");
         setSideIdx(Math.max(sidebarItems().indexOf(t), 0));
         select(t);
       }}
     >
-      {t.kind}
+      <span class="kname">{t.kind}</span>
       <Show when={!t.namespaced}>
         <span class="scope" title="cluster-scoped (not namespaced)">
           C
         </span>
       </Show>
+      <span
+        class="pin"
+        title={isFav(t) ? "unpin" : "pin to top"}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleFav(t);
+        }}
+      >
+        ★
+      </span>
     </button>
   );
 
@@ -4388,6 +4462,43 @@ function App() {
                 </For>
               }
             >
+              <Show when={favTypes().length > 0 || dragging()}>
+                <div
+                  class="group pinned-group"
+                  classList={{ "drop-live": dragging() }}
+                  onDragOver={(e) => dragKey() && e.preventDefault()}
+                  onDrop={(e) => {
+                    const k = dragKey();
+                    if (k) {
+                      e.preventDefault();
+                      pinAt(k, favs().length);
+                    }
+                  }}
+                >
+                  <div class="group-name">★ Pinned</div>
+                  <For each={favTypes()}>
+                    {(t, i) => (
+                      <div
+                        class="pin-slot"
+                        onDragOver={(e) => dragKey() && e.preventDefault()}
+                        onDrop={(e) => {
+                          const k = dragKey();
+                          if (k) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            pinAt(k, i());
+                          }
+                        }}
+                      >
+                        {kindButton(t)}
+                      </div>
+                    )}
+                  </For>
+                  <Show when={favTypes().length === 0}>
+                    <div class="pin-hint">drop a kind here to pin it</div>
+                  </Show>
+                </div>
+              </Show>
               <For each={pinned()}>
                 {(cat) => (
                   <div class="group">
