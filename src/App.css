@@ -42,30 +42,32 @@
 /* Light theme, matched to the PigeonEye brand mockups:
    #2D3748 / #718096 / #A0AEC0 / #E2E8F0 / #6366F1 / #F59E0B */
 :root[data-theme="light"] {
-  --bg: #f4f6fa;
-  --bg2: #ffffff;
-  --bg3: #e9edf4;
-  --bg-hover: #eef1f7;
-  --bg-drawer: #fbfcfe;
-  --border: #e2e8f0;
+  /* Muted light theme — no pure white, softened a few % so it isn't
+     glaring ("eye-searing") in a bright room. */
+  --bg: #e5e8ee;
+  --bg2: #eef1f6;
+  --bg3: #dce0e8;
+  --bg-hover: #e0e4ec;
+  --bg-drawer: #eaedf3;
+  --border: #ccd3de;
   --fg: #2d3748;
-  --dim: #718096;
-  --accent: #6366f1;
-  --accent-soft: rgba(99, 102, 241, 0.12);
+  --dim: #6b7688;
+  --accent: #5457d6;
+  --accent-soft: rgba(84, 87, 214, 0.12);
   --good: #16a34a;
-  --warn: #d97706;
-  --bad: #dc2626;
+  --warn: #c26a06;
+  --bad: #d3352a;
   --key: #4a5568;
-  --primary-bg: #6366f1;
-  --primary-border: #6366f1;
+  --primary-bg: #5457d6;
+  --primary-border: #5457d6;
   --primary-fg: #ffffff;
-  --primary-hover: #5457e0;
-  --error-bg: #fdecec;
-  --error-fg: #b13a3a;
-  --error-border: #f3c3c3;
-  --drawer-border: #d5dbeb;
-  --editor-bg: #ffffff;
-  --editor-gutter: #f4f6fa;
+  --primary-hover: #494cc4;
+  --error-bg: #f6e3e3;
+  --error-fg: #a83a3a;
+  --error-border: #e6bcbc;
+  --drawer-border: #cbd2df;
+  --editor-bg: #eef1f6;
+  --editor-gutter: #e5e8ee;
   --backdrop: rgba(30, 39, 56, 0.35);
   color-scheme: light;
 }
@@ -209,6 +211,9 @@ body {
   font-size: 12px;
   margin-left: auto;
   white-space: nowrap;
+  /* equal-width digits so a ticking count never changes width and
+     shakes the row while indexing streams in */
+  font-variant-numeric: tabular-nums;
 }
 
 .content-head .badge {
@@ -275,6 +280,12 @@ body {
 
 .ns-item:hover {
   background: var(--bg-hover);
+}
+
+.ns-item.cursor {
+  background: var(--accent-soft);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .ns-item.active {
@@ -477,6 +488,14 @@ body {
   cursor: pointer;
   font-size: 13px;
   font-family: var(--font-ui);
+  /* WKWebView needs this (not just draggable=true) to let a kind be
+     dragged into / within the pinned section. */
+  -webkit-user-drag: element;
+}
+/* the star must not itself be draggable, or grabbing it hijacks the
+   row drag and the click-to-pin feels broken */
+.kind .pin {
+  -webkit-user-drag: none;
 }
 
 .kind:hover {
@@ -537,24 +556,64 @@ body {
 }
 
 /* ★ Pinned section: a drop zone that also reveals itself while dragging */
-.pinned-group {
+/* pinned groups */
+.pin-group {
   border-bottom: 1px solid var(--border);
   padding-bottom: 4px;
   margin-bottom: 2px;
 }
-.pinned-group.drop-live {
-  outline: 1px dashed var(--accent);
-  outline-offset: -3px;
-  border-radius: 6px;
+.pin-group-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
 }
-.pin-slot {
-  display: block;
+.pin-star {
+  color: var(--accent);
+  font-size: 10px;
 }
-.pin-hint {
+.pin-group-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pin-group-del {
+  flex: none;
+  background: none;
+  border: none;
   color: var(--dim);
-  font-size: 11px;
-  padding: 4px 12px 4px 16px;
-  font-style: italic;
+  cursor: pointer;
+  font-size: 10px;
+  opacity: 0;
+}
+.pin-group-head:hover .pin-group-del {
+  opacity: 0.7;
+}
+.pin-group-del:hover {
+  color: var(--bad, #dc2626);
+  opacity: 1;
+}
+.pin-rename {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+/* ★ pin-to-group popover */
+.pin-pick {
+  width: 210px;
+}
+.pin-pick-new {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
+.pin-pick-new .search {
+  flex: 1 1 auto;
+  margin: 0;
+  min-width: 0;
 }
 
 /* ── content / table ─────────────────────────────────── */
@@ -899,14 +958,24 @@ tr.row.cursor td:first-child {
   top: calc(100% + 6px);
   right: 0;
   z-index: 21;
-  width: 240px;
-  max-height: 60vh;
+  width: 420px;
+  max-width: 92vw;
+  max-height: 82vh;
   overflow-y: auto;
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
   padding-bottom: 6px;
+  font-size: 13px;
+}
+.cols-pop .ns-item {
+  font-size: 13px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+.cols-pop .cc-labels {
+  max-height: 240px;
 }
 
 .cols-head {
@@ -916,6 +985,244 @@ tr.row.cursor td:first-child {
   padding: 8px 10px 4px;
 }
 
+/* custom-columns builder inside the columns popover */
+.cols-custom {
+  border-top: 1px solid var(--border);
+  margin-top: 6px;
+  padding: 8px 10px 2px;
+  display: flex;
+  flex-direction: column;
+}
+/* The label picker holds the tall scrolling list, so push it to the
+   bottom — everything else (incl. the "custom path" toggle) stays
+   visible above it instead of being pushed off-screen by the list. */
+.cols-custom > .cc-picker {
+  order: 1;
+}
+.cols-custom .section-title.sub {
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.cc-blurb {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+.cc-blurb code {
+  font-size: 10px;
+}
+.cc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.cc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  background: var(--bg-hover);
+  border-radius: 4px;
+}
+.cc-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cc-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--dim);
+}
+.cc-prev {
+  flex: none;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--accent);
+}
+.cc-del {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+}
+.cc-del:hover {
+  color: var(--danger, #e06c75);
+}
+/* label picker */
+.cc-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Reuse the proven .ns-item text rendering; this only adds the scroll
+   box and dividers. Do NOT re-set color/font here — that's what left the
+   labels near-invisible before. */
+.cc-labels {
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.cc-labels .cc-labelitem + .cc-labelitem {
+  border-top: 1px solid var(--border);
+}
+.cc-labels .cc-labelitem:hover {
+  color: var(--accent);
+}
+/* stack the column name over the full label key (shown while searching);
+   beat `.cols-pop .ns-item`'s flex-row with extra specificity */
+.cols-pop .cc-labels .cc-labelitem {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  line-height: 1.4;
+}
+.cc-lbl-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+.cc-lbl-name {
+  font-size: 12px;
+}
+.cc-lbl-val {
+  margin-left: auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--accent);
+}
+.cc-labels .cc-labelitem:hover .cc-lbl-val {
+  color: var(--accent);
+}
+.cc-lbl-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.cc-lbl-key {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--dim);
+}
+.cc-labels .cc-labelitem:hover .cc-lbl-key {
+  color: var(--accent);
+}
+.cc-adv {
+  margin-top: 8px;
+}
+.cc-adv > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--fg);
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-hover);
+  user-select: none;
+}
+.cc-adv > summary::-webkit-details-marker {
+  display: none;
+}
+.cc-adv > summary:hover {
+  border-color: var(--accent);
+}
+.cc-chev {
+  color: var(--dim);
+  font-size: 9px;
+  transition: transform 0.12s ease;
+}
+.cc-adv[open] > summary .cc-chev {
+  transform: rotate(90deg);
+}
+.cc-adv[open] > summary {
+  margin-bottom: 6px;
+}
+
+.cc-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cc-lab {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-top: 4px;
+}
+.cc-lab-dim {
+  font-weight: 400;
+  color: var(--dim);
+}
+.cc-in {
+  width: 100%;
+  min-width: 0;
+}
+.cc-examples {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+.cc-ex-lab {
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.cc-ex {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.cc-ex:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cc-addbtn {
+  margin-top: 6px;
+  align-self: flex-start;
+}
+.cc-err {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--danger, #e06c75);
+  white-space: pre-wrap;
+}
+
 .cols-head .section-title {
   margin: 0;
 }
@@ -923,6 +1230,35 @@ tr.row.cursor td:first-child {
 .cols-pop .ns-item {
   display: flex;
   align-items: center;
+}
+
+/* pointer-drag column rows in the columns menu */
+.col-row {
+  user-select: none;
+  touch-action: none;
+}
+/* select-all / deselect-all header row */
+.col-all {
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 2px;
+}
+.col-grip {
+  color: var(--dim);
+  font-size: 11px;
+  margin-right: 2px;
+  cursor: grab;
+  opacity: 0.35;
+}
+.col-row:hover .col-grip {
+  opacity: 0.8;
+}
+.col-row.coldrag {
+  opacity: 0.4;
+}
+.col-row.coldrop {
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
 .wide-tag {
@@ -991,7 +1327,7 @@ tr.row.marked td {
   height: 6px;
   border-radius: 50%;
   background: var(--good);
-  margin-right: 6px;
+  margin: 0 4px 0 10px;
   vertical-align: middle;
   animation: livepulse 2.4s ease-in-out infinite;
 }
@@ -1024,6 +1360,9 @@ tr.row.marked td {
 th.sortable {
   cursor: pointer;
   user-select: none;
+  /* WebKit/WKWebView won't start a drag from draggable=true alone —
+     it needs this to make the header grabbable for reordering. */
+  -webkit-user-drag: element;
 }
 
 th.sortable:hover {
@@ -1396,6 +1735,35 @@ kbd.key {
   padding-left: 8px;
   margin-left: -10px;
   border-radius: 3px;
+}
+
+/* container list in the pod drawer (keyboard: ↑/↓ to reach, ←/→ + Enter
+   to pick logs/shell for a container) */
+.psec-title {
+  font-size: 11px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 4px 0;
+}
+.ctr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.ctr-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ctr-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-family: var(--font-mono);
 }
 
 .psec.cur {

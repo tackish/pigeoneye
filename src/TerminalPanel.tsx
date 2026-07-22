@@ -251,20 +251,28 @@ export default function TerminalPanel(props: {
                 channel: chan,
               });
       if (t.kind === "logs" || t.kind === "wlogs") return; // read-only
+      // Fire-and-forget stdin/resize: once the shell exits the backend
+      // channel is gone, so a late keystroke/resize would reject with
+      // "channel closed" and hit the global unhandled-rejection overlay.
+      // Swallow it — the session is already dead.
       void invoke("exec_resize", {
         id: sessionId,
         cols: term.cols,
         rows: term.rows,
-      });
+      }).catch(() => {});
       term.onData(
         (d) =>
           sessionId != null &&
-          void invoke("exec_stdin", { id: sessionId, data: d }),
+          void invoke("exec_stdin", { id: sessionId, data: d }).catch(
+            () => {},
+          ),
       );
       term.onResize(
         ({ cols, rows }) =>
           sessionId != null &&
-          void invoke("exec_resize", { id: sessionId, cols, rows }),
+          void invoke("exec_resize", { id: sessionId, cols, rows }).catch(
+            () => {},
+          ),
       );
     } catch (e) {
       term.write(`\r\n\x1b[31m${String(e)}\x1b[0m\r\n`);

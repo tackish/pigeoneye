@@ -838,25 +838,45 @@ function App() {
   // dragged/starred to the top. Global across clusters — a pinned CRD
   // that a given cluster doesn't have simply doesn't render, but stays
   // pinned for the clusters that do. Persisted so it survives restarts.
-  const readPins = (): string[] => {
+  // Pinned kinds, organised into named groups the user can create. Global
+  // across clusters — a pinned CRD a cluster doesn't have simply doesn't
+  // render, but stays pinned for the clusters that do.
+  const readPinGroups = (): { name: string; keys: string[] }[] => {
     try {
-      const v = JSON.parse(localStorage.getItem("pigeoneye.pins") ?? "[]");
-      return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+      const raw = localStorage.getItem("pigeoneye.pingroups");
+      if (raw) {
+        const v = JSON.parse(raw);
+        if (Array.isArray(v))
+          return v.filter(
+            (g) =>
+              g && typeof g.name === "string" && Array.isArray(g.keys),
+          );
+      }
+      // migrate the old flat pin list into a single "Pinned" group
+      const old = JSON.parse(localStorage.getItem("pigeoneye.pins") ?? "[]");
+      const keys = Array.isArray(old)
+        ? old.filter((x: unknown) => typeof x === "string")
+        : [];
+      return [{ name: "Pinned", keys }];
     } catch {
-      return [];
+      return [{ name: "Pinned", keys: [] }];
     }
   };
-  const [favs, setFavsRaw] = createSignal<string[]>(readPins());
-  const setFavs = (next: string[]) => {
-    setFavsRaw(next);
-    localStorage.setItem("pigeoneye.pins", JSON.stringify(next));
+  const [pinGroups, setPinGroupsRaw] = createSignal<
+    { name: string; keys: string[] }[]
+  >(readPinGroups());
+  const setPinGroups = (next: { name: string; keys: string[] }[]) => {
+    setPinGroupsRaw(next);
+    localStorage.setItem("pigeoneye.pingroups", JSON.stringify(next));
   };
-  // The kind currently being dragged (its typeKey), or null. Kept in a
-  // signal, not in DataTransfer: WKWebView/Safari drop custom MIME types,
-  // so the drop logic must never depend on reading them back. `dragging`
-  // also reveals the drop zone while a drag is in flight.
-  const [dragKey, setDragKey] = createSignal<string | null>(null);
-  const dragging = () => dragKey() !== null;
+  // The ★ group-picker popover: which kind is being pinned and where.
+  const [pinPickFor, setPinPickFor] = createSignal<ResourceType | null>(null);
+  const [pinPickAt, setPinPickAt] = createSignal<{ x: number; y: number } | null>(
+    null,
+  );
+  const [newGroupName, setNewGroupName] = createSignal("");
+  const [renamingGroup, setRenamingGroup] = createSignal<string | null>(null);
+  const [renameText, setRenameText] = createSignal("");
 
   let nextShellKey = 1;
   const [failed, setFailed] = createSignal<{ name: string; error: string }[]>([]);
@@ -1129,16 +1149,55 @@ function App() {
     const seen = new Set(front);
     return [...front, ...shown.filter((c) => !seen.has(c))];
   };
-  // Header column being dragged (its name), or null.
+  // The column being dragged / the row we'd drop before. Pointer-based
+  // (not HTML5 drag) because WKWebView barely fires drag events.
   const [dragCol, setDragCol] = createSignal<string | null>(null);
-  // Move `from` so it lands just before `target` in the visible order.
+  const [dropCol, setDropCol] = createSignal<string | null>(null);
+  // True while an actual drag is in progress, so the row's click handler
+  // knows not to also toggle the column's visibility.
+  let colDragActive = false;
+  // Move `from` so it lands just before `target` in the full column order.
   function moveColumn(from: string, target: string) {
     if (from === target) return;
-    const next = view().cols.filter((c) => c !== from);
+    const next = allColsOrdered().filter((c) => c !== from);
     const i = next.indexOf(target);
     next.splice(i < 0 ? next.length : i, 0, from);
     setColOrder({ ...colOrder(), [colKey()]: next });
     setSortCol(null);
+  }
+  // Begin a pointer drag on a column row (in the columns menu). Only
+  // becomes a drag after the pointer moves a few px, so a plain click
+  // still toggles show/hide.
+  function startColDrag(e: PointerEvent, col: string) {
+    if (e.button !== 0) return;
+    const startY = e.clientY;
+    let active = false;
+    const move = (ev: PointerEvent) => {
+      if (!active && Math.abs(ev.clientY - startY) > 4) {
+        active = true;
+        colDragActive = true;
+        setDragCol(col);
+      }
+      if (active) {
+        const el = document
+          .elementFromPoint(ev.clientX, ev.clientY)
+          ?.closest("[data-colname]");
+        setDropCol(el?.getAttribute("data-colname") ?? null);
+      }
+    };
+    const up = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      const from = dragCol();
+      const to = dropCol();
+      if (active && from && to && from !== to) moveColumn(from, to);
+      setDragCol(null);
+      setDropCol(null);
+      // let the click handler see the drag, then clear on the next tick
+      if (active) setTimeout(() => (colDragActive = false), 0);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
   }
 
   const colKey = () => (selected() ? typeKey(selected()!) : "");
@@ -1184,6 +1243,245 @@ function App() {
     setColOrder(ord);
     setSortCol(null);
   }
+  // Whether every column is currently shown, and a one-click toggle to
+  // show or hide them all (the columns-menu "select all" checkbox).
+  const allColsShown = () =>
+    allColsOrdered().every((c) => !hiddenFor().has(c));
+  function toggleAllCols() {
+    const all = allColsOrdered();
+    const next = {
+      ...hiddenCols(),
+      [colKey()]: allColsShown() ? all.slice() : [],
+    };
+    setHiddenCols(next);
+    localStorage.setItem("pigeoneye.cols", JSON.stringify(next));
+    setSortCol(null);
+  }
+
+  // ── Custom columns (kubectl JSONPath) ───────────────────
+  // Per-kind user columns: { name = header, path = JSONPath }. The values
+  // are evaluated by the backend against the full objects (only fetched
+  // when a kind actually has custom columns) and merged in as ordinary
+  // columns, so sort/filter/hide/reorder all apply.
+  const [customCols, setCustomColsRaw] = createSignal<
+    Record<string, { name: string; path: string }[]>
+  >(JSON.parse(localStorage.getItem("pigeoneye.customcols") ?? "{}"));
+  const setCustomCols = (
+    next: Record<string, { name: string; path: string }[]>,
+  ) => {
+    setCustomColsRaw(next);
+    localStorage.setItem("pigeoneye.customcols", JSON.stringify(next));
+  };
+  // A stable empty array for the (common) no-custom-columns case, so the
+  // baseRows display cache — keyed partly on this reference — isn't busted
+  // on every recompute, which would rebuild all 24k rows per keystroke.
+  const NO_CUSTOM_COLS: { name: string; path: string }[] = [];
+  const myCustomCols = () => customCols()[colKey()] ?? NO_CUSTOM_COLS;
+  function addCustomCol(name: string, path: string) {
+    let n = name.trim();
+    const p = path.trim();
+    if (!n || !p) return;
+    // Column lookups (sort, width, filters) are keyed by name, so a name
+    // that collides with a built-in or existing column would act on the
+    // wrong one. Suffix duplicates to keep every header unique.
+    const taken = new Set(allColsOrdered());
+    if (taken.has(n)) {
+      let i = 2;
+      while (taken.has(`${n}_${i}`)) i++;
+      n = `${n}_${i}`;
+    }
+    setCustomCols({
+      ...customCols(),
+      [colKey()]: [...myCustomCols(), { name: n, path: p }],
+    });
+  }
+  function removeCustomCol(i: number) {
+    const cur = myCustomCols().slice();
+    cur.splice(i, 1);
+    const next = { ...customCols() };
+    if (cur.length) next[colKey()] = cur;
+    else delete next[colKey()];
+    setCustomCols(next);
+  }
+  // rowKey (`ns/name`) → { path: value } for the NON-label custom columns
+  // (those need the backend). Label columns are read straight from the
+  // rows' own labels, no fetch.
+  const [customData, setCustomData] = createSignal<
+    Map<string, Record<string, string>>
+  >(new Map());
+  // If a path is just `.metadata.labels['key']` (or `.metadata.labels.key`)
+  // return the key — those columns are free to evaluate client-side from
+  // the labels already in every row, so huge lists don't trigger a full
+  // re-download of every object.
+  const labelPathKey = (path: string): string | null => {
+    const m =
+      path.match(/^\.metadata\.labels\['([^']+)'\]$/) ??
+      path.match(/^\.metadata\.labels\.([A-Za-z0-9_./-]+)$/);
+    return m ? m[1] : null;
+  };
+  const [customErr, setCustomErr] = createSignal<string>("");
+  const [newColName, setNewColName] = createSignal("");
+  const [newColPath, setNewColPath] = createSignal("");
+  // One-click starters that also teach the syntax (label / annotation /
+  // spec field / condition filter). Clicking fills both inputs.
+  const CC_EXAMPLES: { label: string; name: string; path: string }[] = [
+    {
+      label: "a label",
+      name: "INSTANCE-TYPE",
+      path: ".metadata.labels['node.kubernetes.io/instance-type']",
+    },
+    { label: "a spec field", name: "INSTANCE-ID", path: ".spec.providerID" },
+    {
+      label: "a status condition",
+      name: "READY",
+      path: '.status.conditions[?(@.type=="Ready")].status',
+    },
+  ];
+  function submitCustomCol() {
+    addCustomCol(newColName(), newColPath());
+    setNewColName("");
+    setNewColPath("");
+  }
+  // The slim list already carries every row's labels, so the set of label
+  // keys is free to collect client-side — no extra fetch. Pick one and it
+  // becomes a column without typing any JSONPath.
+  const [labelQuery, setLabelQuery] = createSignal("");
+  // label key → a representative (first non-empty) value across the rows,
+  // so the picker can preview a value and skip labels that are all-empty.
+  const labelEntries = createMemo(() => {
+    const m = new Map<string, string>();
+    for (const r of table()?.rows ?? []) {
+      for (const [k, v] of Object.entries(r.labels ?? {})) {
+        if (v && !m.has(k)) m.set(k, v);
+      }
+    }
+    return m;
+  });
+  const labelShort = (key: string) => (key.split("/").pop() ?? key).toUpperCase();
+  // [path, sample value] from real objects (backend) — the non-label side
+  // of the picker. Lazily fetched when the columns menu opens, cached per
+  // kind so it isn't re-fetched.
+  const [fieldEntries, setFieldEntries] = createSignal<[string, string][]>([]);
+  const fieldCache = new Map<string, [string, string][]>();
+  createEffect(() => {
+    if (!colsOpen()) return;
+    const rt = selected();
+    const ctx = active();
+    if (!rt || !ctx) return;
+    const key = colKey();
+    const cached = fieldCache.get(key);
+    if (cached) {
+      setFieldEntries(cached);
+      return;
+    }
+    const ns = rt.namespaced ? namespace() : "";
+    invoke<[string, string][]>("sample_fields", {
+      context: ctx,
+      resource: rt,
+      namespace: ns || null,
+    })
+      .then((entries) => {
+        fieldCache.set(key, entries);
+        if (colKey() === key && colsOpen()) {
+          setFieldEntries(entries);
+          setCustomErr("");
+        }
+      })
+      .catch((e) => {
+        if (colKey() === key && colsOpen())
+          setCustomErr(`could not load fields: ${String(e)}`);
+      });
+  });
+  // A readable column name from a path: the discriminator of a filter
+  // (`Ready`, `InternalIP`) if present, plus the trailing field when that
+  // adds meaning (so `env[?name=="X"].value` and `…fieldRef.fieldPath`
+  // don't both collapse to just `X`); else the last key segment.
+  const pathShort = (p: string) => {
+    const filt = [...p.matchAll(/=="([^"]+)"/g)];
+    const disc = filt.length ? filt[filt.length - 1][1] : "";
+    const tail =
+      p
+        .replace(/\[[^\]]*\]/g, "")
+        .split(".")
+        .filter(Boolean)
+        .pop() ?? p;
+    if (disc) {
+      // the "obvious" leaf of a filtered array needs no suffix
+      if (["value", "address", "status", "name"].includes(tail.toLowerCase()))
+        return disc.toUpperCase();
+      return `${disc}_${tail}`.toUpperCase();
+    }
+    return tail.toUpperCase();
+  };
+  // Everything you can click to add: labels (client-side) + sampled
+  // fields (backend), each with a suggested name, its JSONPath, and a
+  // sample value. Only non-empty ones — an all-blank column is pointless.
+  const pickables = createMemo<
+    { name: string; path: string; kind: "label" | "field"; val: string }[]
+  >(() => {
+    const out: {
+      name: string;
+      path: string;
+      kind: "label" | "field";
+      val: string;
+    }[] = [];
+    for (const [k, v] of [...labelEntries()].sort((a, z) =>
+      a[0].localeCompare(z[0]),
+    ))
+      out.push({
+        name: labelShort(k),
+        path: `.metadata.labels['${k}']`,
+        kind: "label",
+        val: v,
+      });
+    for (const [p, v] of fieldEntries())
+      out.push({ name: pathShort(p), path: p, kind: "field", val: v });
+    return out;
+  });
+
+  // Re-evaluate whenever the kind, its custom columns, the namespace or
+  // the cluster change. Not tied to the row stream, so a watch flush
+  // doesn't refetch every object; reselect the kind to refresh new rows.
+  createEffect(() => {
+    const rt = selected();
+    const ctx = active();
+    const cols = myCustomCols();
+    const ns = rt?.namespaced ? namespace() : "";
+    // Only the non-label paths need the (heavy) full-object fetch; label
+    // columns are evaluated from the rows we already have.
+    const backendPaths = cols
+      .map((c) => c.path)
+      .filter((p) => !labelPathKey(p));
+    if (!rt || !ctx || backendPaths.length === 0) {
+      setCustomData(new Map());
+      setCustomErr("");
+      return;
+    }
+    const want = colKey();
+    invoke<[string, string[]][]>("custom_columns", {
+      context: ctx,
+      resource: rt,
+      namespace: ns || null,
+      fieldSelector: null,
+      paths: backendPaths,
+    })
+      .then((pairs) => {
+        if (colKey() !== want) return;
+        const m = new Map<string, Record<string, string>>();
+        for (const [rowKey, vals] of pairs) {
+          const rec: Record<string, string> = {};
+          backendPaths.forEach((p, i) => (rec[p] = vals[i] ?? ""));
+          m.set(rowKey, rec);
+        }
+        setCustomData(m);
+        setCustomErr("");
+      })
+      .catch((e) => {
+        if (colKey() !== want) return;
+        setCustomErr(String(e));
+        setCustomData(new Map());
+      });
+  });
   const [sortDir, setSortDir] = createSignal<1 | -1>(1);
   // Per-column value filters (spreadsheet-style), keyed by column name so
   // they survive re-sorting. colMenu is the column whose value list is open.
@@ -1433,6 +1731,7 @@ function App() {
     if (!d) return [] as string[];
     return [
       "actions",
+      ...(d.containers?.length ? ["containers"] : []),
       "meta",
       ...(Object.keys(d.labels).length ? ["labels"] : []),
       ...(Object.keys(d.annotations).length ? ["anno"] : []),
@@ -1447,6 +1746,7 @@ function App() {
   /// native focus so Enter/Space activate them without extra wiring.
   const BUTTON_ROWS: Record<string, string> = {
     actions: ".drawer .actions",
+    containers: ".drawer .ctr-list",
     apply: ".drawer .yaml-actions",
   };
 
@@ -1654,6 +1954,23 @@ function App() {
     if (!q) return namespaces();
     return namespaces().filter((n) => n.includes(q));
   });
+  // Whether the "all namespaces" option is shown, and the full ordered
+  // list of selectable values (""=all) the keyboard cursor walks.
+  const nsShowAll = () => {
+    const q = nsQuery().toLowerCase().trim();
+    return !q || "all namespaces".includes(q);
+  };
+  const nsItems = createMemo<string[]>(() => [
+    ...(nsShowAll() ? [""] : []),
+    ...nsFiltered(),
+  ]);
+  const [nsIdx, setNsIdx] = createSignal(0);
+  const scrollNsCursor = () =>
+    requestAnimationFrame(() =>
+      document
+        .querySelector(`.ns-item[data-nsi="${nsIdx()}"]`)
+        ?.scrollIntoView({ block: "nearest" }),
+    );
 
   function pickNamespace(ns: string) {
     setNamespace(ns);
@@ -1812,7 +2129,9 @@ function App() {
       .finally(() => setConnecting(null));
   }
 
-  void loadContexts(false);
+  // On launch, reconnect every cluster tab from last session (the
+  // launcher only shows when there's nothing to restore).
+  void loadContexts(true);
 
   function saveKubeconfigs(paths: string[]) {
     setKubeconfigs(paths);
@@ -2526,15 +2845,26 @@ function App() {
   }
 
   // The user's pins, resolved against what discovery found. A pinned CRD
-  // that this cluster doesn't have is skipped here but kept in favs(), so
-  // it comes back on a cluster that does have it.
-  const favKeys = createMemo(() => new Set(favs()));
-  const favTypes = createMemo<ResourceType[]>(() => {
-    const byKey = new Map(types().map((t) => [typeKey(t), t]));
-    return favs()
-      .map((k) => byKey.get(k))
-      .filter((t): t is ResourceType => !!t);
-  });
+  // that this cluster doesn't have is skipped here but kept in pinGroups(),
+  // so it comes back on a cluster that does have it.
+  const favKeys = createMemo(
+    () => new Set(pinGroups().flatMap((g) => g.keys)),
+  );
+  // Each pin group with its present kinds resolved, in the group's order.
+  const groupTypes = createMemo<{ name: string; types: ResourceType[] }[]>(
+    () => {
+      const byKey = new Map(types().map((t) => [typeKey(t), t]));
+      return pinGroups().map((g) => ({
+        name: g.name,
+        types: g.keys
+          .map((k) => byKey.get(k))
+          .filter((t): t is ResourceType => !!t),
+      }));
+    },
+  );
+  const favTypes = createMemo<ResourceType[]>(() =>
+    groupTypes().flatMap((g) => g.types),
+  );
 
   // Essential panel: curated categories resolved against discovery, minus
   // anything the user pinned (a pin is promoted into ★ Pinned above, not
@@ -2551,9 +2881,13 @@ function App() {
   });
 
   // Everything already shown above the CRD/More groups: curated pins plus
-  // user favorites. Those groups exclude these so nothing shows twice.
+  // user pins. Those groups exclude these so nothing shows twice.
   const shownKeys = createMemo(
-    () => new Set([...pinned().flatMap((c) => c.types.map(typeKey)), ...favs()]),
+    () =>
+      new Set([
+        ...pinned().flatMap((c) => c.types.map(typeKey)),
+        ...favKeys(),
+      ]),
   );
 
   // Every non-builtin group is someone's CRD — surface them all, always,
@@ -2584,17 +2918,42 @@ function App() {
   });
 
   const isFav = (t: ResourceType) => favKeys().has(typeKey(t));
-  function toggleFav(t: ResourceType) {
+  // Pin a kind into a named group (creating it if needed), removing it
+  // from any other group first so a kind lives in exactly one group.
+  function pinToGroup(t: ResourceType, groupName: string) {
     const k = typeKey(t);
-    setFavs(favs().includes(k) ? favs().filter((x) => x !== k) : [...favs(), k]);
+    let groups = pinGroups();
+    if (!groups.some((g) => g.name === groupName))
+      groups = [...groups, { name: groupName, keys: [] }];
+    setPinGroups(
+      groups.map((g) => ({
+        ...g,
+        keys:
+          g.name === groupName
+            ? g.keys.includes(k)
+              ? g.keys
+              : [...g.keys, k]
+            : g.keys.filter((x) => x !== k),
+      })),
+    );
+    setPinPickFor(null);
   }
-  // Insert (or move) a pin so it lands at visual position `index` within
-  // the pinned list — the drag-and-drop reorder primitive.
-  function pinAt(key: string, index: number) {
-    const rest = favs().filter((x) => x !== key);
-    const i = Math.max(0, Math.min(index, rest.length));
-    rest.splice(i, 0, key);
-    setFavs(rest);
+  function unpin(t: ResourceType) {
+    const k = typeKey(t);
+    setPinGroups(
+      pinGroups().map((g) => ({ ...g, keys: g.keys.filter((x) => x !== k) })),
+    );
+  }
+  function renameGroup(oldName: string, next: string) {
+    const n = next.trim();
+    if (!n || pinGroups().some((g) => g.name === n)) return;
+    setPinGroups(
+      pinGroups().map((g) => (g.name === oldName ? { ...g, name: n } : g)),
+    );
+  }
+  function deleteGroup(name: string) {
+    const next = pinGroups().filter((g) => g.name !== name);
+    setPinGroups(next.length ? next : [{ name: "Pinned", keys: [] }]);
   }
 
   // Typing in the kind filter searches everything discovery returned.
@@ -2680,6 +3039,8 @@ function App() {
   // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
   let dispCache = new Map<TableRow, DisplayRow>();
   let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
+  let dispCacheCustom: Map<string, Record<string, string>> | null = null;
+  let dispCacheCcols: { name: string; path: string }[] | null = null;
   const baseRows = createMemo(() => {
     const t = table();
     const rt = selected();
@@ -2697,13 +3058,25 @@ function App() {
     const nstats = nodeView ? nodeStats() : null;
     if (nstats) cols = [...cols, ...NODE_STAT_COLS];
     if (nodeView) cols = [...cols, "AZ"];
+    // User-defined columns, appended last. Label columns read straight
+    // from the row's labels; other paths come from the backend eval.
+    const ccols = myCustomCols();
+    if (ccols.length) cols = [...cols, ...ccols.map((c) => c.name)];
+    const ccolKeys = ccols.map((c) => labelPathKey(c.path));
+    const needBackend = ccolKeys.some((k) => k === null);
+    const cdata = needBackend ? customData() : null;
     // One object identifies "the stats in play" for the row cache.
     const activeStats = stats ?? nstats;
 
     // Reuse the display row for any TableRow object that hasn't
     // changed identity — a watch flush replaces only touched rows, so
     // this rebuilds a handful instead of all 24k.
-    const prev = dispCacheStats === activeStats ? dispCache : null;
+    const prev =
+      dispCacheStats === activeStats &&
+      dispCacheCustom === cdata &&
+      dispCacheCcols === ccols
+        ? dispCache
+        : null;
     const rows: DisplayRow[] = t.rows.map((r) => {
       const hit = prev?.get(r);
       if (hit) return hit;
@@ -2734,6 +3107,19 @@ function App() {
         ];
       }
       if (nodeView) cells = [...cells, zoneOf(r.labels)];
+      if (ccols.length) {
+        const rec = needBackend
+          ? cdata?.get(`${r.namespace ?? ""}/${r.name}`)
+          : undefined;
+        cells = [
+          ...cells,
+          ...ccols.map((c, i) => {
+            const lk = ccolKeys[i];
+            if (lk !== null) return r.labels?.[lk] ?? "";
+            return rec?.[c.path] ?? "";
+          }),
+        ];
+      }
       const hay = (
         cells.join(" ") +
         " " +
@@ -2747,6 +3133,8 @@ function App() {
     for (const d of rows) next.set(d.row, d);
     dispCache = next;
     dispCacheStats = activeStats;
+    dispCacheCustom = cdata;
+    dispCacheCcols = ccols;
     return { cols, rows };
   });
 
@@ -2763,6 +3151,10 @@ function App() {
       hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols,
     );
   });
+
+  // Every column (visible + hidden) in the user's drag order — what the
+  // columns menu lists so you can reorder by dragging its rows.
+  const allColsOrdered = createMemo(() => applyColOrder(baseRows().cols));
 
   const colWidths = createMemo(() => {
     const b = baseRows();
@@ -3625,14 +4017,15 @@ function App() {
         kindFilterRef?.focus();
         return;
       }
-      // `p` pins / unpins the kind under the cursor — pairs with the
-      // `:` palette revealing a CRD here, so you can find-then-pin
-      // without leaving the keyboard.
+      // `p` pins the kind under the cursor into the first group (or
+      // unpins it) — a keyboard shortcut that pairs with the `:` palette
+      // revealing a CRD here.
       if (e.key === "p") {
         const t = sidebarItems()[sideIdx()];
         if (t) {
           e.preventDefault();
-          toggleFav(t);
+          if (isFav(t)) unpin(t);
+          else pinToGroup(t, pinGroups()[0]?.name ?? "Pinned");
         }
         return;
       }
@@ -4011,20 +4404,12 @@ function App() {
   const kindButton = (t: ResourceType) => (
     <button
       class="kind"
-      draggable={true}
       data-sk={sidebarItems().indexOf(t)}
       classList={{
         active: selected() === t,
         cursor: pane() === "sidebar" && sidebarItems()[sideIdx()] === t,
         fav: isFav(t),
       }}
-      onDragStart={(e) => {
-        setDragKey(typeKey(t));
-        // set text/plain too so the drag actually initiates everywhere
-        e.dataTransfer?.setData("text/plain", typeKey(t));
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-      }}
-      onDragEnd={() => setDragKey(null)}
       onClick={() => {
         setPane("table");
         setSideIdx(Math.max(sidebarItems().indexOf(t), 0));
@@ -4039,10 +4424,17 @@ function App() {
       </Show>
       <span
         class="pin"
-        title={isFav(t) ? "unpin" : "pin to top"}
+        title={isFav(t) ? "unpin" : "pin to a group"}
         onClick={(e) => {
           e.stopPropagation();
-          toggleFav(t);
+          if (isFav(t)) {
+            unpin(t);
+          } else {
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setNewGroupName("");
+            setPinPickAt({ x: r.right, y: r.bottom + 4 });
+            setPinPickFor(t);
+          }
         }}
       >
         ★
@@ -4365,39 +4757,51 @@ function App() {
                   placeholder="search namespaces…"
                   ref={(el) => setTimeout(() => el.focus())}
                   value={nsQuery()}
-                  onInput={(e) => setNsQuery(e.currentTarget.value)}
+                  onInput={(e) => {
+                    setNsQuery(e.currentTarget.value);
+                    setNsIdx(0);
+                  }}
                   onKeyDown={(e) => {
+                    const items = nsItems();
                     if (e.key === "Escape") setNsOpen(false);
-                    if (e.key === "Enter") {
-                      const q = nsQuery().toLowerCase().trim();
-                      const list = nsFiltered();
-                      // "all" is a real choice, so it wins when typed
-                      if (q && "all namespaces".startsWith(q)) pickNamespace("");
-                      else if (list.length) pickNamespace(list[0]);
-                      else if (!q) pickNamespace("");
+                    else if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setNsIdx(Math.min(nsIdx() + 1, items.length - 1));
+                      scrollNsCursor();
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setNsIdx(Math.max(nsIdx() - 1, 0));
+                      scrollNsCursor();
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      const v = items[nsIdx()];
+                      if (v !== undefined) pickNamespace(v);
                     }
                   }}
                 />
                 <div class="ns-list">
-                  <Show
-                    when={
-                      !nsQuery().trim() ||
-                      "all namespaces".includes(nsQuery().toLowerCase().trim())
-                    }
-                  >
+                  <Show when={nsShowAll()}>
                     <button
                       class="ns-item"
-                      classList={{ active: namespace() === "" }}
+                      data-nsi={0}
+                      classList={{
+                        active: namespace() === "",
+                        cursor: nsIdx() === 0,
+                      }}
                       onClick={() => pickNamespace("")}
                     >
                       all namespaces
                     </button>
                   </Show>
                   <For each={nsFiltered()}>
-                    {(n) => (
+                    {(n, i) => (
                       <button
                         class="ns-item"
-                        classList={{ active: namespace() === n }}
+                        data-nsi={(nsShowAll() ? 1 : 0) + i()}
+                        classList={{
+                          active: namespace() === n,
+                          cursor: nsIdx() === (nsShowAll() ? 1 : 0) + i(),
+                        }}
                         onClick={() => pickNamespace(n)}
                       >
                         {n}
@@ -4505,8 +4909,25 @@ function App() {
                 value={filter()}
                 onInput={(e) => setFilter(e.currentTarget.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === "Escape")
+                  // ↓ / Enter drops the cursor into the filtered list so
+                  // arrows keep working from where the search landed.
+                  if (
+                    e.key === "ArrowDown" ||
+                    e.key === "Enter" ||
+                    (e.key === "Tab" && !e.shiftKey)
+                  ) {
+                    e.preventDefault();
                     e.currentTarget.blur();
+                    setPane("sidebar");
+                    setSideIdx(0);
+                    requestAnimationFrame(() =>
+                      document
+                        .querySelector(`.kind[data-sk="0"]`)
+                        ?.scrollIntoView({ block: "nearest" }),
+                    );
+                  } else if (e.key === "Escape") {
+                    e.currentTarget.blur();
+                  }
                 }}
               />
             </Show>
@@ -4563,43 +4984,55 @@ function App() {
                 </For>
               }
             >
-              <Show when={favTypes().length > 0 || dragging()}>
-                <div
-                  class="group pinned-group"
-                  classList={{ "drop-live": dragging() }}
-                  onDragOver={(e) => dragKey() && e.preventDefault()}
-                  onDrop={(e) => {
-                    const k = dragKey();
-                    if (k) {
-                      e.preventDefault();
-                      pinAt(k, favs().length);
-                    }
-                  }}
-                >
-                  <div class="group-name">★ Pinned</div>
-                  <For each={favTypes()}>
-                    {(t, i) => (
-                      <div
-                        class="pin-slot"
-                        onDragOver={(e) => dragKey() && e.preventDefault()}
-                        onDrop={(e) => {
-                          const k = dragKey();
-                          if (k) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            pinAt(k, i());
+              <For each={groupTypes()}>
+                {(g) => (
+                  <Show when={g.types.length > 0}>
+                    <div class="group pin-group">
+                      <div class="group-name pin-group-head">
+                        <span class="pin-star">★</span>
+                        <Show
+                          when={renamingGroup() === g.name}
+                          fallback={
+                            <span
+                              class="pin-group-name"
+                              title="double-click to rename"
+                              onDblClick={() => {
+                                setRenameText(g.name);
+                                setRenamingGroup(g.name);
+                              }}
+                            >
+                              {g.name}
+                            </span>
                           }
-                        }}
-                      >
-                        {kindButton(t)}
+                        >
+                          <input
+                            class="search pin-rename"
+                            value={renameText()}
+                            ref={(el) => setTimeout(() => el.focus())}
+                            onInput={(e) => setRenameText(e.currentTarget.value)}
+                            onBlur={() => {
+                              renameGroup(g.name, renameText());
+                              setRenamingGroup(null);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") e.currentTarget.blur();
+                              if (e.key === "Escape") setRenamingGroup(null);
+                            }}
+                          />
+                        </Show>
+                        <button
+                          class="pin-group-del"
+                          title="delete this group (unpins its kinds)"
+                          onClick={() => deleteGroup(g.name)}
+                        >
+                          ✕
+                        </button>
                       </div>
-                    )}
-                  </For>
-                  <Show when={favTypes().length === 0}>
-                    <div class="pin-hint">drop a kind here to pin it</div>
+                      <For each={g.types}>{kindButton}</For>
+                    </div>
                   </Show>
-                </div>
-              </Show>
+                )}
+              </For>
               <For each={pinned()}>
                 {(cat) => (
                   <div class="group">
@@ -4760,13 +5193,10 @@ function App() {
                 <div class="cols-picker">
                   <button
                     class="btn sm"
-                    title="choose columns"
+                    title="show, hide, reorder and add columns"
                     onClick={() => setColsOpen(!colsOpen())}
                   >
-                    columns
-                    <Show when={hiddenFor().size > 0}>
-                      <span class="dim"> −{hiddenFor().size}</span>
-                    </Show>
+                    ⚙ Edit columns
                   </button>
                   <Show when={colsOpen()}>
                     <div class="ns-backdrop" onClick={() => setColsOpen(false)} />
@@ -4777,9 +5207,38 @@ function App() {
                           reset
                         </button>
                       </div>
-                      <For each={view().allCols}>
+                      <button
+                        class="ns-item col-all"
+                        title="show or hide every column"
+                        onClick={toggleAllCols}
+                      >
+                        <span class="col-grip" style={{ visibility: "hidden" }}>
+                          ⠿
+                        </span>
+                        <span
+                          class="mark-box"
+                          classList={{ on: allColsShown() }}
+                        />
+                        {allColsShown() ? "Deselect all" : "Select all"}
+                      </button>
+                      <For each={allColsOrdered()}>
                         {(c) => (
-                          <button class="ns-item" onClick={() => toggleCol(c)}>
+                          <button
+                            class="ns-item col-row"
+                            data-colname={c}
+                            classList={{
+                              coldrag: dragCol() === c,
+                              coldrop: dropCol() === c && dragCol() !== c,
+                            }}
+                            title="drag to reorder · click to show/hide"
+                            onPointerDown={(e) => startColDrag(e, c)}
+                            onClick={() => {
+                              if (!colDragActive) toggleCol(c);
+                            }}
+                          >
+                            <span class="col-grip" title="drag to reorder">
+                              ⠿
+                            </span>
                             <span
                               class="mark-box"
                               classList={{ on: !hiddenFor().has(c) }}
@@ -4796,22 +5255,156 @@ function App() {
                           </button>
                         )}
                       </For>
+                      <div class="cols-custom">
+                        <div class="section-title sub">Custom columns</div>
+                        <p class="cc-blurb">
+                          Like <code>kubectl get -o custom-columns</code>, but
+                          click instead of type: search a field or label below
+                          and add it as a column.
+                        </p>
+                        <Show when={myCustomCols().length > 0}>
+                          <div class="cc-list">
+                            <For each={myCustomCols()}>
+                              {(cc, i) => (
+                                <div class="cc-row">
+                                  <span class="cc-name">{cc.name}</span>
+                                  <code class="cc-path" title={cc.path}>
+                                    {cc.path}
+                                  </code>
+                                  <button
+                                    class="cc-del"
+                                    title="remove column"
+                                    onClick={() => removeCustomCol(i())}
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
+                        <Show when={pickables().length > 0}>
+                          <div class="cc-picker">
+                            <label class="cc-lab">Add a column</label>
+                            <input
+                              class="search cc-in"
+                              placeholder={`search ${pickables().length} fields & labels…`}
+                              value={labelQuery()}
+                              onInput={(e) => setLabelQuery(e.currentTarget.value)}
+                            />
+                            <div class="cc-labels">
+                              <For
+                                each={pickables()
+                                  .filter((p) =>
+                                    `${p.name} ${p.path}`
+                                      .toLowerCase()
+                                      .includes(labelQuery().toLowerCase()),
+                                  )
+                                  .slice(0, 80)}
+                              >
+                                {(p) => (
+                                  <button
+                                    class="ns-item cc-labelitem"
+                                    title={`${p.path}  →  column "${p.name}"`}
+                                    onClick={() => {
+                                      addCustomCol(p.name, p.path);
+                                      setLabelQuery("");
+                                    }}
+                                  >
+                                    <span class="cc-lbl-head">
+                                      <span class="cc-lbl-name">{p.name}</span>
+                                      <span class="cc-lbl-tag">{p.kind}</span>
+                                      <span class="cc-lbl-val">{p.val}</span>
+                                    </span>
+                                    <Show when={labelQuery().trim()}>
+                                      <span class="cc-lbl-key">{p.path}</span>
+                                    </Show>
+                                  </button>
+                                )}
+                              </For>
+                            </div>
+                          </div>
+                        </Show>
+                        <details class="cc-adv">
+                          <summary>
+                            <span class="cc-chev">▸</span>
+                            <span>Advanced: write a JSONPath by hand</span>
+                          </summary>
+                        <div class="cc-form">
+                          <label class="cc-lab">1. Column name</label>
+                          <input
+                            class="search cc-in"
+                            placeholder="e.g. INSTANCE-TYPE"
+                            value={newColName()}
+                            onInput={(e) => setNewColName(e.currentTarget.value)}
+                            onKeyDown={(e) =>
+                              e.key === "Enter" && submitCustomCol()
+                            }
+                          />
+                          <label class="cc-lab">
+                            2. Field path{" "}
+                            <span class="cc-lab-dim">(kubectl JSONPath)</span>
+                          </label>
+                          <input
+                            class="search cc-in"
+                            placeholder="e.g. .metadata.labels.group"
+                            value={newColPath()}
+                            onInput={(e) => setNewColPath(e.currentTarget.value)}
+                            onKeyDown={(e) =>
+                              e.key === "Enter" && submitCustomCol()
+                            }
+                          />
+                          <div class="cc-examples">
+                            <span class="cc-ex-lab">examples:</span>
+                            <For each={CC_EXAMPLES}>
+                              {(ex) => (
+                                <button
+                                  class="cc-ex"
+                                  title={ex.path}
+                                  onClick={() => {
+                                    setNewColName(ex.name);
+                                    setNewColPath(ex.path);
+                                  }}
+                                >
+                                  {ex.label}
+                                </button>
+                              )}
+                            </For>
+                          </div>
+                          <button
+                            class="btn sm cc-addbtn"
+                            disabled={
+                              !newColName().trim() || !newColPath().trim()
+                            }
+                            onClick={submitCustomCol}
+                          >
+                            + Add column
+                          </button>
+                        </div>
+                        </details>
+                        <Show when={customErr()}>
+                          <div class="cc-err">{customErr()}</div>
+                        </Show>
+                      </div>
                     </div>
                   </Show>
                 </div>
+                {/* Stable count first so its position never moves; the
+                    volatile indexing / loading indicators trail after it
+                    and grow into empty space instead of shoving it. */}
                 <span class="badge">
-                  <Show when={indexing()}>
-                    <span class="dim">indexing… </span>
-                  </Show>
-                  <Show when={live()}>
-                    <span class="live-dot" title="live: updates arrive as they happen" />
-                  </Show>
                   {rowCount()} {selected()?.plural ?? "items"}
                   <Show when={dsCount() > 0}>
                     <span class="dim" title="DaemonSet pods (one per node) are sorted to the bottom">
                       {" · "}
                       {dsCount()} daemonset
                     </span>
+                  </Show>
+                  <Show when={live()}>
+                    <span class="live-dot" title="live: updates arrive as they happen" />
+                  </Show>
+                  <Show when={indexing()}>
+                    <span class="dim"> · indexing…</span>
                   </Show>
                   <Show when={streaming()}>
                     <span class="dim loading-more">
@@ -5376,6 +5969,42 @@ function App() {
                       }
                     }}
                   />
+                  <Show when={detail()!.containers?.length}>
+                    <div
+                      class="psec"
+                      data-sec="containers"
+                      classList={{ cur: panelSec() === "containers" }}
+                    >
+                      <div class="psec-title">
+                        containers ({detail()!.containers.length})
+                      </div>
+                      <div class="ctr-list">
+                        <For each={detail()!.containers}>
+                          {(c) => (
+                            <div class="ctr-row">
+                              <span class="ctr-name" title={c}>
+                                {c}
+                              </span>
+                              <button
+                                class="btn sm"
+                                title={`logs — ${c}`}
+                                onClick={() => openPodSession("logs", c)}
+                              >
+                                logs
+                              </button>
+                              <button
+                                class="btn sm"
+                                title={`shell into ${c}`}
+                                onClick={() => openPodSession("pod", c)}
+                              >
+                                shell
+                              </button>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
                   <div class="psec" data-sec="meta" classList={{ cur: panelSec() === "meta" }}>
                   <div class="meta-grid">
                     <Show when={detail()!.namespace}>
@@ -6259,6 +6888,55 @@ function App() {
             </div>
           </Show>
 
+          <Show when={pinPickFor()}>
+            <div class="col-menu-backdrop" onClick={() => setPinPickFor(null)} />
+            <div
+              class="col-menu pin-pick"
+              style={{
+                left: `${pinPickAt()?.x ?? 0}px`,
+                top: `${pinPickAt()?.y ?? 0}px`,
+              }}
+            >
+              <div class="col-menu-head">
+                pin <b>{pinPickFor()!.kind}</b> to…
+              </div>
+              <div class="col-menu-list">
+                <For each={pinGroups()}>
+                  {(g) => (
+                    <button
+                      class="ns-item"
+                      onClick={() => pinToGroup(pinPickFor()!, g.name)}
+                    >
+                      ★ {g.name}
+                    </button>
+                  )}
+                </For>
+              </div>
+              <div class="pin-pick-new">
+                <input
+                  class="search"
+                  placeholder="new group…"
+                  value={newGroupName()}
+                  ref={(el) => setTimeout(() => el.focus())}
+                  onInput={(e) => setNewGroupName(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && newGroupName().trim())
+                      pinToGroup(pinPickFor()!, newGroupName().trim());
+                    if (e.key === "Escape") setPinPickFor(null);
+                  }}
+                />
+                <button
+                  class="btn sm"
+                  disabled={!newGroupName().trim()}
+                  onClick={() =>
+                    pinToGroup(pinPickFor()!, newGroupName().trim())
+                  }
+                >
+                  add
+                </button>
+              </div>
+            </div>
+          </Show>
           <Show when={colMenu()}>
             <div class="col-menu-backdrop" onClick={() => setColMenu(null)} />
             <div
