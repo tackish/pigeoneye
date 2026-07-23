@@ -483,6 +483,26 @@ function age(created: string | null): string {
   return `${Math.floor(s / 86400)}d`;
 }
 
+/// Seconds encoded in a kubectl-style age string ("13s", "5m", "3h5m",
+/// "2d3h", "8d", "1y23d"). Null if it isn't one, so the raw cell is shown.
+function parseAgeSeconds(s: string): number | null {
+  const t = s.trim();
+  const m = t.match(/^(?:(\d+)y)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!m || m[0] === "") return null;
+  const n = (x?: string) => (x ? parseInt(x, 10) : 0);
+  return ((((n(m[1]) * 365 + n(m[2])) * 24 + n(m[3])) * 60 + n(m[4])) * 60) + n(m[5]);
+}
+
+/// Format an age from a second count, matching the server's short style
+/// for the sub-hour range we tick live.
+function fmtAgeSeconds(s: number): string {
+  if (s < 0) s = 0;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
 function zoneOf(labels: Record<string, string>): string {
   return (
     labels["topology.kubernetes.io/zone"] ??
@@ -671,6 +691,56 @@ function App() {
       setUpgradeErr(String(e));
       setUpgrading(false);
     }
+  }
+  // Ticks once a second so the AGE column counts up live instead of
+  // sitting at whatever the server last printed. Only visible age cells
+  // read it (virtual scroll + a ternary that skips non-age cells), so a
+  // 24k-row list costs nothing per tick. Paused while the window is
+  // hidden — liveAge derives from real elapsed time, so it catches up on
+  // return without accumulating skipped ticks.
+  const [nowTick, setNowTick] = createSignal(Date.now());
+  onMount(() => {
+    let id: number | undefined;
+    const start = () => {
+      if (id == null)
+        id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    };
+    const stop = () => {
+      if (id != null) {
+        window.clearInterval(id);
+        id = undefined;
+      }
+    };
+    const onVis = () => {
+      if (document.hidden) stop();
+      else {
+        setNowTick(Date.now());
+        start();
+      }
+    };
+    start();
+    document.addEventListener("visibilitychange", onVis);
+    onCleanup(() => {
+      stop();
+      document.removeEventListener("visibilitychange", onVis);
+    });
+  });
+  // Per-row anchor: the age (seconds) a row showed and when we first saw
+  // it, so live age = base + elapsed. Only rows under an hour are ticked;
+  // older ones keep the server's string (which may be compound, "2d3h").
+  const ageAnchor = new WeakMap<
+    TableRow,
+    { atMs: number; baseSec: number } | null
+  >();
+  function liveAge(row: TableRow, raw: string): string {
+    let a = ageAnchor.get(row);
+    if (a === undefined) {
+      const base = parseAgeSeconds(raw);
+      a = base !== null && base < 3600 ? { atMs: nowTick(), baseSec: base } : null;
+      ageAnchor.set(row, a);
+    }
+    if (!a) return raw;
+    return fmtAgeSeconds(a.baseSec + Math.floor((nowTick() - a.atMs) / 1000));
   }
   const [pickerQ, setPickerQ] = createSignal("");
   const [pickerIdx, setPickerIdx] = createSignal(0);
@@ -4485,8 +4555,27 @@ function App() {
   });
   onCleanup(() => suggestObserver?.disconnect());
 
-  // Check for a newer release once at startup. Best-effort: any failure
-  // (offline, rate-limited, private) just leaves the banner hidden.
+  // Ask GitHub for the latest release tag. Best-effort: any failure
+  // (offline, rate-limited, private) just leaves the version chip plain.
+  let lastReleaseCheck = 0;
+  async function checkLatestRelease() {
+    lastReleaseCheck = Date.now();
+    try {
+      const res = await fetch(
+        "https://api.github.com/repos/tackish/pigeoneye/releases/latest",
+        { headers: { Accept: "application/vnd.github+json" } },
+      );
+      if (!res.ok) return;
+      const tag = (await res.json())?.tag_name;
+      if (typeof tag === "string") setLatestVersion(tag);
+    } catch {
+      /* offline — chip stays plain */
+    }
+  }
+
+  // Check at startup, then keep checking so a release cut while the app is
+  // open lights up the update chip on its own: every 6h, and whenever the
+  // window regains focus after sitting idle for over an hour.
   onMount(() => {
     void (async () => {
       try {
@@ -4494,18 +4583,21 @@ function App() {
       } catch {
         return;
       }
-      try {
-        const res = await fetch(
-          "https://api.github.com/repos/tackish/pigeoneye/releases/latest",
-          { headers: { Accept: "application/vnd.github+json" } },
-        );
-        if (!res.ok) return;
-        const tag = (await res.json())?.tag_name;
-        if (typeof tag === "string") setLatestVersion(tag);
-      } catch {
-        /* offline — no banner */
-      }
+      void checkLatestRelease();
     })();
+    const id = window.setInterval(
+      () => void checkLatestRelease(),
+      6 * 60 * 60 * 1000,
+    );
+    const onFocus = () => {
+      if (Date.now() - lastReleaseCheck > 60 * 60 * 1000)
+        void checkLatestRelease();
+    };
+    window.addEventListener("focus", onFocus);
+    onCleanup(() => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    });
   });
 
   onMount(() => document.addEventListener("keydown", onGlobalKey));
@@ -5903,7 +5995,14 @@ function App() {
                                       cell &&
                                       cell !== "<none>"
                                     }
-                                    fallback={cell}
+                                    fallback={
+                                      <>
+                                        {view().cols[i()]?.toLowerCase() ===
+                                        "age"
+                                          ? liveAge(vr.row, cell)
+                                          : cell}
+                                      </>
+                                    }
                                   >
                                     <button
                                       class="cell-link"
