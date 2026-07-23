@@ -8,6 +8,7 @@
   "permissions": [
     "core:default",
     "core:app:default",
+    "core:webview:allow-set-webview-zoom",
     "opener:default",
     "dialog:default",
     "opener:allow-open-url"

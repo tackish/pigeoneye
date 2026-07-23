@@ -9,6 +9,7 @@ import {
 } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import YamlEditor from "./YamlEditor";
 import TerminalPanel, { type ShellTarget } from "./TerminalPanel";
@@ -778,6 +779,21 @@ function App() {
   const [theme, setTheme] = createSignal<"dark" | "light">(
     (localStorage.getItem("pigeoneye.theme") as "dark" | "light") ?? "dark",
   );
+  // Browser-style UI zoom (⌘/Ctrl +/−, ⌘/Ctrl 0 resets). Native webview
+  // zoom scales everything — including popover positions — cleanly, and
+  // the factor is restored on launch.
+  const [zoom, setZoomRaw] = createSignal(
+    parseFloat(localStorage.getItem("pigeoneye.zoom") ?? "1") || 1,
+  );
+  function setZoom(next: number) {
+    const z = Math.min(2.5, Math.max(0.5, Math.round(next * 100) / 100));
+    setZoomRaw(z);
+    localStorage.setItem("pigeoneye.zoom", String(z));
+    void getCurrentWebview().setZoom(z).catch(() => {});
+  }
+  onMount(() => {
+    if (zoom() !== 1) void getCurrentWebview().setZoom(zoom()).catch(() => {});
+  });
   const [nsOpen, setNsOpen] = createSignal(false);
   const [nsQuery, setNsQuery] = createSignal("");
   const [tabs, setTabs] = createSignal<string[]>([]);
@@ -3876,6 +3892,26 @@ function App() {
   function onGlobalKey(e: KeyboardEvent) {
     const el = e.target as HTMLElement | null;
     const typing = el?.closest("input, textarea, select, [contenteditable], .cm-editor, .xterm");
+    // Browser-style zoom — ⌘/Ctrl +/− adjusts, ⌘/Ctrl 0 resets. First thing,
+    // so it works anywhere (launcher, while typing) like a browser. ⌘0 is
+    // zoom-reset; plain 0 still jumps to all namespaces.
+    if (e.metaKey || e.ctrlKey) {
+      if (e.code === "Equal" || e.code === "NumpadAdd" || e.key === "+") {
+        e.preventDefault();
+        setZoom(zoom() + 0.1);
+        return;
+      }
+      if (e.code === "Minus" || e.code === "NumpadSubtract") {
+        e.preventDefault();
+        setZoom(zoom() - 0.1);
+        return;
+      }
+      if (e.code === "Digit0" || e.code === "Numpad0") {
+        e.preventDefault();
+        setZoom(1);
+        return;
+      }
+    }
     // Launcher screen: arrows/Enter drive the context list no matter
     // where focus sits, so it's fully keyboard-first. Letters still fall
     // through to the search box (which filters via onInput).
@@ -4162,10 +4198,15 @@ function App() {
       else rowSearchRef?.focus();
       return;
     }
-    // `0` jumps to all namespaces, k9s-style. Plain `0` is safe here —
-    // typing contexts already returned above; ⌘/Ctrl+0 works too. Only
-    // acts on a namespaced kind (cluster-scoped views have no ns filter).
-    if (e.code === "Digit0" && !e.shiftKey && !e.altKey) {
+    // Plain `0` jumps to all namespaces, k9s-style (⌘/Ctrl 0 is zoom-reset,
+    // handled above). Only acts on a namespaced kind.
+    if (
+      e.code === "Digit0" &&
+      !e.shiftKey &&
+      !e.altKey &&
+      !e.metaKey &&
+      !e.ctrlKey
+    ) {
       const rt = selected();
       if (!rt || rt.namespaced) {
         e.preventDefault();
@@ -6982,7 +7023,8 @@ function App() {
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
                   <b class="help-sec">app</b>
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
-                  <b>0 · ⌘0</b><span>back to all namespaces</span>
+                  <b>0</b><span>back to all namespaces</span>
+                  <b>⌘ + / − / 0</b><span>zoom in / out / reset</span>
                   <b>⌘,</b><span>settings (kubeconfig, shell)</span>
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
