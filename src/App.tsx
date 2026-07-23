@@ -94,6 +94,9 @@ interface TabState {
   namespace: string;
   selectedKey: string | null;
   source: string;
+  /// The row search (`/`) in effect, kept so switching clusters and coming
+  /// back restores the filter instead of dropping it.
+  filter: string;
 }
 
 interface DisplayRow {
@@ -2148,10 +2151,17 @@ function App() {
       namespace: "",
       selectedKey: null,
       source,
+      filter: "",
     });
   }
 
   function activate(name: string) {
+    // Remember the outgoing tab's row filter so it comes back on return.
+    const cur = active();
+    if (cur && cur !== name) {
+      const cst = tabCache.get(cur);
+      if (cst) cst.filter = rowFilter();
+    }
     const st = tabCache.get(name);
     if (!st) return;
     setActive(name);
@@ -2169,7 +2179,12 @@ function App() {
     setSelected(sel);
     setPane(sel ? "table" : "sidebar");
     setSideIdx(sel ? Math.max(sidebarItems().indexOf(sel), 0) : 0);
-    if (sel) void select(sel);
+    if (sel) {
+      // Restore this tab's filter and re-apply it once the list loads
+      // (select() keeps rowFilter when told to).
+      setRowFilter(st.filter);
+      void select(sel, undefined, true);
+    }
     persist();
   }
 
@@ -2348,7 +2363,11 @@ function App() {
     }, 80);
   }
 
-  async function select(rt: ResourceType, fieldSelector?: string) {
+  async function select(
+    rt: ResourceType,
+    fieldSelector?: string,
+    keepFilter = false,
+  ) {
     const ctx = active();
     if (!ctx) return;
     setPane("table");
@@ -2359,7 +2378,9 @@ function App() {
     const st = tabCache.get(ctx);
     if (st) st.selectedKey = typeKey(rt);
     setSelected(rt);
-    setRowFilter("");
+    // Changing kind drops the filter (it's column/kind-specific); a tab
+    // restore passes keepFilter so the caller's restored filter survives.
+    if (!keepFilter) setRowFilter("");
     setMatched(null);
     stopWatch();
     setPodStats(null);
@@ -2438,6 +2459,10 @@ function App() {
       // No watch (server refused it): cached rows would never revalidate,
       // so fall back to a full fetch.
       if (!started && active() === ctx && selected() === rt) void refreshList();
+      // Re-apply a restored filter against the cached rows (the full-fetch
+      // path does the same once its first page lands).
+      else if (active() === ctx && selected() === rt && rowFilter().trim())
+        onRowFilterInput(rowFilter());
       return;
     }
     setLoading(true);
