@@ -142,11 +142,13 @@ body {
   align-self: center;
 }
 
-/* When an update is available the version becomes a quiet clickable chip
-   ("v0.1.0 → v0.2.0"): a thin accent outline, no loud fill. Click upgrades
-   then restarts. */
+/* When an update is available the version becomes a clickable chip
+   ("v0.1.0 → v0.2.0") that gently shimmers + breathes so it catches the
+   eye without shouting. Click upgrades then restarts. */
 button.app-ver {
-  border: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
   background: var(--bg);
   color: var(--accent);
   font-weight: 600;
@@ -154,6 +156,40 @@ button.app-ver {
   border-radius: 7px;
   cursor: pointer;
   line-height: 1.35;
+  animation: ver-glow 2.6s ease-in-out infinite;
+}
+/* diagonal light sweep that passes across every few seconds */
+button.app-ver::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 35%,
+    color-mix(in srgb, var(--accent) 32%, transparent) 50%,
+    transparent 65%
+  );
+  background-size: 220% 100%;
+  animation: ver-shimmer 3.6s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes ver-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 7px 0 color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+}
+@keyframes ver-shimmer {
+  0% {
+    background-position: 180% 0;
+  }
+  60%,
+  100% {
+    background-position: -120% 0;
+  }
 }
 button.app-ver:hover:not(:disabled) {
   border-color: var(--accent);
@@ -167,9 +203,20 @@ button.app-ver .arr {
   opacity: 0.55;
   margin: 0 2px;
 }
+/* error state: stop the celebration, go quiet red */
 button.app-ver.err {
   border-color: color-mix(in srgb, var(--bad) 55%, transparent);
   color: var(--bad);
+  animation: none;
+}
+button.app-ver.err::after {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  button.app-ver,
+  button.app-ver::after {
+    animation: none;
+  }
 }
 
 .logo-img {
@@ -2766,7 +2813,7 @@ details.fold[open] > summary::before {
   right: 0;
   bottom: 0;
   height: 42%;
-  min-height: 220px;
+  min-height: 120px;
   background: var(--editor-bg);
   /* focus is visible: Esc only leaves the terminal while it has it */
   border-top: 2px solid var(--border);
@@ -2780,6 +2827,20 @@ details.fold[open] > summary::before {
 .term-panel.focused {
   border-top-color: var(--accent);
   opacity: 1;
+}
+
+/* Grab strip straddling the top border to resize the dock. */
+.term-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+  z-index: 6;
+}
+.term-resize:hover {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .term-panel.focused .term-hint {
@@ -2933,8 +2994,20 @@ details.fold[open] > summary::before {
   border-color: var(--border);
 }
 
-.table-wrap:focus {
+/* Drop the default focus ring — but not when this is the active pane, or
+   the pane-active dashed outline (lower specificity) would be overridden
+   and vanish the moment the table takes focus (e.g. leaving the terminal). */
+.table-wrap:focus:not(.pane-active) {
   outline: none;
+}
+
+/* Dashed accent boundary around whichever level the keyboard is driving
+   (sidebar / table / detail), so a keyboard user always sees where they
+   are. Uses outline so it never shifts layout. Terminal shows its own
+   accent border when focused. */
+.pane-active {
+  outline: 2px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: -3px;
 }
 
 .term-tab {

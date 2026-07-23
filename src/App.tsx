@@ -21,6 +21,24 @@ import flyingUrl from "./assets/svg/pigeon-flying.svg";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
+// "ResizeObserver loop completed with undelivered notifications" is a benign
+// browser warning (an observer callback reflowed within the same frame) that
+// zoom makes easy to trigger. It changes nothing at runtime, but the dev
+// error overlay treats it as fatal — swallow just that one message.
+if (typeof window !== "undefined") {
+  const isRoLoop = (m?: string) => !!m && m.includes("ResizeObserver loop");
+  window.addEventListener(
+    "error",
+    (e) => {
+      if (isRoLoop(e.message)) {
+        e.stopImmediatePropagation();
+        e.preventDefault();
+      }
+    },
+    true,
+  );
+}
+
 interface ContextInfo {
   name: string;
   cluster: string;
@@ -971,6 +989,49 @@ function App() {
   const [activeShell, setActiveShell] = createSignal<number | null>(null);
   const [termMin, setTermMin] = createSignal(false);
   const [termFocused, setTermFocused] = createSignal(false);
+  // Log/shell dock height in px, drag- and keyboard-resizable. 0 = use the
+  // default (42% of the viewport). Clamped to a sane range and persisted.
+  // winH tracks the viewport so the dock height re-clamps on window resize.
+  const TERM_MIN_H = 140;
+  const [winH, setWinH] = createSignal(window.innerHeight);
+  onMount(() => {
+    const on = () => setWinH(window.innerHeight);
+    window.addEventListener("resize", on);
+    onCleanup(() => window.removeEventListener("resize", on));
+  });
+  const [termHeightRaw, setTermHeightRaw] = createSignal(
+    parseInt(localStorage.getItem("pigeoneye.termheight") ?? "0", 10) || 0,
+  );
+  const termHeight = () => {
+    const max = Math.max(TERM_MIN_H, winH() - 120);
+    const px = termHeightRaw() || Math.round(winH() * 0.42);
+    return Math.max(TERM_MIN_H, Math.min(px, max));
+  };
+  let termFitRaf = 0;
+  function setTermHeight(px: number) {
+    const max = Math.max(TERM_MIN_H, window.innerHeight - 120);
+    const h = Math.max(TERM_MIN_H, Math.min(Math.round(px), max));
+    setTermHeightRaw(h);
+    localStorage.setItem("pigeoneye.termheight", String(h));
+    // xterm only refits on window resize / becoming active — nudge it once
+    // per frame so a drag stays smooth.
+    if (!termFitRaf)
+      termFitRaf = requestAnimationFrame(() => {
+        termFitRaf = 0;
+        window.dispatchEvent(new Event("resize"));
+      });
+  }
+  function startTermResize(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const move = (ev: PointerEvent) => setTermHeight(window.innerHeight - ev.clientY);
+    const up = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  }
   const termApis = new Map<number, { focus: () => void }>();
 
   function focusTerminal() {
@@ -1784,6 +1845,11 @@ function App() {
   /// Focus hierarchy: the sidebar is the top level, the table sits
   /// under it, and the detail panel under that. Esc walks back up.
   const [pane, setPane] = createSignal<"sidebar" | "table">("sidebar");
+  // Which level the keyboard is driving right now, so it can be outlined —
+  // a keyboard user always sees where they are (sidebar → table → detail →
+  // terminal). Terminal focus and an open detail take precedence over pane.
+  const activePane = (): "sidebar" | "table" | "detail" | "terminal" =>
+    termFocused() ? "terminal" : detailKey() ? "detail" : pane();
   const [sideIdx, setSideIdx] = createSignal(0);
   const [openGroups, setOpenGroups] = createSignal<Set<string>>(new Set());
 
@@ -3912,6 +3978,21 @@ function App() {
         return;
       }
     }
+    // ⌘/Ctrl+⇧+↑/↓ resizes the open log/shell dock. While the terminal has
+    // focus its own key handler forwards these (see TerminalPanel), so this
+    // path is for when focus is elsewhere — hence the !termFocused guard.
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      e.shiftKey &&
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      shells().length > 0 &&
+      !termMin() &&
+      !termFocused()
+    ) {
+      e.preventDefault();
+      setTermHeight(termHeight() + (e.key === "ArrowUp" ? 48 : -48));
+      return;
+    }
     // Launcher screen: arrows/Enter drive the context list no matter
     // where focus sits, so it's fully keyboard-first. Letters still fall
     // through to the search box (which filters via onInput).
@@ -5274,7 +5355,13 @@ function App() {
       </Show>
 
       <div class="body">
-        <aside class="sidebar" classList={{ collapsed: !sidebarOpen() }}>
+        <aside
+          class="sidebar"
+          classList={{
+            collapsed: !sidebarOpen(),
+            "pane-active": activePane() === "sidebar",
+          }}
+        >
           <div class="sidebar-head">
             <button
               class="collapse-btn"
@@ -5961,16 +6048,32 @@ function App() {
               >
                 <div
                   class="table-wrap"
+                  classList={{ "pane-active": activePane() === "table" }}
+                  style={{
+                    // Shrink the scroll area to end at the terminal's top so
+                    // the bottom rows aren't hidden behind the dock — the
+                    // ResizeObserver below refits the virtual window to it.
+                    "margin-bottom":
+                      shells().length > 0 && !termMin()
+                        ? `${termHeight()}px`
+                        : "",
+                  }}
                   tabindex="-1"
                   ref={(el) => {
                     tableFocusRef = el;
                     setViewH(el.clientHeight || 600);
                     tableRO?.disconnect();
                     tableRO = new ResizeObserver(() => {
-                      // a detached element reports 0; ignore it or the
-                      // window collapses to the overscan size
-                      const h = el.clientHeight;
-                      if (h > 0) setViewH(h);
+                      // Defer to the next frame: measuring + updating state
+                      // synchronously inside the callback can re-trigger the
+                      // observer in the same frame (the benign "ResizeObserver
+                      // loop" warning), which zoom made easy to hit.
+                      requestAnimationFrame(() => {
+                        // a detached element reports 0; ignore it or the
+                        // window collapses to the overscan size
+                        const h = el.clientHeight;
+                        if (h > 0) setViewH(h);
+                      });
                     });
                     tableRO.observe(el);
                   }}
@@ -6170,7 +6273,11 @@ function App() {
           </Show>
 
           <Show when={detailKey()}>
-            <div class="drawer" onClick={(e) => e.stopPropagation()}>
+            <div
+              class="drawer"
+              classList={{ "pane-active": activePane() === "detail" }}
+              onClick={(e) => e.stopPropagation()}
+            >
               <div class="drawer-head">
                 <h3>
                   <span class="gv">{selected()?.kind}</span>{" "}
@@ -6689,9 +6796,18 @@ function App() {
           <Show when={shells().length > 0 && !termMin()}>
             <div
               class="term-panel"
-              classList={{ focused: termFocused() }}
+              classList={{
+                focused: termFocused(),
+                "pane-active": activePane() === "terminal",
+              }}
+              style={{ height: `${termHeight()}px` }}
               onClick={(e) => e.stopPropagation()}
             >
+              <div
+                class="term-resize"
+                title="drag to resize · ⌘⇧↑/↓"
+                onPointerDown={startTermResize}
+              />
               <div class="term-head">
                 <div class="term-tabs">
                   <For each={shells()}>
@@ -6725,8 +6841,8 @@ function App() {
                 </div>
                 <span class="term-hint">
                   {termFocused()
-                    ? "esc leave · ⌘←/→ or ⇧tab switch · ⇧⌘W close · ⌘T hide"
-                    : "⌘T or click to type here"}
+                    ? "esc leave · ⌘←/→ or ⇧tab switch · ⌘⇧↑/↓ resize · ⇧⌘W close · ⌘T hide"
+                    : "⌘T or click to type · drag top or ⌘⇧↑/↓ to resize"}
                 </span>
                 <button
                   class="btn sm"
@@ -6764,6 +6880,7 @@ function App() {
                       }
                       onCycleTab={cycleShell}
                       onCloseTab={() => closeShell(sh.k)}
+                      onResize={(d) => setTermHeight(termHeight() + d * 48)}
                       api={(a) => termApis.set(sh.k, a)}
                     />
                   )}
@@ -7029,6 +7146,7 @@ function App() {
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
                   <b>⌘T</b><span>show / hide the terminal dock</span>
+                  <b>⌘⇧↑ / ↓</b><span>resize the log / shell dock (or drag its top edge)</span>
                   <b>alt+1-9 · ⇧tab</b><span>switch terminal tabs (⇧tab works inside the shell)</span>
                   <b>⌘W</b><span>close what's in front: shell → detail → cluster tab</span>
                   <b>⇧⌘W</b><span>close the current shell session</span>

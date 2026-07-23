@@ -68,6 +68,7 @@ export default function TerminalPanel(props: {
   onFocusChange: (focused: boolean) => void;
   onCycleTab: (delta: number) => void;
   onCloseTab: () => void;
+  onResize?: (delta: number) => void;
   api?: (a: { focus: () => void }) => void;
 }) {
   let host!: HTMLDivElement;
@@ -164,6 +165,12 @@ export default function TerminalPanel(props: {
       if (appMod && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
         ev.preventDefault();
         props.onCycleTab(ev.key === "ArrowRight" ? 1 : -1);
+        return false;
+      }
+      // ⌘⇧↑/↓ resizes the dock (plain ⌘↑ still leaves the terminal below).
+      if (appMod && ev.shiftKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+        ev.preventDefault();
+        props.onResize?.(ev.key === "ArrowUp" ? 1 : -1);
         return false;
       }
       if (
