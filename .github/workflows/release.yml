@@ -21,11 +21,45 @@ jobs:
           fetch-depth: 0
       - id: v
         name: Determine next version
+        # Conventional Commits decide the bump from the commit messages
+        # since the last release tag:
+        #   feat!: … / any type + BREAKING CHANGE   → major (X+1.0.0)
+        #   feat: …                                 → minor (x.Y+1.0)
+        #   anything else (fix:, chore:, plain …)   → patch (x.y.Z+1)
+        # Highest level among the new commits wins.
         run: |
           LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           MAJOR=$(echo $LATEST | cut -d. -f1 | tr -d v)
           MINOR=$(echo $LATEST | cut -d. -f2)
-          PATCH=$(( $(echo $LATEST | cut -d. -f3) + 1 ))
+          PATCH=$(echo $LATEST | cut -d. -f3)
+
+          # Range of commits being released (all of them if no tag yet).
+          if git rev-parse "$LATEST" >/dev/null 2>&1; then
+            RANGE="${LATEST}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+          SUBJECTS=$(git log --format='%s' $RANGE)
+          BODIES=$(git log --format='%B' $RANGE)
+
+          BUMP=patch
+          if echo "$SUBJECTS" | grep -qE '^feat(\([^)]+\))?:'; then
+            BUMP=minor
+          fi
+          # major: a "type!:" subject, or a real BREAKING CHANGE footer
+          # (line starts with the token + ": "), not a prose mention of it.
+          if echo "$SUBJECTS" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
+             || echo "$BODIES" | grep -qE '^BREAKING[ -]CHANGE: '; then
+            BUMP=major
+          fi
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          echo "bump=${BUMP} → v${MAJOR}.${MINOR}.${PATCH}"
           echo "version=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
           echo "tag=v${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
 
