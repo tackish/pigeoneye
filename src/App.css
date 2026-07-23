@@ -314,6 +314,22 @@ button.app-ver.err {
   min-width: 160px;
 }
 
+/* Nudge shown beside the namespace filter while it's scoped to one ns —
+   press 0 (k9s-style) to jump back to all. */
+.ns-hint {
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+  align-self: center;
+}
+.ns-hint b {
+  color: var(--accent);
+  font-weight: 600;
+  padding: 0 3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 4px;
+}
+
 .ns-backdrop {
   position: fixed;
   inset: 0;

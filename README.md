@@ -52,8 +52,10 @@ coalesced into batches, and a view cache that resumes the watch on return.
   create-from-template, scale, rollout restart / history / undo, drain,
   CronJob trigger, secret reveal, **port-forward** manager, live **`top`**
   metrics, and **`auth can-i`**.
-- **Keyboard-first**, multi-cluster tabs, light/dark, and **one-click
-  re-login** (AWS SSO, gcloud, Teleport, Azure, OIDC) when a token expires.
+- **Keyboard-first**, color-coded multi-cluster tabs, light/dark,
+  **one-click re-login** (AWS SSO, gcloud, Teleport, Azure, OIDC) when a
+  token expires, and **in-app updates** — the top bar flags a new release
+  and upgrades in place, no `brew` needed.
 
 ## vs. k9s & Lens
 

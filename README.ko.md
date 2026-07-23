@@ -49,8 +49,9 @@ watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
 - **안전한 편집·운영.** YAML **서버사이드 apply**(dry-run), 템플릿 생성,
   스케일, 롤아웃 restart/history/undo, drain, CronJob trigger, Secret
   reveal, **포트포워드** 관리, **`top`** 메트릭, **`auth can-i`**.
-- **키보드 우선**, 멀티 클러스터 탭, 라이트/다크, 토큰 만료 시 **원클릭
-  재로그인**(AWS SSO·gcloud·Teleport·Azure·OIDC).
+- **키보드 우선**, 색으로 구분되는 멀티 클러스터 탭, 라이트/다크, 토큰 만료 시
+  **원클릭 재로그인**(AWS SSO·gcloud·Teleport·Azure·OIDC), 새 릴리즈를 상단바에
+  알리고 **앱 안에서 바로 업데이트**(brew 불필요).
 
 ## k9s · Lens 비교
 

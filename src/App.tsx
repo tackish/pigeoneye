@@ -3535,6 +3535,11 @@ function App() {
 
   const cmdItems = createMemo<CmdItem[]>(() => {
     const q = cmdText().trim().toLowerCase();
+    if (q === "0") {
+      return [
+        { label: "all namespaces", hint: "0", run: () => pickNamespace("") },
+      ];
+    }
     if (q.startsWith("ns")) {
       const arg = q.slice(2).trim();
       const list = arg
@@ -3563,7 +3568,8 @@ function App() {
     if (!q) {
       return [
         { label: "pods · deploy · svc · no …", hint: "type a resource kind", run: () => {} },
-        { label: "ns <name>", hint: "switch namespace", run: () => setCmdText("ns ") },
+        { label: "ns <name>", hint: "switch namespace (0 = all)", run: () => setCmdText("ns ") },
+        { label: "0", hint: "all namespaces", run: () => pickNamespace("") },
         { label: "ctx <name>", hint: "switch cluster", run: () => setCmdText("ctx ") },
       ];
     }
@@ -4124,9 +4130,15 @@ function App() {
       else rowSearchRef?.focus();
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.code === "Digit0") {
-      e.preventDefault();
-      pickNamespace("");
+    // `0` jumps to all namespaces, k9s-style. Plain `0` is safe here —
+    // typing contexts already returned above; ⌘/Ctrl+0 works too. Only
+    // acts on a namespaced kind (cluster-scoped views have no ns filter).
+    if (e.code === "Digit0" && !e.shiftKey && !e.altKey) {
+      const rt = selected();
+      if (!rt || rt.namespaced) {
+        e.preventDefault();
+        pickNamespace("");
+      }
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key === ",") {
@@ -5025,6 +5037,11 @@ function App() {
           <div class="ns-picker">
             <button
               class="ctx ns-btn"
+              title={
+                namespace()
+                  ? "press 0 to show all namespaces"
+                  : "filter by namespace"
+              }
               onClick={() => {
                 setNsOpen(!nsOpen());
                 setNsQuery("");
@@ -5095,6 +5112,11 @@ function App() {
               </div>
             </Show>
           </div>
+          <Show when={namespace()}>
+            <span class="ns-hint" title="press 0 to show all namespaces">
+              press <b>0</b> for all
+            </span>
+          </Show>
         </Show>
         <span class="badge">
           <Show when={active()}>{types().length} kinds</Show>
@@ -6890,7 +6912,7 @@ function App() {
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
                   <b class="help-sec">app</b>
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
-                  <b>⌘0</b><span>back to all namespaces</span>
+                  <b>0 · ⌘0</b><span>back to all namespaces</span>
                   <b>⌘,</b><span>settings (kubeconfig, shell)</span>
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
