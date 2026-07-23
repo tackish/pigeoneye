@@ -3957,7 +3957,12 @@ function App() {
 
   function onGlobalKey(e: KeyboardEvent) {
     const el = e.target as HTMLElement | null;
-    const typing = el?.closest("input, textarea, select, [contenteditable], .cm-editor, .xterm");
+    // Anything inside the terminal dock (the log toolbar's buttons too, not
+    // just its inputs) owns the keyboard — global table shortcuts must not
+    // fire, or arrow keys in the log toolbar would also walk the table.
+    const typing = el?.closest(
+      "input, textarea, select, [contenteditable], .cm-editor, .xterm, .term-panel",
+    );
     // Browser-style zoom — ⌘/Ctrl +/− adjusts, ⌘/Ctrl 0 resets. First thing,
     // so it works anywhere (launcher, while typing) like a browser. ⌘0 is
     // zoom-reset; plain 0 still jumps to all namespaces.
@@ -6047,17 +6052,20 @@ function App() {
                 }
               >
                 <div
-                  class="table-wrap"
+                  class="table-frame"
                   classList={{ "pane-active": activePane() === "table" }}
                   style={{
-                    // Shrink the scroll area to end at the terminal's top so
-                    // the bottom rows aren't hidden behind the dock — the
-                    // ResizeObserver below refits the virtual window to it.
+                    // Shrink the frame to end at the terminal's top so the
+                    // bottom rows (and the boundary) aren't hidden behind the
+                    // dock — the ResizeObserver below refits the window to it.
                     "margin-bottom":
                       shells().length > 0 && !termMin()
                         ? `${termHeight()}px`
                         : "",
                   }}
+                >
+                <div
+                  class="table-wrap"
                   tabindex="-1"
                   ref={(el) => {
                     tableFocusRef = el;
@@ -6267,6 +6275,7 @@ function App() {
                       </Show>
                     </tbody>
                   </table>
+                </div>
                 </div>
               </Show>
             </Show>
@@ -7147,6 +7156,8 @@ function App() {
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
                   <b>⌘T</b><span>show / hide the terminal dock</span>
                   <b>⌘⇧↑ / ↓</b><span>resize the log / shell dock (or drag its top edge)</span>
+                  <b>in logs: j/k ↑↓ · g/G · /</b><span>scroll · top / bottom · find</span>
+                  <b>tab (in logs)</b><span>enter the log toolbar → ←/→ move · ↵ press · esc back</span>
                   <b>alt+1-9 · ⇧tab</b><span>switch terminal tabs (⇧tab works inside the shell)</span>
                   <b>⌘W</b><span>close what's in front: shell → detail → cluster tab</span>
                   <b>⇧⌘W</b><span>close the current shell session</span>

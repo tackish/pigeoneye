@@ -561,6 +561,7 @@ button.app-ver.err::after {
   flex-direction: column;
   background: var(--chrome);
   border-right: 1px solid var(--border);
+  position: relative;
 }
 
 .search {
@@ -2994,20 +2995,38 @@ details.fold[open] > summary::before {
   border-color: var(--border);
 }
 
-/* Drop the default focus ring — but not when this is the active pane, or
-   the pane-active dashed outline (lower specificity) would be overridden
-   and vanish the moment the table takes focus (e.g. leaving the terminal). */
-.table-wrap:focus:not(.pane-active) {
+.table-wrap:focus {
   outline: none;
 }
 
+/* Non-scrolling frame that holds the scrolling table, so the pane-active
+   boundary can be drawn on it (a border on the scroller itself would be
+   hidden by the sticky header / row backgrounds). */
+.table-frame {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+.table-frame > .table-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
 /* Dashed accent boundary around whichever level the keyboard is driving
-   (sidebar / table / detail), so a keyboard user always sees where they
-   are. Uses outline so it never shifts layout. Terminal shows its own
-   accent border when focused. */
-.pane-active {
-  outline: 2px dashed color-mix(in srgb, var(--accent) 70%, transparent);
-  outline-offset: -3px;
+   (sidebar / table / detail / terminal), so a keyboard user always sees
+   where they are. Drawn as an overlay ABOVE the pane's content — sticky
+   headers and row backgrounds can't hide any edge — and inset a couple px
+   so it reads as "inside the scroll", never shifting layout. */
+.pane-active::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 2px dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 8;
 }
 
 .term-tab {
@@ -3082,6 +3101,14 @@ details.fold[open] > summary::before {
   background: var(--bg2);
   flex-wrap: wrap;
 }
+/* Clear focus ring so keyboard navigation of the toolbar is visible. Use
+   :focus (not just :focus-visible) so it shows on programmatic focus from
+   the arrow-key navigation too. */
+.log-bar :is(button, input, select):focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 5px;
+}
 
 .log-find {
   min-width: 160px;
@@ -3132,6 +3159,18 @@ details.fold[open] > summary::before {
 
 .log-seg button.active {
   background: var(--primary-bg);
+  color: var(--primary-fg);
+}
+
+/* The segment clips outlines (overflow:hidden), so ring the focused button
+   from the inside — clearly, whether or not it's the active choice. */
+.log-seg button:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  color: var(--fg);
+}
+.log-seg button.active:focus {
+  box-shadow: inset 0 0 0 2px var(--primary-fg);
   color: var(--primary-fg);
 }
 

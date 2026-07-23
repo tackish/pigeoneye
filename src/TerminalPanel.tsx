@@ -75,6 +75,27 @@ export default function TerminalPanel(props: {
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
   let search: SearchAddon | undefined;
+  let findInputRef: HTMLInputElement | undefined;
+  let logBarRef: HTMLDivElement | undefined;
+  // Move focus between the log toolbar's controls with ←/→ (roving focus),
+  // so the whole bar is reachable and clickable from the keyboard.
+  function moveLogBar(e: KeyboardEvent, dir: 1 | -1) {
+    const bar = logBarRef;
+    if (!bar) return;
+    const target = e.target as HTMLElement;
+    // In the find box, ←/→ move the caret until it's at the edge, then
+    // they step out of the input like any other control.
+    if (target instanceof HTMLInputElement && target.type !== "checkbox") {
+      const atEdge = dir === 1 ? target.selectionStart === target.value.length : target.selectionStart === 0;
+      if (!atEdge || target.selectionStart !== target.selectionEnd) return;
+    }
+    const items = [...bar.querySelectorAll<HTMLElement>("input, button, select")];
+    const i = items.indexOf(document.activeElement as HTMLElement);
+    if (i < 0) return;
+    e.preventDefault();
+    const next = Math.min(Math.max(i + dir, 0), items.length - 1);
+    items[next]?.focus();
+  }
   let sessionId: number | null = null;
   const isLogs = props.target.kind === "logs" || props.target.kind === "wlogs";
   // Buffer the streamed log text (for copy/download). Capped so a
@@ -87,6 +108,98 @@ export default function TerminalPanel(props: {
     logBuf += d.replace(/\r\n/g, "\n").replace(/\x1b\[[0-9;]*m/g, "");
     if (logBuf.length > LOG_BUF_MAX)
       logBuf = logBuf.slice(logBuf.length - LOG_BUF_MAX);
+  };
+
+  // Give plain pod logs a little colour: dim the leading timestamp and
+  // klog file:line, tint the severity/level words. wlogs already carry a
+  // per-pod colour from the backend, so only kind "logs" is colourised.
+  const A = {
+    dim: "\x1b[90m",
+    red: "\x1b[31m",
+    yellow: "\x1b[33m",
+    green: "\x1b[32m",
+    cyan: "\x1b[36m",
+    off: "\x1b[0m",
+  };
+  const levelColor = (lvl: string): string | null => {
+    const l = lvl.toLowerCase();
+    if (/^(err|error|fatal|panic|crit|emerg|alert)/.test(l)) return A.red;
+    if (/^warn/.test(l)) return A.yellow;
+    if (/^(info|notice)/.test(l)) return A.green;
+    if (/^(debug|trace|verbose)/.test(l)) return A.dim;
+    return null;
+  };
+  // Tint the timestamp and level wherever they appear — logfmt (level=info,
+  // time="…"), JSON ("level":"info","ts":"…"), and bare uppercase words.
+  const colorizeInline = (s: string): string =>
+    s
+      // logfmt: level=info · lvl=warn · severity=error
+      .replace(/\b(level|lvl|severity)=("?)([A-Za-z]+)\2/gi, (m, k, q, v) => {
+        const c = levelColor(v);
+        return c ? `${k}=${q}${c}${v}${A.off}${q}` : m;
+      })
+      // JSON: "level":"info"
+      .replace(
+        /("(?:level|lvl|severity)"\s*:\s*")([A-Za-z]+)(")/gi,
+        (m, pre, v, post) => {
+          const c = levelColor(v);
+          return c ? `${pre}${c}${v}${A.off}${post}` : m;
+        },
+      )
+      // logfmt timestamps: time="…" · ts=…
+      .replace(
+        /\b(time|ts|timestamp)=("?)([^"\s]+)\2/gi,
+        (_m, k, q, v) => `${k}=${q}${A.dim}${v}${A.off}${q}`,
+      )
+      // JSON timestamps: "ts":"…" · "time":"…"
+      .replace(
+        /("(?:ts|time|timestamp|@timestamp)"\s*:\s*")([^"]+)(")/gi,
+        (_m, pre, v, post) => `${pre}${A.dim}${v}${A.off}${post}`,
+      )
+      // bare uppercase level words
+      .replace(/\b(ERROR|FATAL|PANIC|FAIL(?:ED)?)\b/g, A.red + "$1" + A.off)
+      .replace(/\b(WARN(?:ING)?|Warning)\b/g, A.yellow + "$1" + A.off)
+      .replace(/\b(INFO|NOTICE)\b/g, A.green + "$1" + A.off)
+      .replace(/\b(DEBUG|TRACE)\b/g, A.dim + "$1" + A.off);
+  function colorizeLine(line: string): string {
+    // klog: "I0723 04:27:34.014636   1 warnings.go:110] msg"
+    let m = line.match(/^([IWEF])(\d{4} [\d:.]+)(\s+\d+\s+\S+?\])(.*)$/);
+    if (m) {
+      const sev = m[1] === "E" || m[1] === "F" ? A.red : m[1] === "W" ? A.yellow : A.cyan;
+      return sev + m[1] + A.dim + m[2] + m[3] + A.off + colorizeInline(m[4]);
+    }
+    // bare leading RFC3339 timestamp (kubectl --timestamps)
+    m = line.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?)(\s+)(.*)$/);
+    if (m) return A.dim + m[1] + A.off + m[2] + colorizeInline(m[3]);
+    return colorizeInline(line);
+  }
+  // Chunks can split a line, so buffer until a newline before colourising.
+  let colorBuf = "";
+  function writeLog(d: string) {
+    if (isLogs) pushLog(d);
+    if (props.target.kind !== "logs") {
+      term?.write(d);
+      return;
+    }
+    colorBuf += d;
+    let out = "";
+    let nl: number;
+    while ((nl = colorBuf.indexOf("\n")) >= 0) {
+      out += colorizeLine(colorBuf.slice(0, nl).replace(/\r$/, "")) + "\r\n";
+      colorBuf = colorBuf.slice(nl + 1);
+    }
+    if (out) term?.write(out);
+  }
+
+  // Highlight every match (not just the current one) as you type.
+  const SEARCH_OPTS = {
+    incremental: true,
+    decorations: {
+      matchBackground: "#6b5300",
+      activeMatchBackground: "#cc9a00",
+      matchOverviewRuler: "#cc9a00",
+      activeMatchColorOverviewRuler: "#ffcc33",
+    },
   };
   const [logPrev, setLogPrev] = createSignal(!!props.target.logPrevious);
   const [logTs, setLogTs] = createSignal(!!props.target.logTimestamps);
@@ -115,6 +228,8 @@ export default function TerminalPanel(props: {
       cursorBlink: true,
       // Deep scrollback for logs so search/scroll reaches far back.
       scrollback: isLogs ? 200000 : 2000,
+      // The search addon's match-highlight decorations use a proposed API.
+      allowProposedApi: true,
       theme: TERM_THEMES[props.theme],
     });
     fit = new FitAddon();
@@ -173,6 +288,37 @@ export default function TerminalPanel(props: {
         props.onResize?.(ev.key === "ArrowUp" ? 1 : -1);
         return false;
       }
+      // Logs are read-only — there's no shell to type into — so the
+      // navigation keys scroll the viewport (vim j/k/g/G too) and `/`
+      // jumps to the find box, matching the rest of the app.
+      if (isLogs && term && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+        const b = term;
+        switch (ev.key) {
+          case "ArrowDown":
+          case "j":
+            ev.preventDefault(); b.scrollLines(1); return false;
+          case "ArrowUp":
+          case "k":
+            ev.preventDefault(); b.scrollLines(-1); return false;
+          case "PageDown":
+            ev.preventDefault(); b.scrollPages(1); return false;
+          case "PageUp":
+            ev.preventDefault(); b.scrollPages(-1); return false;
+          case "End":
+          case "G":
+            ev.preventDefault(); b.scrollToBottom(); return false;
+          case "Home":
+          case "g":
+            ev.preventDefault(); b.scrollToTop(); return false;
+          case "/":
+            ev.preventDefault(); findInputRef?.focus(); return false;
+          // Tab enters the log toolbar; ←/→ then walk it, esc comes back.
+          case "Tab":
+            ev.preventDefault();
+            (logBarRef?.querySelector("input, button, select") as HTMLElement)?.focus();
+            return false;
+        }
+      }
       if (
         ev.key === "Escape" ||
         (ev.metaKey && ev.key === "ArrowUp") ||
@@ -203,8 +349,7 @@ export default function TerminalPanel(props: {
         props.onExit();
         return;
       }
-      if (isLogs) pushLog(d);
-      term?.write(d);
+      writeLog(d);
     };
     try {
       sessionId =
@@ -313,12 +458,12 @@ export default function TerminalPanel(props: {
     }
     term.clear();
     logBuf = "";
+    colorBuf = "";
     term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
       if (d === "\u0000exit") return;
-      pushLog(d);
-      term?.write(d);
+      writeLog(d);
     };
     try {
       sessionId = await invoke<number>("log_start", {
@@ -341,8 +486,8 @@ export default function TerminalPanel(props: {
   const doFind = (back = false) => {
     const q = findQ();
     if (!q || !search) return;
-    if (back) search.findPrevious(q);
-    else search.findNext(q);
+    if (back) search.findPrevious(q, SEARCH_OPTS);
+    else search.findNext(q, SEARCH_OPTS);
   };
 
   const [saved, setSaved] = createSignal(false);
@@ -378,18 +523,31 @@ export default function TerminalPanel(props: {
       style={{ display: props.active ? "flex" : "none" }}
     >
       <Show when={isLogs}>
-        <div class="log-bar">
+        <div
+          class="log-bar"
+          ref={(el) => (logBarRef = el)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowRight") moveLogBar(e, 1);
+            else if (e.key === "ArrowLeft") moveLogBar(e, -1);
+            else if (e.key === "Escape") term?.focus();
+          }}
+        >
           <input
             class="search log-find"
-            placeholder="find in logs…"
+            placeholder="find in logs…  ( / )"
+            ref={(el) => (findInputRef = el)}
             value={findQ()}
             onInput={(e) => {
               setFindQ(e.currentTarget.value);
-              search?.findNext(e.currentTarget.value);
+              search?.findNext(e.currentTarget.value, SEARCH_OPTS);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") doFind(e.shiftKey);
-              if (e.key === "Escape") e.currentTarget.blur();
+              // Esc hands focus back to the log so the arrows scroll again.
+              if (e.key === "Escape") {
+                e.currentTarget.blur();
+                term?.focus();
+              }
             }}
           />
           <button class="btn sm" title="next match (↵)" onClick={() => doFind()}>
