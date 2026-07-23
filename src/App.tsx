@@ -5432,7 +5432,24 @@ function App() {
                   <For each={restGroups()}>
                     {([group, ts]) => (
                       <div class="group">
-                        <div class="group-name sub">{group}</div>
+                        <div class="crd-grp-head">
+                          <div class="group-name sub">{group}</div>
+                          <span
+                            class="pin grp-pin"
+                            title="pin this whole group to a favorites group"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const r = (
+                                e.currentTarget as HTMLElement
+                              ).getBoundingClientRect();
+                              setNewGroupName(group);
+                              setPinPickAt({ x: r.right, y: r.bottom + 4 });
+                              setPinPick({ types: ts, label: group });
+                            }}
+                          >
+                            ★
+                          </span>
+                        </div>
                         <For each={ts}>{kindButton}</For>
                       </div>
                     )}

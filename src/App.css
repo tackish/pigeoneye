@@ -573,7 +573,8 @@ button.app-ver.err {
   display: flex;
   align-items: center;
 }
-.crd-grp-head .grp-toggle {
+.crd-grp-head > .grp-toggle,
+.crd-grp-head > .group-name {
   flex: 1;
   min-width: 0;
 }
