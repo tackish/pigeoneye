@@ -1015,8 +1015,13 @@ function App() {
     setPinGroupsRaw(next);
     localStorage.setItem("pigeoneye.pingroups", JSON.stringify(next));
   };
-  // The ★ group-picker popover: which kind is being pinned and where.
-  const [pinPickFor, setPinPickFor] = createSignal<ResourceType | null>(null);
+  // The ★ group-picker popover: which kind(s) are being pinned and where.
+  // `types` is one kind for a kind's own star, or every kind under a CRD
+  // group when its group header is pinned as a whole.
+  const [pinPick, setPinPick] = createSignal<{
+    types: ResourceType[];
+    label: string;
+  } | null>(null);
   const [pinPickAt, setPinPickAt] = createSignal<{ x: number; y: number } | null>(
     null,
   );
@@ -3096,26 +3101,28 @@ function App() {
   });
 
   const isFav = (t: ResourceType) => favKeys().has(typeKey(t));
-  // Pin a kind into a named group (creating it if needed), removing it
-  // from any other group first so a kind lives in exactly one group.
-  function pinToGroup(t: ResourceType, groupName: string) {
-    const k = typeKey(t);
+  // Pin one or more kinds into a named group (creating it if needed),
+  // removing them from any other group first so a kind lives in exactly
+  // one group. Pinning a whole CRD group passes all its kinds at once.
+  function pinTypesToGroup(list: ResourceType[], groupName: string) {
+    const keys = new Set(list.map(typeKey));
     let groups = pinGroups();
     if (!groups.some((g) => g.name === groupName))
       groups = [...groups, { name: groupName, keys: [] }];
     setPinGroups(
-      groups.map((g) => ({
-        ...g,
-        keys:
-          g.name === groupName
-            ? g.keys.includes(k)
-              ? g.keys
-              : [...g.keys, k]
-            : g.keys.filter((x) => x !== k),
-      })),
+      groups.map((g) => {
+        if (g.name === groupName) {
+          const merged = [...g.keys];
+          for (const k of keys) if (!merged.includes(k)) merged.push(k);
+          return { ...g, keys: merged };
+        }
+        return { ...g, keys: g.keys.filter((x) => !keys.has(x)) };
+      }),
     );
-    setPinPickFor(null);
+    setPinPick(null);
   }
+  const pinToGroup = (t: ResourceType, groupName: string) =>
+    pinTypesToGroup([t], groupName);
   function unpin(t: ResourceType) {
     const k = typeKey(t);
     setPinGroups(
@@ -4611,8 +4618,10 @@ function App() {
   }
 
   // Check at startup, then keep checking so a release cut while the app is
-  // open lights up the update chip on its own: every 6h, and whenever the
-  // window regains focus after sitting idle for over an hour.
+  // open lights up the update chip on its own: every 15 min, and whenever
+  // the window regains focus if the last check was over 2 min ago. (The
+  // focus path alone misses continuous use, where focus never re-fires, so
+  // the interval is what actually catches it.)
   onMount(() => {
     void (async () => {
       try {
@@ -4624,16 +4633,18 @@ function App() {
     })();
     const id = window.setInterval(
       () => void checkLatestRelease(),
-      6 * 60 * 60 * 1000,
+      15 * 60 * 1000,
     );
-    const onFocus = () => {
-      if (Date.now() - lastReleaseCheck > 60 * 60 * 1000)
+    const recheck = () => {
+      if (Date.now() - lastReleaseCheck > 2 * 60 * 1000)
         void checkLatestRelease();
     };
-    window.addEventListener("focus", onFocus);
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
     onCleanup(() => {
       window.clearInterval(id);
-      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
     });
   });
 
@@ -4675,7 +4686,7 @@ function App() {
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
             setNewGroupName("");
             setPinPickAt({ x: r.right, y: r.bottom + 4 });
-            setPinPickFor(t);
+            setPinPick({ types: [t], label: t.kind });
           }
         }}
       >
@@ -5379,13 +5390,30 @@ function App() {
                 <For each={customGroups()}>
                   {([group, ts]) => (
                     <div class="crd-group" classList={{ open: groupOpen(group) }}>
-                      <button
-                        class="group-name sub grp-toggle"
-                        onClick={() => toggleGroup(group)}
-                      >
-                        {group}
-                        <span class="grp-count">{ts.length}</span>
-                      </button>
+                      <div class="crd-grp-head">
+                        <button
+                          class="group-name sub grp-toggle"
+                          onClick={() => toggleGroup(group)}
+                        >
+                          {group}
+                          <span class="grp-count">{ts.length}</span>
+                        </button>
+                        <span
+                          class="pin grp-pin"
+                          title="pin this whole group to a favorites group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const r = (
+                              e.currentTarget as HTMLElement
+                            ).getBoundingClientRect();
+                            setNewGroupName(group);
+                            setPinPickAt({ x: r.right, y: r.bottom + 4 });
+                            setPinPick({ types: ts, label: group });
+                          }}
+                        >
+                          ★
+                        </span>
+                      </div>
                       <Show when={groupOpen(group)}>
                         <For each={ts}>{kindButton}</For>
                       </Show>
@@ -7225,8 +7253,8 @@ function App() {
             </div>
           </Show>
 
-          <Show when={pinPickFor()}>
-            <div class="col-menu-backdrop" onClick={() => setPinPickFor(null)} />
+          <Show when={pinPick()}>
+            <div class="col-menu-backdrop" onClick={() => setPinPick(null)} />
             <div
               class="col-menu pin-pick"
               style={{
@@ -7235,14 +7263,19 @@ function App() {
               }}
             >
               <div class="col-menu-head">
-                pin <b>{pinPickFor()!.kind}</b> to…
+                pin <b>{pinPick()!.label}</b>
+                <Show when={pinPick()!.types.length > 1}>
+                  {" "}
+                  <span class="dim">({pinPick()!.types.length} kinds)</span>
+                </Show>{" "}
+                to…
               </div>
               <div class="col-menu-list">
                 <For each={pinGroups()}>
                   {(g) => (
                     <button
                       class="ns-item"
-                      onClick={() => pinToGroup(pinPickFor()!, g.name)}
+                      onClick={() => pinTypesToGroup(pinPick()!.types, g.name)}
                     >
                       ★ {g.name}
                     </button>
@@ -7258,15 +7291,15 @@ function App() {
                   onInput={(e) => setNewGroupName(e.currentTarget.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && newGroupName().trim())
-                      pinToGroup(pinPickFor()!, newGroupName().trim());
-                    if (e.key === "Escape") setPinPickFor(null);
+                      pinTypesToGroup(pinPick()!.types, newGroupName().trim());
+                    if (e.key === "Escape") setPinPick(null);
                   }}
                 />
                 <button
                   class="btn sm"
                   disabled={!newGroupName().trim()}
                   onClick={() =>
-                    pinToGroup(pinPickFor()!, newGroupName().trim())
+                    pinTypesToGroup(pinPick()!.types, newGroupName().trim())
                   }
                 >
                   add

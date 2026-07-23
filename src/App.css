@@ -567,6 +567,33 @@ button.app-ver.err {
   font-size: 11px;
 }
 
+/* CRD group header: the toggle plus a star to pin the whole group (all
+   its kinds) into a favorites group at once. Star shows on hover. */
+.crd-grp-head {
+  display: flex;
+  align-items: center;
+}
+.crd-grp-head .grp-toggle {
+  flex: 1;
+  min-width: 0;
+}
+.grp-pin {
+  opacity: 0;
+  flex: none;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--dim);
+  cursor: pointer;
+  transition: opacity 0.12s;
+}
+.crd-grp-head:hover .grp-pin {
+  opacity: 0.7;
+}
+.grp-pin:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
 .group .group-name.sub ~ .kind {
   padding-left: 26px;
 }
