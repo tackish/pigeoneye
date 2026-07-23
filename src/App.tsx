@@ -988,7 +988,12 @@ function App() {
   const [shellStatus, setShellStatus] = createSignal<Map<number, "running" | "exited">>(new Map());
   const [activeShell, setActiveShell] = createSignal<number | null>(null);
   const [termMin, setTermMin] = createSignal(false);
+  // termFocused: the xterm itself has focus (drives its hint + Esc-leave).
+  // termDockFocused: focus is anywhere in the dock — the xterm OR the log
+  // toolbar — so the level indicator stays on the terminal when you tab up
+  // to the toolbar instead of jumping to the table.
   const [termFocused, setTermFocused] = createSignal(false);
+  const [termDockFocused, setTermDockFocused] = createSignal(false);
   // Log/shell dock height in px, drag- and keyboard-resizable. 0 = use the
   // default (42% of the viewport). Clamped to a sane range and persisted.
   // winH tracks the viewport so the dock height re-clamps on window resize.
@@ -1849,7 +1854,11 @@ function App() {
   // a keyboard user always sees where they are (sidebar → table → detail →
   // terminal). Terminal focus and an open detail take precedence over pane.
   const activePane = (): "sidebar" | "table" | "detail" | "terminal" =>
-    termFocused() ? "terminal" : detailKey() ? "detail" : pane();
+    termDockFocused() && shells().length > 0 && !termMin()
+      ? "terminal"
+      : detailKey()
+        ? "detail"
+        : pane();
   const [sideIdx, setSideIdx] = createSignal(0);
   const [openGroups, setOpenGroups] = createSignal<Set<string>>(new Set());
 
@@ -6806,11 +6815,18 @@ function App() {
             <div
               class="term-panel"
               classList={{
-                focused: termFocused(),
+                focused: termDockFocused(),
                 "pane-active": activePane() === "terminal",
               }}
               style={{ height: `${termHeight()}px` }}
               onClick={(e) => e.stopPropagation()}
+              onFocusIn={() => setTermDockFocused(true)}
+              onFocusOut={(e) => {
+                // Still in the dock (xterm ↔ toolbar) → stay active; only
+                // drop when focus actually leaves the terminal panel.
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+                  setTermDockFocused(false);
+              }}
             >
               <div
                 class="term-resize"
