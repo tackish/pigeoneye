@@ -1440,8 +1440,35 @@ pub async fn watch_start(
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut rows = rows;
             if rows.is_empty() {
-                continue;
+                // A Table-format DELETE can arrive with no printed rows (or
+                // as the bare object). Recover the identity from the
+                // object's own metadata so the row is still removed instead
+                // of lingering until the next full resync. (A list Table's
+                // top-level metadata has no `name`, so this only fires for a
+                // real object.)
+                if kind == "DELETED" {
+                    if let Some(name) = obj
+                        .pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                    {
+                        rows.push(TableRow {
+                            name: name.to_string(),
+                            namespace: obj
+                                .pointer("/metadata/namespace")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .or_else(|| ns_for_rows.clone()),
+                            cells: Vec::new(),
+                            labels: Default::default(),
+                            owner_kind: None,
+                        });
+                    }
+                }
+                if rows.is_empty() {
+                    continue;
+                }
             }
             let payload = serde_json::json!({ "type": kind, "rows": rows });
             if channel.send(payload).is_err() {

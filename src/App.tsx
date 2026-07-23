@@ -8,6 +8,7 @@ import {
   Show,
 } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import YamlEditor from "./YamlEditor";
 import TerminalPanel, { type ShellTarget } from "./TerminalPanel";
@@ -494,6 +495,34 @@ function basename(p: string): string {
   return p.split("/").pop() ?? p;
 }
 
+/// Deterministic hue (0-359) for a context name, so each cluster keeps a
+/// stable identity color across its tab and the active-tab card — you can
+/// tell prod from staging at a glance, not just by reading the text.
+function ctxHue(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+
+/// Compare two dotted versions ("0.0.6", "v0.1.0"). Leading "v" and any
+/// pre-release suffix are ignored; missing components count as 0. Returns
+/// >0 when a is newer, <0 when older, 0 when equal.
+function cmpSemver(a: string, b: string): number {
+  const parts = (s: string) =>
+    s
+      .replace(/^v/, "")
+      .split(/[-+]/)[0]
+      .split(".")
+      .map((n) => parseInt(n, 10) || 0);
+  const pa = parts(a);
+  const pb = parts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
 const fmtCpu = (m: number) => String(m);
 const fmtMem = (b: number) => String(Math.round(b / 1048576));
 const pct = (used: number, base: number) =>
@@ -615,6 +644,34 @@ function App() {
     JSON.parse(localStorage.getItem(KUBECONFIG_KEY) ?? "[]"),
   );
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  // In-app update: current build version vs. the latest GitHub release.
+  const [appVersion, setAppVersion] = createSignal("");
+  const [latestVersion, setLatestVersion] = createSignal("");
+  const [upgrading, setUpgrading] = createSignal(false);
+  const [upgradeDone, setUpgradeDone] = createSignal(false);
+  const [upgradeErr, setUpgradeErr] = createSignal("");
+  const updateAvailable = createMemo(
+    () =>
+      !!appVersion() &&
+      !!latestVersion() &&
+      cmpSemver(latestVersion(), appVersion()) > 0,
+  );
+  async function runSelfUpgrade() {
+    if (upgrading()) return;
+    setUpgrading(true);
+    setUpgradeErr("");
+    try {
+      await invoke<string>("self_upgrade");
+      // The new bundle is on disk. Flip the label to "restarting…", then
+      // relaunch so the running (old) process is replaced by it.
+      setUpgradeDone(true);
+      setUpgrading(false);
+      window.setTimeout(() => void invoke("restart_app").catch(() => {}), 700);
+    } catch (e) {
+      setUpgradeErr(String(e));
+      setUpgrading(false);
+    }
+  }
   const [pickerQ, setPickerQ] = createSignal("");
   const [pickerIdx, setPickerIdx] = createSignal(0);
   const lastSession: string[] = (() => {
@@ -653,6 +710,10 @@ function App() {
   const [tabs, setTabs] = createSignal<string[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
   const [connecting, setConnecting] = createSignal<string | null>(null);
+  // True from launch while last session's tabs reconnect, so the launcher
+  // (context picker) doesn't flash before the restored tabs appear. We know
+  // synchronously whether there's anything to restore from the saved tabs.
+  const [restoring, setRestoring] = createSignal(lastSession.length > 0);
   const [error, setError] = createSignal<string | null>(null);
   const [types, setTypes] = createSignal<ResourceType[]>([]);
   const [namespaces, setNamespaces] = createSignal<string[]>([]);
@@ -669,49 +730,57 @@ function App() {
   const watchBuf = new Map<string, { del: boolean; row: TableRow }>();
   let watchFlushTimer: number | undefined;
 
+  function flushWatch(seq: number) {
+    if (watchFlushTimer != null) {
+      window.clearTimeout(watchFlushTimer);
+      watchFlushTimer = undefined;
+    }
+    if (seq !== listSeq || !watchBuf.size) {
+      watchBuf.clear();
+      return;
+    }
+    const pending = new Map(watchBuf);
+    watchBuf.clear();
+    setTable((prev) => {
+      if (!prev) return prev;
+      // one index pass, then O(1) updates
+      const idx = new Map<string, number>();
+      for (let i = 0; i < prev.rows.length; i++) idx.set(rowKeyOf(prev.rows[i]), i);
+      let rows = prev.rows;
+      let copied = false;
+      const ensure = () => {
+        if (!copied) {
+          rows = prev.rows.slice();
+          copied = true;
+        }
+      };
+      const dels: number[] = [];
+      for (const [k, ch] of pending) {
+        const i = idx.get(k);
+        if (ch.del) {
+          if (i !== undefined) dels.push(i);
+        } else if (i !== undefined) {
+          ensure();
+          rows[i] = ch.row;
+        } else {
+          ensure();
+          rows.push(ch.row);
+        }
+      }
+      if (dels.length) {
+        ensure();
+        dels.sort((a, b) => b - a);
+        for (const i of dels) rows.splice(i, 1);
+      }
+      return copied ? { ...prev, rows } : prev;
+    });
+  }
+
   function scheduleWatchFlush(seq: number) {
     if (watchFlushTimer != null) return;
     watchFlushTimer = window.setTimeout(() => {
       watchFlushTimer = undefined;
-      if (seq !== listSeq || !watchBuf.size) {
-        watchBuf.clear();
-        return;
-      }
-      const pending = new Map(watchBuf);
-      watchBuf.clear();
-      setTable((prev) => {
-        if (!prev) return prev;
-        // one index pass, then O(1) updates
-        const idx = new Map<string, number>();
-        for (let i = 0; i < prev.rows.length; i++) idx.set(rowKeyOf(prev.rows[i]), i);
-        let rows = prev.rows;
-        let copied = false;
-        const ensure = () => {
-          if (!copied) {
-            rows = prev.rows.slice();
-            copied = true;
-          }
-        };
-        const dels: number[] = [];
-        for (const [k, ch] of pending) {
-          const i = idx.get(k);
-          if (ch.del) {
-            if (i !== undefined) dels.push(i);
-          } else if (i !== undefined) {
-            ensure();
-            rows[i] = ch.row;
-          } else {
-            ensure();
-            rows.push(ch.row);
-          }
-        }
-        if (dels.length) {
-          ensure();
-          dels.sort((a, b) => b - a);
-          for (const i of dels) rows.splice(i, 1);
-        }
-        return copied ? { ...prev, rows } : prev;
-      });
+      flushWatch(seq);
     }, 700);
   }
 
@@ -755,8 +824,12 @@ function App() {
       }
       const incoming = ev.rows ?? [];
       if (!incoming.length) return;
-      for (const r of incoming) watchBuf.set(rowKeyOf(r), { del: ev.type === "DELETED", row: r });
-      scheduleWatchFlush(seq);
+      const del = ev.type === "DELETED";
+      for (const r of incoming) watchBuf.set(rowKeyOf(r), { del, row: r });
+      // A vanished row (Node gone NotReady/deleted) should leave the list
+      // at once — don't let it sit behind the 700ms coalescing window.
+      if (del) flushWatch(seq);
+      else scheduleWatchFlush(seq);
     };
     try {
       const id = await invoke<number>("watch_start", {
@@ -2083,6 +2156,7 @@ function App() {
     } catch (e) {
       setContexts([]);
       setError(String(e));
+      setRestoring(false);
     }
   }
 
@@ -2090,11 +2164,17 @@ function App() {
   // active tab wins focus back.
   function restoreSession(cs: ContextInfo[]) {
     const raw = localStorage.getItem(SESSION_KEY);
-    if (!raw) return;
+    if (!raw) {
+      setRestoring(false);
+      return;
+    }
     const saved = JSON.parse(raw) as { tabs: string[]; active: string | null };
     const known = new Set(cs.map((c) => c.name));
     const wanted = (saved.tabs ?? []).filter((t) => known.has(t));
-    if (!wanted.length) return;
+    if (!wanted.length) {
+      setRestoring(false);
+      return;
+    }
     setConnecting(wanted.join(", "));
     void Promise.all(
       wanted.map((name) =>
@@ -2126,7 +2206,10 @@ function App() {
             : opened[0];
         if (act) activate(act);
       })
-      .finally(() => setConnecting(null));
+      .finally(() => {
+        setConnecting(null);
+        setRestoring(false);
+      });
   }
 
   // On launch, reconnect every cluster tab from last session (the
@@ -3021,11 +3104,13 @@ function App() {
       if (!groupOpen("__more")) toggleGroup("__more");
     }
     // group expansion changes sidebarItems(); wait a frame for it to
-    // settle before locating the row.
+    // settle before locating the row. Scroll it into view and position the
+    // sidebar cursor there, but DON'T steal keyboard focus — after a `:`
+    // pick the keyboard belongs to the table rows; the sidebar just
+    // highlights the picked kind (via its `active` state).
     requestAnimationFrame(() => {
       const idx = sidebarItems().findIndex((x) => typeKey(x) === k);
       if (idx < 0) return;
-      setPane("sidebar");
       setSideIdx(idx);
       document
         .querySelector(`.kind[data-sk="${idx}"]`)
@@ -3430,11 +3515,13 @@ function App() {
     return hits.slice(0, 12).map((t) => ({
       label: t.kind,
       hint: t.group || "core",
-      // open the table AND reveal the kind in the sidebar so it's one
-      // keystroke away from being pinned.
+      // Open the table (select() sets pane=table + cursor on row 0 and
+      // highlights the kind in the sidebar), reveal the kind so it's
+      // visible, and focus the table so arrows navigate rows right away.
       run: () => {
         void select(t);
         revealInSidebar(t);
+        requestAnimationFrame(() => tableFocusRef?.focus());
       },
     }));
   });
@@ -3977,9 +4064,12 @@ function App() {
       setSettingsOpen(!settingsOpen());
       return;
     }
-    // Shift+/ focuses the sidebar kind filter (/ is the row search).
+    // ⌘K / Ctrl+K focuses the sidebar kind filter from anywhere (`/` is
+    // the row search). ⌘⇧K does the same, since some keyboards/apps eat
+    // ⌘K — give it a second, always-available binding.
     if ((e.metaKey || e.ctrlKey) && e.code === "KeyK") {
       e.preventDefault();
+      setSidebarOpen(true);
       kindFilterRef?.focus();
       return;
     }
@@ -4395,6 +4485,29 @@ function App() {
   });
   onCleanup(() => suggestObserver?.disconnect());
 
+  // Check for a newer release once at startup. Best-effort: any failure
+  // (offline, rate-limited, private) just leaves the banner hidden.
+  onMount(() => {
+    void (async () => {
+      try {
+        setAppVersion(await getVersion());
+      } catch {
+        return;
+      }
+      try {
+        const res = await fetch(
+          "https://api.github.com/repos/tackish/pigeoneye/releases/latest",
+          { headers: { Accept: "application/vnd.github+json" } },
+        );
+        if (!res.ok) return;
+        const tag = (await res.json())?.tag_name;
+        if (typeof tag === "string") setLatestVersion(tag);
+      } catch {
+        /* offline — no banner */
+      }
+    })();
+  });
+
   onMount(() => document.addEventListener("keydown", onGlobalKey));
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
@@ -4606,6 +4719,24 @@ function App() {
               Browse…
             </button>
           </div>
+          <div class="settings-ver">
+            <span>
+              PigeonEye <b>v{appVersion() || "…"}</b>
+            </span>
+            <Show
+              when={updateAvailable()}
+              fallback={
+                <Show when={!!latestVersion()}>
+                  <span class="dim">up to date</span>
+                </Show>
+              }
+            >
+              <span class="dim">
+                update to v{latestVersion().replace(/^v/, "")} available in the
+                top bar
+              </span>
+            </Show>
+          </div>
         </div>
   );
 
@@ -4687,20 +4818,80 @@ function App() {
     </div>
   );
 
+  // Shown at launch while last session's tabs reconnect — a calm splash so
+  // the launcher's context picker never flashes before the tabs appear.
+  const restoreSplash = () => (
+    <div class="launcher">
+      <img class="mascot" src={flyingUrl} alt="" />
+      <h1>PigeonEye</h1>
+      <p class="dim">reconnecting your clusters…</p>
+      <div class="restore-ctxs">
+        <For each={lastSession}>
+          {(name) => (
+            <span class="restore-ctx" style={{ "--ctx-hue": ctxHue(name) }}>
+              <span class="ctx-dot" />
+              {name}
+            </span>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+
   return (
-    <Show when={tabs().length > 0} fallback={launcher()}>
+    <Show
+      when={tabs().length > 0}
+      fallback={restoring() ? restoreSplash() : launcher()}
+    >
     <div class="shell">
       <header class="topbar">
         <img class="logo-img" src={logoUrl} alt="PigeonEye" />
         <span class="logo">PigeonEye</span>
+        <Show when={appVersion()}>
+          <Show
+            when={updateAvailable()}
+            fallback={
+              <span class="app-ver" title="installed version">
+                v{appVersion()}
+              </span>
+            }
+          >
+            <button
+              class="app-ver update"
+              classList={{ err: !!upgradeErr() }}
+              disabled={upgrading() || upgradeDone()}
+              title={
+                upgradeErr()
+                  ? `update failed: ${upgradeErr()} — click to retry`
+                  : `update to v${latestVersion().replace(/^v/, "")} and restart`
+              }
+              onClick={() => void runSelfUpgrade()}
+            >
+              {upgrading() ? (
+                "updating…"
+              ) : upgradeDone() ? (
+                "restarting…"
+              ) : upgradeErr() ? (
+                "update failed — retry"
+              ) : (
+                <>
+                  v{appVersion()} <span class="arr">→</span> v
+                  {latestVersion().replace(/^v/, "")}
+                </>
+              )}
+            </button>
+          </Show>
+        </Show>
         <div class="tabs">
           <For each={tabs()}>
             {(name) => (
               <div
                 class="tab"
                 classList={{ active: active() === name }}
+                style={{ "--ctx-hue": ctxHue(name) }}
                 onClick={() => active() !== name && activate(name)}
               >
+                <span class="ctx-dot" />
                 <span class="tab-name">{name}</span>
                 <button
                   class="tab-close"

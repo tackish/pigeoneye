@@ -17,6 +17,45 @@ async fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+/// Upgrade the app in place via Homebrew (how it's distributed), so the
+/// user doesn't have to drop to a terminal. Refreshes the tap then
+/// upgrades the cask; the running process keeps the old code until it's
+/// relaunched. `brew` is resolved from the login-shell PATH set at start.
+#[tauri::command]
+async fn self_upgrade() -> Result<String, String> {
+    let out = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("brew")
+            .args(["update"])
+            .output()
+            .and_then(|_| {
+                std::process::Command::new("brew")
+                    .args(["upgrade", "--cask", "peye"])
+                    .output()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("could not run brew: {e}"))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(combined.trim().to_string())
+    } else {
+        Err(combined.trim().to_string())
+    }
+}
+
+/// Relaunch the app, replacing the running process. Called after
+/// `self_upgrade` so the freshly-installed bundle takes over. `restart`
+/// exits and re-execs, so this never returns.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 #[tauri::command]
 async fn connect(
     state: State<'_, AppState>,
@@ -645,7 +684,9 @@ pub fn run() {
             list_namespaces,
             count_resources,
             custom_columns,
-            sample_fields
+            sample_fields,
+            self_upgrade,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

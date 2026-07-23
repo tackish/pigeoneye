@@ -4,6 +4,10 @@
   --bg3: #1a2029;
   --bg-hover: #1c2330;
   --bg-drawer: #151a26;
+  /* Topbar + sidebar frame. In dark mode it matches --bg2 (no change); in
+     light mode it's a distinct, calmer tone so the chrome isn't the
+     brightest surface on screen. */
+  --chrome: #12161d;
   --border: #262d38;
   --fg: #e3e8f0;
   --dim: #7a8798;
@@ -39,36 +43,38 @@
   text-rendering: optimizeLegibility;
 }
 
-/* Light theme, matched to the PigeonEye brand mockups:
-   #2D3748 / #718096 / #A0AEC0 / #E2E8F0 / #6366F1 / #F59E0B */
+/* Light theme — a soft, dimmed "slate" palette (Tailwind slate-100/200
+   range), deliberately kept off the bright end so it isn't glaring in a
+   lit room. The reading surface (table) is a calm light gray; the chrome
+   (topbar/sidebar) sits a shade deeper so it frames the content instead
+   of being the brightest thing on screen. Brand ref: slate + indigo. */
 :root[data-theme="light"] {
-  /* Muted light theme — no pure white, softened a few % so it isn't
-     glaring ("eye-searing") in a bright room. */
-  --bg: #e5e8ee;
-  --bg2: #eef1f6;
-  --bg3: #dce0e8;
-  --bg-hover: #e0e4ec;
-  --bg-drawer: #eaedf3;
-  --border: #ccd3de;
-  --fg: #2d3748;
-  --dim: #6b7688;
-  --accent: #5457d6;
-  --accent-soft: rgba(84, 87, 214, 0.12);
-  --good: #16a34a;
-  --warn: #c26a06;
-  --bad: #d3352a;
-  --key: #4a5568;
-  --primary-bg: #5457d6;
-  --primary-border: #5457d6;
+  --bg: #dfe3ea;
+  --bg2: #e7eaf0;
+  --bg3: #d1d7e1;
+  --bg-hover: #d7dce4;
+  --bg-drawer: #e1e5ec;
+  --chrome: #d6dbe3;
+  --border: #c1c9d6;
+  --fg: #1f2733;
+  --dim: #5f6a7b;
+  --accent: #4b4fce;
+  --accent-soft: rgba(75, 79, 206, 0.13);
+  --good: #157f3b;
+  --warn: #b05d05;
+  --bad: #c32e25;
+  --key: #414b5a;
+  --primary-bg: #4b4fce;
+  --primary-border: #4b4fce;
   --primary-fg: #ffffff;
-  --primary-hover: #494cc4;
-  --error-bg: #f6e3e3;
-  --error-fg: #a83a3a;
-  --error-border: #e6bcbc;
-  --drawer-border: #cbd2df;
-  --editor-bg: #eef1f6;
-  --editor-gutter: #e5e8ee;
-  --backdrop: rgba(30, 39, 56, 0.35);
+  --primary-hover: #4143bb;
+  --error-bg: #eddada;
+  --error-fg: #97302f;
+  --error-border: #d6acac;
+  --drawer-border: #c3cbd8;
+  --editor-bg: #e7eaf0;
+  --editor-gutter: #dfe3ea;
+  --backdrop: rgba(24, 32, 47, 0.4);
   color-scheme: light;
 }
 
@@ -117,7 +123,7 @@ body {
   align-items: center;
   gap: 10px;
   padding: 8px 14px;
-  background: var(--bg2);
+  background: var(--chrome);
   border-bottom: 1px solid var(--border);
 }
 
@@ -125,6 +131,45 @@ body {
   font-weight: 700;
   letter-spacing: -0.01em;
   margin-right: 6px;
+}
+
+.app-ver {
+  font-size: 11px;
+  color: var(--dim);
+  margin-right: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  align-self: center;
+}
+
+/* When an update is available the version becomes a quiet clickable chip
+   ("v0.1.0 → v0.2.0"): a thin accent outline, no loud fill. Click upgrades
+   then restarts. */
+button.app-ver {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--accent);
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  line-height: 1.35;
+}
+button.app-ver:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+}
+button.app-ver:disabled {
+  opacity: 0.75;
+  cursor: default;
+}
+button.app-ver .arr {
+  opacity: 0.55;
+  margin: 0 2px;
+}
+button.app-ver.err {
+  border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+  color: var(--bad);
 }
 
 .logo-img {
@@ -148,20 +193,35 @@ body {
   display: none;
 }
 
+/* Browser/editor-style tabs. Inactive tabs are quiet and flat; the active
+   tab lifts onto the content color with a thin identity-colored top accent —
+   clean, not a heavy filled card. Each context's hue is set inline. */
 .tab {
   display: flex;
   align-items: center;
-  gap: 4px;
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 4px 3px 10px;
+  gap: 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 6px 6px;
+  padding: 4px 5px 4px 11px;
   cursor: pointer;
   font-size: 12px;
   font-family: var(--font-ui);
   color: var(--dim);
   white-space: nowrap;
   user-select: none;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+/* Per-context identity dot — stable color, carried on every tab. */
+.ctx-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: hsl(var(--ctx-hue, 240) 55% 60%);
 }
 
 .tab:hover {
@@ -170,9 +230,16 @@ body {
 }
 
 .tab.active {
-  color: var(--accent);
-  border-color: var(--primary-border);
-  background: var(--accent-soft);
+  color: var(--fg);
+  font-weight: 600;
+  background: var(--bg);
+  border-color: var(--border);
+  border-top-color: hsl(var(--ctx-hue, 240) 62% 56%);
+  box-shadow: inset 0 2px 0 hsl(var(--ctx-hue, 240) 62% 56%);
+}
+
+.tab.active .ctx-dot {
+  background: hsl(var(--ctx-hue, 240) 62% 54%);
 }
 
 .tab-close {
@@ -218,6 +285,21 @@ body {
 
 .content-head .badge {
   margin-left: 0;
+}
+
+.settings-ver {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--dim);
+}
+.settings-ver b {
+  color: var(--fg);
+  font-weight: 600;
 }
 
 /* ── namespace picker ────────────────────────────────── */
@@ -414,7 +496,7 @@ body {
   width: 232px;
   display: flex;
   flex-direction: column;
-  background: var(--bg2);
+  background: var(--chrome);
   border-right: 1px solid var(--border);
 }
 
@@ -1820,6 +1902,27 @@ kbd.key {
 
 .launcher .mascot {
   width: 96px;
+}
+
+/* Contexts being reconnected, shown as their identity-colored chips so you
+   see which clusters are coming back before the tabs render. */
+.restore-ctxs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.restore-ctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px 5px 10px;
+  font-size: 13px;
+  color: var(--fg);
+  border-radius: 8px;
+  border: 1px solid hsl(var(--ctx-hue, 240) 55% 58% / 0.5);
+  background: hsl(var(--ctx-hue, 240) 55% 58% / 0.12);
 }
 
 .launcher-error {
