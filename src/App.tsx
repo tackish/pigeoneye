@@ -799,7 +799,7 @@ function App() {
     queueMicrotask(() =>
       document
         .querySelectorAll(".launcher-item")
-        [i]?.scrollIntoView({ block: "nearest" }),
+        [i]?.scrollIntoView?.({ block: "nearest" }),
     );
   });
   const [newPath, setNewPath] = createSignal("");
@@ -844,7 +844,7 @@ function App() {
     requestAnimationFrame(() =>
       tabsStripRef
         ?.querySelector<HTMLElement>(".tab.active")
-        ?.scrollIntoView({ inline: "nearest", block: "nearest" }),
+        ?.scrollIntoView?.({ inline: "nearest", block: "nearest" }),
     );
   });
   const [connecting, setConnecting] = createSignal<string | null>(null);
@@ -2100,7 +2100,7 @@ function App() {
     const el = sectionButtons(sec)[idx];
     if (el) {
       el.classList.add("btn-cursor");
-      el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      el.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     }
   }
 
@@ -2126,7 +2126,7 @@ function App() {
     const el = items[idx];
     if (el) {
       el.classList.add("btn-cursor");
-      el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      el.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     }
   }
 
@@ -2165,7 +2165,7 @@ function App() {
     // would leave the row off-screen.
     document
       .querySelector(`.psec[data-sec="${sec}"]`)
-      ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      ?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
     if (BUTTON_ROWS[sec]) {
       requestAnimationFrame(() => focusRowButton(sec, 0));
       return;
@@ -2328,7 +2328,7 @@ function App() {
     requestAnimationFrame(() =>
       document
         .querySelector(`.ns-item[data-nsi="${nsIdx()}"]`)
-        ?.scrollIntoView({ block: "nearest" }),
+        ?.scrollIntoView?.({ block: "nearest" }),
     );
 
   function pickNamespace(ns: string) {
@@ -3529,7 +3529,7 @@ function App() {
     setSideIdx(next);
     document
       .querySelector(`.kind[data-sk="${next}"]`)
-      ?.scrollIntoView({ block: "nearest" });
+      ?.scrollIntoView?.({ block: "nearest" });
   }
 
   function enterSidebarItem() {
@@ -3571,7 +3571,7 @@ function App() {
       setSideIdx(idx);
       document
         .querySelector(`.kind[data-sk="${idx}"]`)
-        ?.scrollIntoView({ block: "center" });
+        ?.scrollIntoView?.({ block: "center" });
     });
   }
 
@@ -3889,7 +3889,7 @@ function App() {
   function scrollColIntoView(i: number) {
     document
       .querySelector(`th[data-col="${i}"]`)
-      ?.scrollIntoView({ inline: "nearest", block: "nearest" });
+      ?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
   }
 
   function moveCursor(delta: number) {
@@ -5879,7 +5879,7 @@ function App() {
                     requestAnimationFrame(() =>
                       document
                         .querySelector(`.kind[data-sk="0"]`)
-                        ?.scrollIntoView({ block: "nearest" }),
+                        ?.scrollIntoView?.({ block: "nearest" }),
                     );
                   } else if (e.key === "Escape") {
                     e.currentTarget.blur();
