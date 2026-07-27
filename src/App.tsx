@@ -3770,8 +3770,110 @@ function App() {
     run: () => void;
   }
 
+  /// Match a resource kind the way the `:` palette does: exact alias
+  /// first, then prefix, then substring on kind or group.
+  function resolveKinds(token: string): ResourceType[] {
+    if (!token) return [];
+    const byKey = new Map(types().map((t) => [typeKey(t).toLowerCase(), t]));
+    const hits: ResourceType[] = [];
+    const alias = KIND_ALIASES[token];
+    if (alias) {
+      const t = byKey.get(alias.toLowerCase());
+      if (t) hits.push(t);
+    }
+    for (const t of types())
+      if (!hits.includes(t) && t.kind.toLowerCase().startsWith(token)) hits.push(t);
+    for (const t of types())
+      if (
+        !hits.includes(t) &&
+        (t.kind.toLowerCase().includes(token) || t.group.includes(token))
+      )
+        hits.push(t);
+    return hits;
+  }
+
+  /// Open a kind and land the cursor in the table.
+  function gotoKind(t: ResourceType) {
+    void select(t);
+    revealInSidebar(t);
+    requestAnimationFrame(() => tableFocusRef?.focus());
+  }
+
+  /// One palette row for a kind, honoring a k9s-style modifier arg:
+  ///   :pod kube-system  → namespace     :pod /nginx     → name filter
+  ///   :pod app=web,e=d  → label selector :pod @prod      → context
+  /// No arg just opens the kind.
+  function kindItem(t: ResourceType, rest: string): CmdItem {
+    if (!rest) return { label: t.kind, hint: t.group || "core", run: () => gotoKind(t) };
+    if (rest.startsWith("@")) {
+      const arg = rest.slice(1);
+      const ctx = contexts().find((c) =>
+        c.name.toLowerCase().includes(arg.toLowerCase()),
+      );
+      const name = ctx?.name ?? arg;
+      return {
+        label: `${t.kind} @ ${name}`,
+        hint: "kind in context",
+        run: () =>
+          void (async () => {
+            await openContext(name);
+            // types() now belongs to the new context — re-resolve there.
+            const nt = resolveKinds(t.kind.toLowerCase())[0];
+            if (nt) gotoKind(nt);
+          })(),
+      };
+    }
+    if (rest.startsWith("/")) {
+      const f = rest.slice(1);
+      return {
+        label: `${t.kind} /${f}`,
+        hint: "filter by name",
+        run: () =>
+          void (async () => {
+            await select(t);
+            revealInSidebar(t);
+            onRowFilterInput(f);
+          })(),
+      };
+    }
+    if (rest.includes("=")) {
+      return {
+        label: `${t.kind} ${rest}`,
+        hint: "label selector",
+        run: () => {
+          void select(t, `label:${rest}`);
+          revealInSidebar(t);
+          requestAnimationFrame(() => tableFocusRef?.focus());
+        },
+      };
+    }
+    // A bare word is a namespace (k9s: `:pod ns-x`). Resolve it against the
+    // known list so a prefix works, but keep the raw value as a fallback.
+    if (!t.namespaced)
+      return {
+        label: `${t.kind} · ${rest}`,
+        hint: "cluster-scoped — ns ignored",
+        run: () => gotoKind(t),
+      };
+    const ns =
+      namespaces().find((n) => n === rest) ??
+      namespaces().find((n) => n.includes(rest)) ??
+      rest;
+    return {
+      label: `${t.kind} · ${ns}`,
+      hint: "in namespace",
+      run: () => {
+        setNamespace(ns);
+        const st = tabCache.get(active()!);
+        if (st) st.namespace = ns;
+        gotoKind(t);
+      },
+    };
+  }
+
   const cmdItems = createMemo<CmdItem[]>(() => {
-    const q = cmdText().trim().toLowerCase();
+    const raw = cmdText().trim();
+    const q = raw.toLowerCase();
     if (q === "0") {
       return [
         { label: "all namespaces", hint: "0", run: () => pickNamespace("") },
@@ -3805,38 +3907,21 @@ function App() {
     if (!q) {
       return [
         { label: "pods · deploy · svc · no …", hint: "type a resource kind", run: () => {} },
+        { label: "kind ns · /name · k=v · @ctx", hint: "narrow a kind inline", run: () => {} },
         { label: "ns <name>", hint: "switch namespace (0 = all)", run: () => setCmdText("ns ") },
         { label: "0", hint: "all namespaces", run: () => pickNamespace("") },
         { label: "ctx <name>", hint: "switch cluster", run: () => setCmdText("ctx ") },
       ];
     }
-    const byKey = new Map(types().map((t) => [typeKey(t).toLowerCase(), t]));
-    const hits: ResourceType[] = [];
-    const alias = KIND_ALIASES[q];
-    if (alias) {
-      const t = byKey.get(alias.toLowerCase());
-      if (t) hits.push(t);
-    }
-    for (const t of types()) {
-      if (hits.includes(t)) continue;
-      if (t.kind.toLowerCase().startsWith(q)) hits.push(t);
-    }
-    for (const t of types()) {
-      if (hits.includes(t)) continue;
-      if (t.kind.toLowerCase().includes(q) || t.group.includes(q)) hits.push(t);
-    }
-    return hits.slice(0, 12).map((t) => ({
-      label: t.kind,
-      hint: t.group || "core",
-      // Open the table (select() sets pane=table + cursor on row 0 and
-      // highlights the kind in the sidebar), reveal the kind so it's
-      // visible, and focus the table so arrows navigate rows right away.
-      run: () => {
-        void select(t);
-        revealInSidebar(t);
-        requestAnimationFrame(() => tableFocusRef?.focus());
-      },
-    }));
+    // Resource kind, optionally with a k9s-style modifier (namespace,
+    // /name filter, k=v label selector, or @ctx). The first whitespace
+    // splits the kind from its argument.
+    const parts = raw.split(/\s+/);
+    const head = (parts[0] ?? "").toLowerCase();
+    const rest = parts.slice(1).join(" ").trim();
+    return resolveKinds(head)
+      .slice(0, 12)
+      .map((t) => kindItem(t, rest));
   });
 
   function runCmd(item: CmdItem | undefined) {
@@ -7392,7 +7477,7 @@ function App() {
                 <h3>Keyboard shortcuts</h3>
                 <div class="help-grid">
                   <b class="help-sec">table</b>
-                  <b>:</b><span>command palette (kinds · ns · ctx)</span>
+                  <b>:</b><span>palette — kind · kind ns · kind /name · kind k=v · kind @ctx · ns · ctx</span>
                   <b>/</b><span>search rows (any field value)</span>
                   <b>esc</b><span>step up: detail → table → sidebar</span>
                   <b>j k ↑ ↓</b><span>move cursor · g/G first/last</span>
