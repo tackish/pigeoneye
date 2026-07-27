@@ -1667,23 +1667,72 @@ pub async fn ensure_index(state: &AppState) -> Result<(), String> {
     .await
 }
 
+/// Below this row count a single-threaded scan already runs in well under
+/// a millisecond, so spinning up worker threads would cost more than it
+/// saves. Above it, the full-text blobs (every field of tens of thousands
+/// of objects) make the parallel split worthwhile.
+const PARALLEL_FILTER_MIN: usize = 4000;
+
 pub async fn filter_rows(state: &AppState, query: String) -> Result<Vec<String>, String> {
     let terms: Vec<String> = query
         .to_lowercase()
         .split_whitespace()
         .map(String::from)
         .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
     let s = state.search.read().await;
+    let n = s.blobs.len();
     // Return the matched rows' keys (namespace/name), not positional
     // indices: the frontend list is reordered by the watch informer
     // independently of this cache, so an index would point at the wrong
     // row. A key stays correct no matter how the list is spliced.
-    Ok(s.blobs
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| terms.iter().all(|t| b.contains(t.as_str())))
-        .filter_map(|(i, _)| s.keys.get(i).cloned())
-        .collect())
+    if n < PARALLEL_FILTER_MIN {
+        return Ok(s
+            .blobs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| terms.iter().all(|t| b.contains(t.as_str())))
+            .filter_map(|(i, _)| s.keys.get(i).cloned())
+            .collect());
+    }
+    // Big list: split the scan across cores. Scoped threads borrow the
+    // blobs/keys under the read guard, so nothing is cloned; the guard only
+    // holds off a re-index for the few milliseconds the scan takes. Chunks
+    // are appended in order, so results stay in blob order like the plain
+    // path above.
+    let workers = std::thread::available_parallelism()
+        .map(|c| c.get().min(8))
+        .unwrap_or(4);
+    let chunk = n.div_ceil(workers);
+    let blobs = &s.blobs;
+    let keys = &s.keys;
+    let terms = &terms;
+    let mut out: Vec<String> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let start = w * chunk;
+                let end = ((w + 1) * chunk).min(n);
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    for i in start..end {
+                        if terms.iter().all(|t| blobs[i].contains(t.as_str())) {
+                            if let Some(k) = keys.get(i) {
+                                local.push(k.clone());
+                            }
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        for h in handles {
+            out.extend(h.join().unwrap_or_default());
+        }
+    });
+    Ok(out)
 }
 
 const SERVER_MANAGED_META: [&str; 7] = [
@@ -2235,41 +2284,56 @@ pub async fn get_events(
     kind: String,
 ) -> Result<Vec<EventInfo>, String> {
     let client = client(state, &context).await?;
-    let ar = KubeApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "Event"));
-    let api: Api<DynamicObject> = match namespace.as_deref() {
-        Some(ns) if !ns.is_empty() => Api::namespaced_with(client, ns, &ar),
-        _ => Api::all_with(client, &ar),
-    };
     let selector = format!("involvedObject.name={name},involvedObject.kind={kind}");
-    let list = api
-        .list(&ListParams::default().fields(&selector).limit(100))
-        .await
+    let base = match namespace.as_deref() {
+        Some(ns) if !ns.is_empty() => format!("/api/v1/namespaces/{ns}/events"),
+        _ => "/api/v1/events".to_string(),
+    };
+    // resourceVersion=0 serves the list from the API server's watch cache
+    // instead of a quorum read out of etcd. The events tail doesn't need to
+    // be perfectly fresh, and a Node's detail has no namespace to scope to —
+    // so it reads events cluster-wide, which is dramatically slower as a
+    // quorum read on a busy cluster (the same reason `kubectl get events`
+    // drags). This is the single biggest win for node-detail event latency.
+    let url = format!(
+        "{base}?fieldSelector={}&limit=100&resourceVersion=0",
+        urlencode(&selector),
+    );
+    let req = http::Request::get(&url)
+        .header(http::header::ACCEPT, "application/json")
+        .body(Vec::new())
         .map_err(err)?;
-    let mut out: Vec<EventInfo> = list
-        .items
-        .iter()
-        .map(|o| {
-            let v = serde_json::to_value(o).unwrap_or_default();
-            let last = v["lastTimestamp"]
-                .as_str()
-                .or_else(|| v["eventTime"].as_str())
-                .or_else(|| v.pointer("/metadata/creationTimestamp").and_then(|t| t.as_str()))
-                .map(String::from);
-            EventInfo {
-                type_: v["type"].as_str().unwrap_or("Normal").to_string(),
-                reason: v["reason"].as_str().unwrap_or_default().to_string(),
-                message: v["message"].as_str().unwrap_or_default().to_string(),
-                count: v["count"].as_i64().unwrap_or(1),
-                last,
-                source: v
-                    .pointer("/source/component")
-                    .and_then(|c| c.as_str())
-                    .or_else(|| v.pointer("/reportingComponent").and_then(|c| c.as_str()))
-                    .unwrap_or_default()
-                    .to_string(),
-            }
+    let list: serde_json::Value = client.request(req).await.map_err(err)?;
+    let mut out: Vec<EventInfo> = list["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| {
+                    let last = v["lastTimestamp"]
+                        .as_str()
+                        .or_else(|| v["eventTime"].as_str())
+                        .or_else(|| {
+                            v.pointer("/metadata/creationTimestamp").and_then(|t| t.as_str())
+                        })
+                        .map(String::from);
+                    EventInfo {
+                        type_: v["type"].as_str().unwrap_or("Normal").to_string(),
+                        reason: v["reason"].as_str().unwrap_or_default().to_string(),
+                        message: v["message"].as_str().unwrap_or_default().to_string(),
+                        count: v["count"].as_i64().unwrap_or(1),
+                        last,
+                        source: v
+                            .pointer("/source/component")
+                            .and_then(|c| c.as_str())
+                            .or_else(|| v.pointer("/reportingComponent").and_then(|c| c.as_str()))
+                            .unwrap_or_default()
+                            .to_string(),
+                    }
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     // newest first
     out.sort_by(|a, b| b.last.cmp(&a.last));
     Ok(out)
