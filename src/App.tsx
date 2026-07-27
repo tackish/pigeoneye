@@ -692,6 +692,15 @@ function App() {
   const [upgrading, setUpgrading] = createSignal(false);
   const [upgradeDone, setUpgradeDone] = createSignal(false);
   const [upgradeErr, setUpgradeErr] = createSignal("");
+  // Context tabs collapse into a ▾ dropdown when they can't all fit, so a
+  // context scrolled off the edge is never silently hidden.
+  const [tabsOverflow, setTabsOverflow] = createSignal(false);
+  const [tabsMenuOpen, setTabsMenuOpen] = createSignal(false);
+  let tabsStripRef: HTMLDivElement | undefined;
+  const measureTabs = () => {
+    const el = tabsStripRef;
+    if (el) setTabsOverflow(el.scrollWidth > el.clientWidth + 1);
+  };
   const updateAvailable = createMemo(
     () =>
       !!appVersion() &&
@@ -816,6 +825,28 @@ function App() {
   const [nsQuery, setNsQuery] = createSignal("");
   const [tabs, setTabs] = createSignal<string[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
+  // Watch the tab strip for overflow. RO catches width changes; a tabs()
+  // change that doesn't resize the strip is re-measured by the effect below.
+  onMount(() => {
+    if (!tabsStripRef) return;
+    const ro = new ResizeObserver(() => requestAnimationFrame(measureTabs));
+    ro.observe(tabsStripRef);
+    onCleanup(() => ro.disconnect());
+  });
+  createEffect(() => {
+    tabs();
+    requestAnimationFrame(measureTabs);
+  });
+  // Keep the active tab in view within the strip (it may be scrolled off).
+  createEffect(() => {
+    const a = active();
+    if (!a) return;
+    requestAnimationFrame(() =>
+      tabsStripRef
+        ?.querySelector<HTMLElement>(".tab.active")
+        ?.scrollIntoView({ inline: "nearest", block: "nearest" }),
+    );
+  });
   const [connecting, setConnecting] = createSignal<string | null>(null);
   // True from launch while last session's tabs reconnect, so the launcher
   // (context picker) doesn't flash before the restored tabs appear. We know
@@ -2466,6 +2497,11 @@ function App() {
   let indexed = false;
   let indexPromise: Promise<unknown> | null = null;
   const [indexing, setIndexing] = createSignal(false);
+  // Reactive mirror of `indexed`: false until the current list's full-text
+  // index is built. While a filter is active and this is false, the count
+  // is provisional (deep-field matches haven't been scanned yet), so the
+  // badge shows "searching…" instead of a misleading "0".
+  const [deepReady, setDeepReady] = createSignal(false);
 
   function onRowFilterInput(value: string) {
     setRowFilter(value);
@@ -2492,8 +2528,8 @@ function App() {
         // Keystrokes during the build share one request and re-filter
         // with whatever is typed by the time it lands.
         if (!indexed) {
+          setIndexing(true);
           if (!indexPromise) {
-            setIndexing(true);
             const buildSeq = listSeq;
             indexPromise = invoke("ensure_index").finally(() => {
               // A resource switch during the build bumps listSeq and
@@ -2501,6 +2537,7 @@ function App() {
               // new list as indexed.
               if (buildSeq !== listSeq) return;
               indexed = true;
+              setDeepReady(true);
               indexPromise = null;
               setIndexing(false);
             });
@@ -2512,7 +2549,10 @@ function App() {
           }
         }
       } catch {
+        // Index build failed (offline, etc.): settle the UI on whatever the
+        // seed matched rather than spinning "searching…" forever.
         setIndexing(false);
+        setDeepReady(true);
       }
     }, 80);
   }
@@ -2549,6 +2589,7 @@ function App() {
     if (tableFocusRef) tableFocusRef.scrollTop = 0;
     setScrollTop(0);
     indexed = false;
+    setDeepReady(false);
     indexPromise = null;
     filterSeq++;
     closeDetail();
@@ -2590,6 +2631,7 @@ function App() {
         // without needing a search.
         if (!indexed && !indexPromise) {
           const buildSeq = listSeq;
+          setIndexing(true);
           indexPromise = invoke("ensure_index")
             .then(() => {
               if (active() === ctx && selected() === rt) void loadPodStats(ctx, ns);
@@ -2597,7 +2639,9 @@ function App() {
             .finally(() => {
               if (buildSeq !== listSeq) return; // superseded by a switch
               indexed = true;
+              setDeepReady(true);
               indexPromise = null;
+              setIndexing(false);
             });
         }
       }
@@ -4961,19 +5005,42 @@ function App() {
   // Ask GitHub for the latest release tag. Best-effort: any failure
   // (offline, rate-limited, private) just leaves the version chip plain.
   let lastReleaseCheck = 0;
-  async function checkLatestRelease() {
+  async function checkLatestRelease(): Promise<boolean> {
     lastReleaseCheck = Date.now();
     try {
       const res = await fetch(
         "https://api.github.com/repos/tackish/pigeoneye/releases/latest",
         { headers: { Accept: "application/vnd.github+json" } },
       );
-      if (!res.ok) return;
+      if (!res.ok) return false;
       const tag = (await res.json())?.tag_name;
-      if (typeof tag === "string") setLatestVersion(tag);
+      if (typeof tag === "string") {
+        setLatestVersion(tag);
+        return true;
+      }
+      return false;
     } catch {
-      /* offline — chip stays plain */
+      /* offline / rate-limited — chip stays plain */
+      return false;
     }
+  }
+
+  // Clicking the plain version chip forces a check right now, with visible
+  // feedback — the automatic 15-min/focus checks can silently fail (GitHub
+  // rate limit, offline), which is why "no update button after a release"
+  // happens. If a newer release turns up, updateAvailable() flips and the
+  // chip becomes the upgrade button on its own.
+  const [checkingUpdate, setCheckingUpdate] = createSignal(false);
+  const [checkNote, setCheckNote] = createSignal("");
+  async function manualUpdateCheck() {
+    if (checkingUpdate() || updateAvailable()) return;
+    setCheckingUpdate(true);
+    setCheckNote("");
+    const ok = await checkLatestRelease();
+    setCheckingUpdate(false);
+    if (!ok) setCheckNote("check failed");
+    else if (!updateAvailable()) setCheckNote("up to date");
+    if (checkNote()) window.setTimeout(() => setCheckNote(""), 2500);
   }
 
   // Check at startup, then keep checking so a release cut while the app is
@@ -5350,9 +5417,18 @@ function App() {
           <Show
             when={updateAvailable()}
             fallback={
-              <span class="app-ver" title="installed version">
-                v{appVersion()}
-              </span>
+              <button
+                class="app-ver check"
+                disabled={checkingUpdate()}
+                title="installed version — click to check for updates"
+                onClick={() => void manualUpdateCheck()}
+              >
+                {checkingUpdate()
+                  ? "checking…"
+                  : checkNote()
+                    ? `v${appVersion()} · ${checkNote()}`
+                    : `v${appVersion()}`}
+              </button>
             }
           >
             <button
@@ -5381,29 +5457,72 @@ function App() {
             </button>
           </Show>
         </Show>
-        <div class="tabs">
-          <For each={tabs()}>
-            {(name) => (
-              <div
-                class="tab"
-                classList={{ active: active() === name }}
-                style={{ "--ctx-hue": ctxHue(name) }}
-                onClick={() => active() !== name && activate(name)}
-              >
-                <span class="ctx-dot" />
-                <span class="tab-name">{name}</span>
-                <button
-                  class="tab-close"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(name);
-                  }}
+        <div class="tabs-area">
+          <div class="tabs" ref={(el) => (tabsStripRef = el)}>
+            <For each={tabs()}>
+              {(name) => (
+                <div
+                  class="tab"
+                  classList={{ active: active() === name }}
+                  style={{ "--ctx-hue": ctxHue(name) }}
+                  onClick={() => active() !== name && activate(name)}
                 >
-                  ✕
-                </button>
+                  <span class="ctx-dot" />
+                  <span class="tab-name">{name}</span>
+                  <button
+                    class="tab-close"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(name);
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+          <Show when={tabsOverflow()}>
+            <button
+              class="tabs-more"
+              classList={{ open: tabsMenuOpen() }}
+              title="all connected clusters"
+              onClick={() => setTabsMenuOpen(!tabsMenuOpen())}
+            >
+              ▾ {tabs().length}
+            </button>
+            <Show when={tabsMenuOpen()}>
+              <div class="tabs-backdrop" onClick={() => setTabsMenuOpen(false)} />
+              <div class="tabs-pop">
+                <For each={tabs()}>
+                  {(name) => (
+                    <div
+                      class="tabs-pop-row"
+                      classList={{ active: active() === name }}
+                      style={{ "--ctx-hue": ctxHue(name) }}
+                      onClick={() => {
+                        setTabsMenuOpen(false);
+                        if (active() !== name) activate(name);
+                      }}
+                    >
+                      <span class="ctx-dot" />
+                      <span class="tabs-pop-name">{name}</span>
+                      <button
+                        class="tab-close"
+                        title="close context"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          closeTab(name);
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  )}
+                </For>
               </div>
-            )}
-          </For>
+            </Show>
+          </Show>
         </div>
         <select
           class="ctx"
@@ -6150,18 +6269,32 @@ function App() {
                     volatile indexing / loading indicators trail after it
                     and grow into empty space instead of shoving it. */}
                 <span class="badge">
-                  {rowCount()} {selected()?.plural ?? "items"}
-                  <Show when={dsCount() > 0}>
-                    <span class="dim" title="DaemonSet pods (one per node) are sorted to the bottom">
-                      {" · "}
-                      {dsCount()} daemonset
-                    </span>
-                  </Show>
-                  <Show when={live()}>
-                    <span class="live-dot" title="live: updates arrive as they happen" />
-                  </Show>
-                  <Show when={indexing()}>
-                    <span class="dim"> · indexing…</span>
+                  {/* While filtering, the count is provisional until the
+                      full-text index is built — deep-field matches haven't
+                      been scanned yet. Show "searching…" instead of a
+                      misleading "0" that looks like a re-index. */}
+                  <Show
+                    when={rowFilter().trim() && !deepReady()}
+                    fallback={
+                      <>
+                        {rowCount()} {selected()?.plural ?? "items"}
+                        <Show when={dsCount() > 0}>
+                          <span class="dim" title="DaemonSet pods (one per node) are sorted to the bottom">
+                            {" · "}
+                            {dsCount()} daemonset
+                          </span>
+                        </Show>
+                        <Show when={live()}>
+                          <span class="live-dot" title="live: updates arrive as they happen" />
+                        </Show>
+                        <Show when={indexing()}>
+                          <span class="dim"> · indexing…</span>
+                        </Show>
+                      </>
+                    }
+                  >
+                    <span class="badge-spin" />
+                    <span class="dim"> searching {selected()?.plural ?? "items"}…</span>
                   </Show>
                   <Show when={streaming()}>
                     <span class="dim loading-more">
@@ -6275,7 +6408,7 @@ function App() {
                 when={rowCount() > 0}
                 fallback={
                   <Show
-                    when={indexing() && rowFilter().trim()}
+                    when={rowFilter().trim() && !deepReady()}
                     fallback={
                       <div class="empty">
                         <img class="mascot tilt" src={puzzledUrl} alt="" />

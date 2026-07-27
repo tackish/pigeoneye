@@ -195,6 +195,22 @@ button.app-ver:hover:not(:disabled) {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg));
 }
+/* The plain "check for updates" state: no celebration, just a quiet chip. */
+button.app-ver.check {
+  color: var(--dim);
+  border-color: var(--border);
+  background: transparent;
+  font-weight: 400;
+  animation: none;
+}
+button.app-ver.check::after {
+  display: none;
+}
+button.app-ver.check:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
 button.app-ver:disabled {
   opacity: 0.75;
   cursor: default;
@@ -227,17 +243,99 @@ button.app-ver.err::after {
 
 /* ── context tabs ────────────────────────────────────── */
 
+/* Strip + overflow dropdown. The area caps the whole thing; the strip
+   inside it scrolls, and a ▾ button appears when tabs don't all fit. */
+.tabs-area {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 50%;
+  position: relative;
+}
+
 .tabs {
   display: flex;
   align-items: center;
   gap: 4px;
   overflow-x: auto;
   scrollbar-width: none;
-  max-width: 50%;
+  flex: 1;
+  min-width: 0;
 }
 
 .tabs::-webkit-scrollbar {
   display: none;
+}
+
+/* ▾ N — reveals every connected context so none is hidden off-edge. */
+.tabs-more {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  padding: 3px 7px;
+  white-space: nowrap;
+}
+.tabs-more:hover,
+.tabs-more.open {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.tabs-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+}
+.tabs-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 21;
+  min-width: 220px;
+  max-width: 360px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.tabs-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--dim);
+  font-size: 12px;
+  font-family: var(--font-ui);
+}
+.tabs-pop-row:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.tabs-pop-row.active {
+  color: var(--fg);
+  font-weight: 600;
+  background: color-mix(in srgb, hsl(var(--ctx-hue, 240) 62% 56%) 14%, transparent);
+}
+.tabs-pop-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Browser/editor-style tabs. Inactive tabs are quiet and flat; the active
