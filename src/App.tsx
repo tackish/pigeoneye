@@ -1994,6 +1994,9 @@ function App() {
   const [events, setEvents] = createSignal<EventInfo[]>([]);
   // Per-event copy feedback (which event just showed "✓").
   const [copiedEv, setCopiedEv] = createSignal<EventInfo | null>(null);
+  // "copy all" (events) and per-secret-value copy feedback.
+  const [copiedAll, setCopiedAll] = createSignal(false);
+  const [copiedSecret, setCopiedSecret] = createSignal<string | null>(null);
   // Pods running on the open node, shown inline so you don't have to
   // navigate away to see what a node is carrying.
   const [nodePods, setNodePods] = createSignal<ResourceTable | null>(null);
@@ -2034,8 +2037,18 @@ function App() {
     const who = detail() ? `${selected()?.kind ?? ""}/${detail()!.name}\n` : "";
     try {
       await navigator.clipboard.writeText(who + events().map(eventText).join("\n"));
-      setCopiedEv(events()[0] ?? null);
-      setTimeout(() => setCopiedEv(null), 1200);
+      setCopiedAll(true);
+      setTimeout(() => setCopiedAll(false), 1200);
+    } catch (e) {
+      setActionErr(`could not copy: ${String(e)}`);
+    }
+  }
+  /// Copy one decoded Secret value, with per-row "copied ✓" feedback.
+  async function copySecret(k: string, v: string) {
+    try {
+      await navigator.clipboard.writeText(v);
+      setCopiedSecret(k);
+      setTimeout(() => setCopiedSecret((c) => (c === k ? null : c)), 1200);
     } catch (e) {
       setActionErr(`could not copy: ${String(e)}`);
     }
@@ -7224,11 +7237,9 @@ function App() {
                               <button
                                 class="btn sm"
                                 title="copy the decoded value"
-                                onClick={() =>
-                                  void navigator.clipboard.writeText(v)
-                                }
+                                onClick={() => void copySecret(k, v)}
                               >
-                                copy
+                                {copiedSecret() === k ? "copied ✓" : "copy"}
                               </button>
                             </div>
                           )}
@@ -7336,7 +7347,7 @@ function App() {
                               void copyAllEvents();
                             }}
                           >
-                            copy all
+                            {copiedAll() ? "copied ✓" : "copy all"}
                           </button>
                         </summary>
                         <div class="ev-list">
