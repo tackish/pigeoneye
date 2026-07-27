@@ -2061,6 +2061,40 @@ kbd.key {
 
 /* Pods on a node — inline mini-list inside the node detail panel, so you
    can see what a node carries without leaving it. */
+/* Live drain indicator in the node pod-list header. Default = in flight
+   (amber); .done = complete (accent/green); .stalled = blocked (red). */
+.drain-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.drain-badge.done {
+  color: var(--good, #4ec9a0);
+  border-color: color-mix(in srgb, var(--good, #4ec9a0) 55%, transparent);
+  background: color-mix(in srgb, var(--good, #4ec9a0) 12%, transparent);
+}
+.drain-badge.stalled {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+}
+
+/* Controller column in the node pod list: DaemonSet pods (the ones drain
+   leaves behind) stand out; everything else is quiet. */
+.np td.np-ds {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .np-note {
   font-size: 12px;
   margin: 2px 0 10px;
@@ -2644,17 +2678,39 @@ kbd.key {
   vertical-align: middle;
 }
 
+/* Collapsible sections read as clickable accordion headers — an accent
+   chevron that rotates open, and a hover background — so a foldable
+   section (Annotations, Status, Events…) is visibly different from a
+   plain, non-collapsible title. */
 details.fold > summary {
   cursor: pointer;
   list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px -6px 5px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+details.fold > summary:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
 }
 
 details.fold > summary::before {
-  content: "▸ ";
+  content: "▸";
+  color: var(--accent);
+  font-size: 9px;
+  line-height: 1;
+  transition: transform 0.12s ease;
 }
 
 details.fold[open] > summary::before {
-  content: "▾ ";
+  transform: rotate(90deg);
 }
 
 .anno-list {

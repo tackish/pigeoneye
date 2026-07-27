@@ -2041,6 +2041,10 @@ function App() {
   /// Which section of the open detail panel the keyboard is on.
   const [panelSec, setPanelSec] = createSignal<string>("meta");
   const [actionIdx, setActionIdx] = createSignal(0);
+  // In a content section (not a button row), -1 = the section header is
+  // focused (Enter toggles / opens), 0+ = one of its aux buttons (copy) is
+  // focused via →, so those buttons are keyboard-reachable too.
+  const [secBtn, setSecBtn] = createSignal(-1);
 
   /// Forwards belonging to the resource in the open panel.
   const podForwards = createMemo(() => {
@@ -2076,6 +2080,29 @@ function App() {
     containers: ".drawer .ctr-list",
     apply: ".drawer .yaml-actions",
   };
+
+  // Aux buttons inside a *content* section (copy / copy all) — reachable
+  // with → even though the section's Enter still does its primary action
+  // (toggle the fold / open the editor).
+  const SECTION_BUTTONS: Record<string, string> = {
+    events: ".drawer [data-sec='events'] .ev-copyall",
+    yaml: ".drawer [data-sec='yaml'] .copy-btn",
+  };
+  function sectionButtons(sec: string): HTMLElement[] {
+    const sel = SECTION_BUTTONS[sec];
+    if (!sel) return [];
+    return [...document.querySelectorAll<HTMLElement>(`${sel}:not(:disabled)`)];
+  }
+  function paintSecBtn(sec: string, idx: number) {
+    document
+      .querySelectorAll(".btn-cursor")
+      .forEach((el) => el.classList.remove("btn-cursor"));
+    const el = sectionButtons(sec)[idx];
+    if (el) {
+      el.classList.add("btn-cursor");
+      el.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  }
 
   function rowItems(sec: string): HTMLElement[] {
     const sel = BUTTON_ROWS[sec];
@@ -2132,6 +2159,7 @@ function App() {
     const next = Math.min(Math.max(i + delta, 0), secs.length - 1);
     const sec = secs[next];
     setPanelSec(sec);
+    setSecBtn(-1); // new section → land on its header, not an aux button
     // Always bring the section into view first — Apply/Reset are
     // disabled until the manifest changes, so a cursor-only scroll
     // would leave the row off-screen.
@@ -2870,15 +2898,19 @@ function App() {
     await showDetail(null, name);
   }
 
-  /// The pods on a node, fetched once for the inline list in the node
-  /// panel. `key` guards against a stale response landing after the user
-  /// has already opened a different node.
-  async function loadNodePods(nodeName: string, key: string) {
+  /// The pods on a node, fetched for the inline list in the node panel.
+  /// `key` guards against a stale response landing after the user has
+  /// opened a different node. `silent` refreshes in place (no spinner, no
+  /// blanking) — used by the drain poll so the list updates without a
+  /// flash every couple of seconds.
+  async function loadNodePods(nodeName: string, key: string, silent = false) {
     const pod = types().find((x) => x.group === "" && x.kind === "Pod");
     if (!pod) return;
-    setNodePods(null);
-    setNodePodsErr("");
-    setNodePodsLoading(true);
+    if (!silent) {
+      setNodePods(null);
+      setNodePodsErr("");
+      setNodePodsLoading(true);
+    }
     try {
       const t = await invoke<ResourceTable>("list_snapshot", {
         context: active(),
@@ -2888,11 +2920,83 @@ function App() {
       });
       if (detailKey() === key) setNodePods(t);
     } catch (e) {
-      if (detailKey() === key) setNodePodsErr(String(e));
+      if (!silent && detailKey() === key) setNodePodsErr(String(e));
     } finally {
-      if (detailKey() === key) setNodePodsLoading(false);
+      if (!silent && detailKey() === key) setNodePodsLoading(false);
     }
   }
+
+  // Live drain progress. drain_node only *issues* evictions and returns, so
+  // pods then terminate over their grace period — polling the node's pod
+  // list is how you actually watch them go. Three terminal states: draining
+  // (in flight), done (only DaemonSet/mirror pods left = a complete drain),
+  // stalled (something refuses to leave, almost always a PDB).
+  const [draining, setDraining] = createSignal<string | null>(null);
+  const [drainDone, setDrainDone] = createSignal<string | null>(null);
+  const [drainStalled, setDrainStalled] = createSignal<string | null>(null);
+  let drainPollId: number | undefined;
+  const drainRemaining = createMemo(() => {
+    const t = nodePods();
+    if (!t) return null;
+    // Evictable = what drain won't skip. DaemonSet pods are skipped (the
+    // DaemonSet controller re-places them, so drain leaves them); mirror
+    // pods are rare and not distinguishable from a row, so this is a
+    // close-enough "still to go" count.
+    const evictable = t.rows.filter((r) => r.owner_kind !== "DaemonSet").length;
+    return { total: t.rows.length, evictable };
+  });
+  function resetDrainState() {
+    setDrainDone(null);
+    setDrainStalled(null);
+  }
+  function stopDrainPoll() {
+    if (drainPollId != null) window.clearInterval(drainPollId);
+    drainPollId = undefined;
+    setDraining(null);
+  }
+  function startDrainPoll(node: string) {
+    stopDrainPoll();
+    resetDrainState();
+    setDraining(node);
+    const key = `/${node}`; // nodes are cluster-scoped: showDetail key is "/<name>"
+    const started = Date.now();
+    let prev = -1;
+    let stall = 0;
+    const tick = async () => {
+      // Only meaningful while looking at this node; give up after 5 min.
+      if (detailKey() !== key || Date.now() - started > 5 * 60 * 1000) {
+        stopDrainPoll();
+        return;
+      }
+      await loadNodePods(node, key, true);
+      if (detailKey() !== key) return;
+      // Only judge off a real pod list — a null list (load failed) must not
+      // read as "0 evictable".
+      const rem = drainRemaining();
+      if (!rem) return;
+      if (rem.evictable === 0) {
+        // Only DaemonSet/mirror pods left: that IS a complete drain (kubectl
+        // drain --ignore-daemonsets stops here too). Node is ready to remove.
+        setDrainDone(node);
+        stopDrainPoll();
+        return;
+      }
+      // No progress for ~20s → something is refusing to be evicted, almost
+      // always a PodDisruptionBudget. Stop spinning and say what's stuck.
+      if (rem.evictable === prev) {
+        if (++stall >= 8) {
+          setDrainStalled(node);
+          stopDrainPoll();
+        }
+      } else {
+        stall = 0;
+        prev = rem.evictable;
+      }
+    };
+    drainPollId = window.setInterval(() => void tick(), 2500);
+    void tick();
+  }
+  onCleanup(stopDrainPoll);
 
   /// Drill from a pod in the node's inline list into that pod's own
   /// detail — landing on the pods-on-node view so the "← node" trail back
@@ -2988,8 +3092,10 @@ function App() {
     setFindQ("");
     setPanelSec("actions");
     setActionIdx(0);
+    setSecBtn(-1);
     setNodePods(null);
     setNodePodsErr("");
+    resetDrainState(); // the "drained/stalled" chip belongs to one node view
     setDetailLoading(true);
     // Events (and, for a node, its pod list) don't depend on the detail
     // fetch, so fire them in parallel instead of after it. Gating them
@@ -4003,13 +4109,16 @@ function App() {
     setDlgIdx(1);
     setConfirm({
       title: `Drain node ${d.name}?`,
-      body: "The node is cordoned, then every pod except DaemonSets and mirror pods is evicted (PodDisruptionBudgets respected).",
+      body: "The node will be cordoned, then every pod except DaemonSets and mirror pods will be evicted (PodDisruptionBudgets respected). DaemonSet and mirror pods are left in place by design — once only those remain, the drain is complete.",
       label: "Drain node",
       danger: true,
-      run: () =>
+      run: () => {
         void runAction("drain", () =>
           invoke<string>("drain_node", { context: active(), name: d.name }),
-        ),
+        );
+        // Watch the pods drain in the node panel (if it's the open node).
+        if (detailKey() === `/${d.name}`) startDrainPoll(d.name);
+      },
     });
   }
 
@@ -4657,6 +4766,7 @@ function App() {
       if (e.key === "Enter") {
         e.preventDefault();
         if (BUTTON_ROWS[panelSec()]) pressRowButton();
+        else if (secBtn() >= 0) sectionButtons(panelSec())[secBtn()]?.click();
         else activatePanelSection();
         return;
       }
@@ -4664,6 +4774,27 @@ function App() {
         if (BUTTON_ROWS[panelSec()]) {
           e.preventDefault();
           moveWithinRow(e.key === "ArrowRight" ? 1 : -1);
+          return;
+        }
+        // Content sections: → steps onto their copy button(s); ← steps
+        // back to the header, then (a second ←) closes the detail.
+        const btns = sectionButtons(panelSec());
+        if (btns.length && e.key === "ArrowRight" && secBtn() < btns.length - 1) {
+          e.preventDefault();
+          const n = secBtn() + 1;
+          setSecBtn(n);
+          paintSecBtn(panelSec(), n);
+          return;
+        }
+        if (e.key === "ArrowLeft" && secBtn() >= 0) {
+          e.preventDefault();
+          const n = secBtn() - 1;
+          setSecBtn(n);
+          if (n >= 0) paintSecBtn(panelSec(), n);
+          else
+            document
+              .querySelectorAll(".btn-cursor")
+              .forEach((el) => el.classList.remove("btn-cursor"));
           return;
         }
         if (e.key === "ArrowLeft") {
@@ -6901,6 +7032,28 @@ function App() {
                         <Show when={nodePods()}>
                           <span class="dim"> ({nodePods()!.rows.length})</span>
                         </Show>
+                        <Show when={draining() === detail()?.name}>
+                          <span class="drain-badge">
+                            <span class="badge-spin" />
+                            draining — {drainRemaining()?.evictable ?? 0} to evict
+                          </span>
+                        </Show>
+                        <Show when={drainDone() === detail()?.name}>
+                          <span
+                            class="drain-badge done"
+                            title="only DaemonSet/mirror pods remain — a complete drain. The node can now be removed."
+                          >
+                            ✓ drained — DaemonSet/mirror pods remain
+                          </span>
+                        </Show>
+                        <Show when={drainStalled() === detail()?.name}>
+                          <span
+                            class="drain-badge stalled"
+                            title="eviction made no progress — usually a PodDisruptionBudget refusing it"
+                          >
+                            {drainRemaining()?.evictable ?? 0} won't evict — PodDisruptionBudget?
+                          </span>
+                        </Show>
                       </div>
                       <Show
                         when={!nodePodsLoading()}
@@ -6919,6 +7072,7 @@ function App() {
                                 <thead>
                                   <tr>
                                     <th>Namespace</th>
+                                    <th>Controller</th>
                                     <For each={nodePodCols()}>
                                       {(col) => <th>{col.c.name}</th>}
                                     </For>
@@ -6937,6 +7091,23 @@ function App() {
                                         }
                                       >
                                         <td class="dim">{r.namespace}</td>
+                                        {/* Controller as its own column so
+                                            DaemonSet pods (the ones drain
+                                            leaves behind) are unmistakable and
+                                            never clipped by a long pod name. */}
+                                        <td
+                                          classList={{
+                                            "np-ds": r.owner_kind === "DaemonSet",
+                                            dim: r.owner_kind !== "DaemonSet",
+                                          }}
+                                          title={
+                                            r.owner_kind === "DaemonSet"
+                                              ? "DaemonSet pod — drain leaves these in place"
+                                              : undefined
+                                          }
+                                        >
+                                          {r.owner_kind ?? "—"}
+                                        </td>
                                         <For each={nodePodCols()}>
                                           {(col) => (
                                             <td
@@ -7122,15 +7293,14 @@ function App() {
                       data-sec="events"
                       classList={{ cur: panelSec() === "events" }}
                     >
+                      {/* Events start open every time — they're usually why
+                          the panel was opened. `true` is a constant (no
+                          reactive dep), so it only sets the initial state;
+                          the user can still collapse it with v / Enter / click. */}
                       <details
                         class="fold"
                         ref={(el) => (eventFoldRef = el)}
-                        open={
-                          events().some((e) => e.type_ === "Warning") ||
-                          findMatches(
-                            events().map((e) => `${e.reason} ${e.message}`).join("\n"),
-                          )
-                        }
+                        open={true}
                       >
                         <summary class="section-title">
                           Events ({events().length})
@@ -7636,8 +7806,9 @@ function App() {
                   <b>Esc</b><span>close → clear filter → view history back</span>
                   <b class="help-sec">detail panel</b>
                   <b>↑ ↓ · j k</b><span>move between sections</span>
-                  <b>Enter</b><span>open the focused section (folds · editor)</span>
-                  <b>← h</b><span>back to the table</span>
+                  <b>← →</b><span>reach a section's buttons — actions, copy / copy all, Apply</span>
+                  <b>Enter</b><span>open the focused section (folds · editor) or press its button</span>
+                  <b>← h</b><span>back to the table (from a section header)</span>
                   <b>⇞ ⇟ · g G</b><span>scroll · first / last section</span>
                   <b>⇧J ⇧K</b><span>previous / next resource, panel follows</span>
                   <b>a · t · v</b><span>toggle annotations · status · events</span>
