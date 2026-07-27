@@ -2285,16 +2285,19 @@ pub async fn get_events(
 ) -> Result<Vec<EventInfo>, String> {
     let client = client(state, &context).await?;
     let selector = format!("involvedObject.name={name},involvedObject.kind={kind}");
+    // Events for a cluster-scoped object (Node, PV, ClusterRole, a CRD…)
+    // are created in the "default" namespace by convention — the event
+    // recorder falls back to "default" when the involved object has no
+    // namespace. So scope there instead of listing events cluster-wide,
+    // which is what made a Node's events crawl (all-namespace event lists
+    // are the slow case, cache or not). Namespaced objects keep their own ns.
     let base = match namespace.as_deref() {
         Some(ns) if !ns.is_empty() => format!("/api/v1/namespaces/{ns}/events"),
-        _ => "/api/v1/events".to_string(),
+        _ => "/api/v1/namespaces/default/events".to_string(),
     };
-    // resourceVersion=0 serves the list from the API server's watch cache
-    // instead of a quorum read out of etcd. The events tail doesn't need to
-    // be perfectly fresh, and a Node's detail has no namespace to scope to —
-    // so it reads events cluster-wide, which is dramatically slower as a
-    // quorum read on a busy cluster (the same reason `kubectl get events`
-    // drags). This is the single biggest win for node-detail event latency.
+    // resourceVersion=0 serves from the API server's watch cache instead of
+    // a quorum read out of etcd; the events tail doesn't need to be
+    // perfectly fresh.
     let url = format!(
         "{base}?fieldSelector={}&limit=100&resourceVersion=0",
         urlencode(&selector),
