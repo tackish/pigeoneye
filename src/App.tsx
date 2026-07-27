@@ -697,6 +697,7 @@ function App() {
   const [tabsOverflow, setTabsOverflow] = createSignal(false);
   const [tabsMenuOpen, setTabsMenuOpen] = createSignal(false);
   let tabsStripRef: HTMLDivElement | undefined;
+  let tabsRO: ResizeObserver | undefined;
   const measureTabs = () => {
     const el = tabsStripRef;
     if (el) setTabsOverflow(el.scrollWidth > el.clientWidth + 1);
@@ -825,13 +826,15 @@ function App() {
   const [nsQuery, setNsQuery] = createSignal("");
   const [tabs, setTabs] = createSignal<string[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
-  // Watch the tab strip for overflow. RO catches width changes; a tabs()
-  // change that doesn't resize the strip is re-measured by the effect below.
+  // The strip's ResizeObserver is attached in its ref callback (below) —
+  // the topbar lives behind <Show when={tabs().length}>, so at the
+  // component's onMount the strip may not exist yet; attaching on mount
+  // there would silently no-op forever. A window resize listener is the
+  // belt-and-suspenders trigger, and the effect re-measures on tab changes.
   onMount(() => {
-    if (!tabsStripRef) return;
-    const ro = new ResizeObserver(() => requestAnimationFrame(measureTabs));
-    ro.observe(tabsStripRef);
-    onCleanup(() => ro.disconnect());
+    const onResize = () => requestAnimationFrame(measureTabs);
+    window.addEventListener("resize", onResize);
+    onCleanup(() => window.removeEventListener("resize", onResize));
   });
   createEffect(() => {
     tabs();
@@ -5589,7 +5592,21 @@ function App() {
           </Show>
         </Show>
         <div class="tabs-area">
-          <div class="tabs" ref={(el) => (tabsStripRef = el)}>
+          <div
+            class="tabs"
+            ref={(el) => {
+              // Attach the overflow observer here, not in onMount — this
+              // runs whenever the strip actually mounts (the topbar is
+              // behind a <Show>), so resizing the window re-measures.
+              tabsStripRef = el;
+              tabsRO?.disconnect();
+              tabsRO = new ResizeObserver(() =>
+                requestAnimationFrame(measureTabs),
+              );
+              tabsRO.observe(el);
+              requestAnimationFrame(measureTabs);
+            }}
+          >
             <For each={tabs()}>
               {(name) => (
                 <div
