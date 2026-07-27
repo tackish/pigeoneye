@@ -1041,6 +1041,51 @@ pub async fn cached_list(
     }))
 }
 
+/// One-shot list for an embedded mini-view — e.g. the pods running on a
+/// node, shown inside the node detail panel without leaving it. A single
+/// Metadata page (so each row carries its own namespace across a
+/// cluster-wide query), the same server-side printer columns as the main
+/// list, and no watch / cache / search index. A node holds at most ~110
+/// pods, so one page is the whole answer.
+pub async fn list_snapshot(
+    state: &AppState,
+    context: String,
+    rt: ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+) -> Result<ResourceTable, String> {
+    let client = client(state, &context).await?;
+    let table = fetch_table_page(
+        &client,
+        &rt,
+        namespace.as_deref(),
+        "Metadata",
+        field_selector.as_deref(),
+        None,
+        None,
+    )
+    .await?;
+    let columns: Vec<ColumnDef> = table["columnDefinitions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|c| ColumnDef {
+                    name: c["name"].as_str().unwrap_or_default().to_string(),
+                    priority: c["priority"].as_i64().unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows = rows_from_page(&table, namespace.as_deref());
+    Ok(ResourceTable {
+        columns,
+        rows,
+        truncated: continue_token(&table).is_some(),
+        resource_version: None,
+        include: "Metadata".into(),
+    })
+}
+
 pub async fn list_resources(
     state: &AppState,
     context: String,

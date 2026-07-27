@@ -833,6 +833,21 @@ button.app-ver.err::after {
   white-space: nowrap;
 }
 
+/* A spec.nodeName= filter is the trail back to a node — make it the
+   click target that reopens that node's detail. */
+.fieldsel-back {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 0;
+}
+.fieldsel-back:hover {
+  text-decoration: underline;
+}
+
 .search.wide {
   width: 340px;
 }
@@ -1946,6 +1961,62 @@ kbd.key {
   border-radius: 0 4px 4px 0;
 }
 
+/* Pods on a node — inline mini-list inside the node detail panel, so you
+   can see what a node carries without leaving it. */
+.np-note {
+  font-size: 12px;
+  margin: 2px 0 10px;
+}
+.np-note.bad {
+  color: var(--bad);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.np-wrap {
+  max-height: 260px;
+  overflow: auto;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.np {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.np th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  color: var(--dim);
+  background: var(--bg-drawer);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.np td {
+  padding: 3px 8px;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.np tbody tr {
+  cursor: pointer;
+}
+.np tbody tr:hover {
+  background: var(--accent-soft);
+}
+.np td.dim {
+  color: var(--dim);
+}
+.np td.bad {
+  color: var(--bad);
+}
+
 /* keyboard cursor on the action rows must be unmistakable */
 .btn-cursor {
   outline: 2px solid var(--accent);
@@ -2347,6 +2418,39 @@ kbd.key {
   letter-spacing: 0;
 }
 
+/* Events summary lays out as a row so "copy all" can sit at the far end. */
+[data-sec="events"] > details > summary.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ev-copyall {
+  margin-left: auto;
+}
+
+/* Per-event copy — quiet until the row is hovered or the button is focused. */
+.ev-head .ev-copy {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.ev:hover .ev-copy,
+.ev-copy:focus-visible {
+  opacity: 1;
+}
+.ev-head .ev-copy:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .drawer-find {
   margin: 0 0 10px;
   padding: 3px 8px;
@@ -2543,6 +2647,33 @@ details.fold[open] > summary::before {
   background: var(--bg-drawer);
   border-top: 1px solid var(--border);
   z-index: 2;
+}
+
+/* "force" checkbox beside Apply */
+.force-apply {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--dim);
+  cursor: pointer;
+  user-select: none;
+}
+.force-apply input {
+  accent-color: var(--bad);
+  cursor: pointer;
+}
+.force-apply:has(input:checked) {
+  color: var(--bad);
+}
+/* Keyboard cursor rings the whole label, not the tiny checkbox. */
+.force-apply input.btn-cursor {
+  outline: none;
+}
+.force-apply:has(input.btn-cursor) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 .btn {

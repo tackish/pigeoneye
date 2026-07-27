@@ -112,6 +112,17 @@ async fn cached_list(
 }
 
 #[tauri::command]
+async fn list_snapshot(
+    state: State<'_, AppState>,
+    context: String,
+    resource: ResourceType,
+    namespace: Option<String>,
+    field_selector: Option<String>,
+) -> Result<ResourceTable, String> {
+    k8s::list_snapshot(&state, context, resource, namespace, field_selector).await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn watch_start(
     state: State<'_, AppState>,
@@ -649,6 +660,7 @@ pub fn run() {
             discover,
             list_resources,
             cached_list,
+            list_snapshot,
             watch_start,
             watch_stop,
             get_resource,

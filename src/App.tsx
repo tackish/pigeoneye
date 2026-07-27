@@ -1917,6 +1917,9 @@ function App() {
   const [findQ, setFindQ] = createSignal("");
   const [copied, setCopied] = createSignal(false);
   const [secretShown, setSecretShown] = createSignal(false);
+  // Pre-authorize a force apply from the editor bar, so Apply shows only its
+  // one warning and skips the follow-up conflict/"changed on server" prompt.
+  const [forceApply, setForceApply] = createSignal(false);
   const [dryRun, setDryRun] = createSignal<{ ok: boolean; text: string } | null>(
     null,
   );
@@ -1955,6 +1958,55 @@ function App() {
     }
   }
   const [events, setEvents] = createSignal<EventInfo[]>([]);
+  // Per-event copy feedback (which event just showed "✓").
+  const [copiedEv, setCopiedEv] = createSignal<EventInfo | null>(null);
+  // Pods running on the open node, shown inline so you don't have to
+  // navigate away to see what a node is carrying.
+  const [nodePods, setNodePods] = createSignal<ResourceTable | null>(null);
+  const [nodePodsLoading, setNodePodsLoading] = createSignal(false);
+  const [nodePodsErr, setNodePodsErr] = createSignal("");
+  // The default (priority 0) printer columns, paired with their cell
+  // index — same set the main list shows, minus the wide extras.
+  const nodePodCols = createMemo(() => {
+    const t = nodePods();
+    if (!t) return [] as { c: ColumnDef; i: number }[];
+    return t.columns
+      .map((c, i) => ({ c, i }))
+      .filter(({ c }) => c.priority === 0);
+  });
+
+  /// One event as a self-contained block. Events don't name the object
+  /// they belong to — a node's events read as bare "reason: message" —
+  /// so we prepend the open resource's identity, otherwise a pasted
+  /// event says nothing about *which* node/pod it came from.
+  function eventText(ev: EventInfo): string {
+    const when = ev.last ? `${age(ev.last)} ago` : "";
+    const meta = [when, ev.count > 1 ? `${ev.count}×` : "", ev.source]
+      .filter(Boolean)
+      .join(" · ");
+    return `[${ev.type_}] ${ev.reason} — ${ev.message}${meta ? `  (${meta})` : ""}`;
+  }
+  async function copyEvent(ev: EventInfo) {
+    const who = detail() ? `${selected()?.kind ?? ""}/${detail()!.name}\n` : "";
+    try {
+      await navigator.clipboard.writeText(who + eventText(ev));
+      setCopiedEv(ev);
+      setTimeout(() => setCopiedEv((c) => (c === ev ? null : c)), 1200);
+    } catch (e) {
+      setActionErr(`could not copy: ${String(e)}`);
+    }
+  }
+  async function copyAllEvents() {
+    const who = detail() ? `${selected()?.kind ?? ""}/${detail()!.name}\n` : "";
+    try {
+      await navigator.clipboard.writeText(who + events().map(eventText).join("\n"));
+      setCopiedEv(events()[0] ?? null);
+      setTimeout(() => setCopiedEv(null), 1200);
+    } catch (e) {
+      setActionErr(`could not copy: ${String(e)}`);
+    }
+  }
+
   /// Which section of the open detail panel the keyboard is on.
   const [panelSec, setPanelSec] = createSignal<string>("meta");
   const [actionIdx, setActionIdx] = createSignal(0);
@@ -1971,8 +2023,10 @@ function App() {
   const panelSections = createMemo(() => {
     const d = detail();
     if (!d) return [] as string[];
+    const isNodeKind = selected()?.group === "" && selected()?.kind === "Node";
     return [
       "actions",
+      ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
       ...(d.containers?.length ? ["containers"] : []),
       "meta",
       ...(Object.keys(d.labels).length ? ["labels"] : []),
@@ -1995,8 +2049,12 @@ function App() {
   function rowItems(sec: string): HTMLElement[] {
     const sel = BUTTON_ROWS[sec];
     if (!sel) return [];
+    // Checkboxes (the Apply row's "force") are navigable too; click()
+    // toggles them just like Enter/Space on a button.
     return [
-      ...document.querySelectorAll<HTMLElement>(`${sel} button:not(:disabled)`),
+      ...document.querySelectorAll<HTMLElement>(
+        `${sel} :is(button, input[type="checkbox"]):not(:disabled)`,
+      ),
     ];
   }
 
@@ -2759,6 +2817,54 @@ function App() {
     await select(t, `spec.nodeName=${node}`);
   }
 
+  /// The return trip for `jumpToPodsOnNode`: switch back to Nodes (which
+  /// drops the spec.nodeName filter) and reopen the node we came from.
+  async function backToNode(name: string) {
+    const t = types().find((x) => x.group === "" && x.kind === "Node");
+    if (!t) return;
+    await select(t);
+    await showDetail(null, name);
+  }
+
+  /// The pods on a node, fetched once for the inline list in the node
+  /// panel. `key` guards against a stale response landing after the user
+  /// has already opened a different node.
+  async function loadNodePods(nodeName: string, key: string) {
+    const pod = types().find((x) => x.group === "" && x.kind === "Pod");
+    if (!pod) return;
+    setNodePods(null);
+    setNodePodsErr("");
+    setNodePodsLoading(true);
+    try {
+      const t = await invoke<ResourceTable>("list_snapshot", {
+        context: active(),
+        resource: pod,
+        namespace: null,
+        fieldSelector: `spec.nodeName=${nodeName}`,
+      });
+      if (detailKey() === key) setNodePods(t);
+    } catch (e) {
+      if (detailKey() === key) setNodePodsErr(String(e));
+    } finally {
+      if (detailKey() === key) setNodePodsLoading(false);
+    }
+  }
+
+  /// Drill from a pod in the node's inline list into that pod's own
+  /// detail — landing on the pods-on-node view so the "← node" trail back
+  /// is still there.
+  async function openPodFromNode(nodeName: string, ns: string | null, podName: string) {
+    const pod = types().find((x) => x.group === "" && x.kind === "Pod");
+    if (!pod) return;
+    if (ns) {
+      const st = tabCache.get(active()!);
+      if (st) st.namespace = ns;
+      setNamespace(ns);
+    }
+    await select(pod, `spec.nodeName=${nodeName}`);
+    await showDetail(ns, podName);
+  }
+
   async function refreshList() {
     const rt = selected();
     const ctx = active();
@@ -2830,6 +2936,7 @@ function App() {
     setDetailKey(key);
     setDetail(null);
     setSecretShown(false); // secrets start hidden on every open
+    setForceApply(false); // force is opt-in per resource, never sticky
     setEvents([]);
     setActionMsg(null);
     setActionErr(null);
@@ -2837,7 +2944,26 @@ function App() {
     setFindQ("");
     setPanelSec("actions");
     setActionIdx(0);
+    setNodePods(null);
+    setNodePodsErr("");
     setDetailLoading(true);
+    // Events (and, for a node, its pod list) don't depend on the detail
+    // fetch, so fire them in parallel instead of after it. Gating them
+    // behind the heavier manifest/status pull is what made node events
+    // feel laggy — they only started once fetchDetail had resolved.
+    void invoke<EventInfo[]>("get_events", {
+      context: active(),
+      namespace,
+      name,
+      kind: selected()?.kind,
+    })
+      .then((ev) => {
+        if (detailKey() === key) setEvents(ev);
+      })
+      .catch(() => {});
+    if (selected()?.group === "" && selected()?.kind === "Node") {
+      void loadNodePods(name, key);
+    }
     try {
       const d = await fetchDetail(namespace, name);
       if (detailKey() !== key) return; // user moved on
@@ -2845,18 +2971,6 @@ function App() {
         setDetail(d);
         setYamlText(d.yaml);
       }
-      // Events answer "why is this thing unhappy" — fetch them
-      // alongside, but never let them block the panel.
-      void invoke<EventInfo[]>("get_events", {
-        context: active(),
-        namespace,
-        name,
-        kind: selected()?.kind,
-      })
-        .then((ev) => {
-          if (detailKey() === key) setEvents(ev);
-        })
-        .catch(() => {});
     } catch (e) {
       setError(String(e));
       closeDetail();
@@ -3941,11 +4055,35 @@ function App() {
     const t = target ?? currentTarget();
     if (!t || !selected()) return;
     setDlgIdx(1);
+    // What "delete node" actually does hinges on the node's finalizers,
+    // not on the client — a Karpenter node (karpenter.sh/termination) gets
+    // cordoned, drained, and its EC2 instance terminated before the Node
+    // object goes; a plain node just loses its API record and its kubelet
+    // re-registers it. Detect Karpenter from the open manifest so the
+    // warning tells the truth for this specific node.
+    const node = isNode();
+    let body: string;
+    if (node) {
+      const km = detail()?.yaml?.includes("karpenter.sh/termination");
+      const base =
+        km === true
+          ? `${t.name} carries Karpenter's termination finalizer, so deleting it hands control to Karpenter: the node is cordoned, its pods are drained, and the underlying EC2 instance is terminated before the Node object is finally removed. This is the graceful way to retire a Karpenter node.`
+          : km === false
+            ? `Removes the Node object ${t.name} from ${active()}'s API server only. The machine is NOT terminated and a running kubelet will re-register it; pods are not evicted. For a real removal, drain the node, then terminate the instance (or let Karpenter / the autoscaler reclaim it).`
+            : `Deletes the Node object ${t.name}. What follows depends on its finalizers: a Karpenter-managed node (karpenter.sh/termination) gets drained and its EC2 instance terminated; a plain node just loses its API record and its kubelet re-registers it — the machine keeps running.`;
+      const forceNote =
+        km === true
+          ? ` Force (grace 0) gives pods no graceful shutdown window, but Karpenter's finalizer still gates deletion until the instance is drained and terminated.`
+          : ` Force uses grace period 0 — the object is removed immediately.`;
+      body = base + (force ? forceNote : "") + ` This cannot be undone.`;
+    } else {
+      body = force
+        ? `Grace period 0 — ${t.name} is removed immediately, without waiting for a graceful shutdown. This cannot be undone.`
+        : `${t.name}${t.namespace ? ` in ${t.namespace}` : ""} is deleted from ${active()} with the default grace period. This cannot be undone.`;
+    }
     setConfirm({
       title: `${force ? "Force delete" : "Delete"} ${selected()?.kind}/${t.name}?`,
-      body: force
-        ? `Grace period 0 — ${t.name} is removed immediately, without waiting for a graceful shutdown. This cannot be undone.`
-        : `${t.name}${t.namespace ? ` in ${t.namespace}` : ""} is deleted from ${active()} with the default grace period. This cannot be undone.`,
+      body,
       label: force ? "Force delete" : "Delete",
       danger: true,
       run: () =>
@@ -5668,16 +5806,33 @@ function App() {
                 }}
               />
               <Show when={activeFieldSel()}>
-                <span class="fieldsel" title={activeFieldSel() ?? ""}>
-                  {activeFieldSel()!.replace(/^label:/, "")}
-                  <button
-                    class="tab-close"
-                    title="clear this filter"
-                    onClick={() => void select(selected()!)}
-                  >
-                    ✕
-                  </button>
-                </span>
+                {(() => {
+                  const node = () =>
+                    activeFieldSel()!.match(/^spec\.nodeName=(.+)$/)?.[1];
+                  return (
+                    <span class="fieldsel" title={activeFieldSel() ?? ""}>
+                      <Show
+                        when={node()}
+                        fallback={activeFieldSel()!.replace(/^label:/, "")}
+                      >
+                        <button
+                          class="fieldsel-back"
+                          title={`back to node ${node()}`}
+                          onClick={() => void backToNode(node()!)}
+                        >
+                          ← node {node()}
+                        </button>
+                      </Show>
+                      <button
+                        class="tab-close"
+                        title="clear this filter"
+                        onClick={() => void select(selected()!)}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  );
+                })()}
               </Show>
               <Show when={templateFor(selected())}>
                 <button
@@ -6517,6 +6672,79 @@ function App() {
                       }
                     }}
                   />
+                  <Show when={isNode()}>
+                    <div
+                      class="psec"
+                      data-sec="nodepods"
+                      classList={{ cur: panelSec() === "nodepods" }}
+                    >
+                      <div class="psec-title">
+                        pods on this node
+                        <Show when={nodePods()}>
+                          <span class="dim"> ({nodePods()!.rows.length})</span>
+                        </Show>
+                      </div>
+                      <Show
+                        when={!nodePodsLoading()}
+                        fallback={<div class="dim np-note">loading pods…</div>}
+                      >
+                        <Show
+                          when={!nodePodsErr()}
+                          fallback={<div class="np-note bad">{nodePodsErr()}</div>}
+                        >
+                          <Show
+                            when={(nodePods()?.rows.length ?? 0) > 0}
+                            fallback={<div class="dim np-note">no pods scheduled here</div>}
+                          >
+                            <div class="np-wrap">
+                              <table class="np">
+                                <thead>
+                                  <tr>
+                                    <th>Namespace</th>
+                                    <For each={nodePodCols()}>
+                                      {(col) => <th>{col.c.name}</th>}
+                                    </For>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <For each={nodePods()!.rows}>
+                                    {(r) => (
+                                      <tr
+                                        onClick={() =>
+                                          void openPodFromNode(
+                                            detail()!.name,
+                                            r.namespace,
+                                            r.name,
+                                          )
+                                        }
+                                      >
+                                        <td class="dim">{r.namespace}</td>
+                                        <For each={nodePodCols()}>
+                                          {(col) => (
+                                            <td
+                                              classList={{
+                                                bad:
+                                                  col.c.name === "STATUS" &&
+                                                  !/^(Running|Completed|Succeeded)$/.test(
+                                                    String(r.cells[col.i] ?? ""),
+                                                  ),
+                                              }}
+                                            >
+                                              {String(r.cells[col.i] ?? "")}
+                                            </td>
+                                          )}
+                                        </For>
+                                      </tr>
+                                    )}
+                                  </For>
+                                </tbody>
+                              </table>
+                            </div>
+                          </Show>
+                        </Show>
+                      </Show>
+                    </div>
+                  </Show>
                   <Show when={detail()!.containers?.length}>
                     <div
                       class="psec"
@@ -6694,6 +6922,17 @@ function App() {
                               warning
                             </span>
                           </Show>
+                          <button
+                            class="btn sm copy-btn ev-copyall"
+                            title="copy every event to the clipboard"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              void copyAllEvents();
+                            }}
+                          >
+                            copy all
+                          </button>
                         </summary>
                         <div class="ev-list">
                           <For each={events()}>
@@ -6719,6 +6958,16 @@ function App() {
                                     {ev.count > 1 ? ` · ${ev.count} times` : ""}
                                     {ev.source ? ` · ${ev.source}` : ""}
                                   </span>
+                                  <button
+                                    class="ev-copy"
+                                    title="copy this event"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void copyEvent(ev);
+                                    }}
+                                  >
+                                    {copiedEv() === ev ? "✓" : "copy"}
+                                  </button>
                                 </div>
                                 <div class="ev-msg">{ev.message}</div>
                               </div>
@@ -6765,18 +7014,34 @@ function App() {
                         actionBusy() !== null || yamlText() === detail()!.yaml
                       }
                       onClick={() => {
+                        const f = forceApply();
                         setDlgIdx(1);
                         setConfirm({
-                          title: "Apply changes?",
-                          body: `Patches ${selected()?.kind}/${detail()!.name}${detail()!.namespace ? ` in ${detail()!.namespace}` : ""} on ${active()} via server-side apply.`,
-                          label: "Apply to cluster",
-                          danger: false,
-                          run: () => applyYaml(),
+                          title: f ? "Force-apply changes?" : "Apply changes?",
+                          body:
+                            `Patches ${selected()?.kind}/${detail()!.name}${detail()!.namespace ? ` in ${detail()!.namespace}` : ""} on ${active()} via server-side apply.` +
+                            (f
+                              ? "\n\nForce is ON: PigeonEye takes ownership of any conflicting fields and overwrites changes made on the server since load — no further prompt."
+                              : ""),
+                          label: f ? "Force apply" : "Apply to cluster",
+                          danger: f,
+                          run: () => applyYaml(f),
                         });
                       }}
                     >
                       {actionBusy() === "apply" ? "applying…" : "Apply"}
                     </button>
+                    <label
+                      class="force-apply"
+                      title="take ownership of conflicting fields and skip the conflict prompt"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={forceApply()}
+                        onChange={(e) => setForceApply(e.currentTarget.checked)}
+                      />
+                      force
+                    </label>
                     <button
                       class="btn"
                       title="server dry-run: validate without persisting"
