@@ -2356,12 +2356,12 @@ kbd.key {
 
 .tab.pending {
   animation: tab-breathe 1.6s ease-in-out infinite;
+  /* It has a close button now — the pointer means something again. */
+  cursor: default;
   /* The base tab's border is transparent, so dashing it alone shows
      nothing — it needs a colour to dash. */
   border-color: var(--border);
   border-style: dashed;
-  /* Nothing to click yet. */
-  cursor: default;
 }
 
 .tab.pending .tab-name {

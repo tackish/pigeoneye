@@ -869,6 +869,15 @@ function App() {
   // it means one unreachable cluster holds up the entire app.
   const [connecting, setConnecting] = createSignal<string[]>([]);
   const isConnecting = (name: string) => connecting().includes(name);
+  // Attempts the user gave up on. The invoke still settles — it just has
+  // nothing left to say, and an error from a cancelled attempt is noise.
+  const abandoned = new Set<string>();
+
+  function cancelConnect(name: string) {
+    abandoned.add(name);
+    endConnect(name);
+    void invoke("cancel_connect", { context: name }).catch(() => {});
+  }
   const beginConnect = (name: string) =>
     setConnecting([...connecting().filter((n) => n !== name), name]);
   const endConnect = (name: string) =>
@@ -1344,11 +1353,17 @@ function App() {
 
   /// Closing unmounts the terminal, which stops the session and kills the
   /// shell — so this is also how a login is cancelled.
-  function closeLogin() {
+  /// `cancelled` means the user closed the window rather than the process
+  /// ending on its own.
+  function closeLogin(cancelled = false) {
     const t = loginTarget();
     setLoginTarget(null);
     shellApi = undefined;
     if (!t) return;
+    // A pre-connect step the user walked out of has not happened, so
+    // connecting anyway would just spend the timeout and put up a banner
+    // for something they chose not to do.
+    if (cancelled && t.oneShot) return;
     // No context behind it means it came from the picker, where the useful
     // thing afterwards is re-reading the kubeconfig: `tsh kube login` and
     // `aws eks update-kubeconfig` both write new contexts, and a stale list
@@ -1418,6 +1433,7 @@ function App() {
       activate(name);
     } catch (e) {
       const msg = String(e);
+      if (abandoned.delete(name)) return;
       setError(`could not connect to ${name}: ${msg}`);
       if (isAuthError(msg)) void offerLogin(name);
     } finally {
@@ -2648,6 +2664,7 @@ function App() {
       activate(name);
     } catch (e) {
       const msg = String(e);
+      if (abandoned.delete(name)) return;
       setError(`could not connect to ${name}: ${msg}`);
       setFailed([...failed().filter((f) => f.name !== name), { name, error: msg }]);
       // The pre-connect command ran and we still could not connect, so it
@@ -4970,7 +4987,7 @@ function App() {
       // The login terminal handles its own Esc when it has focus; this is
       // for when focus sits on the dialog's close button instead.
       if (loginTarget()) {
-        closeLogin();
+        closeLogin(true);
         return;
       }
       if (newOpen()) {
@@ -6211,7 +6228,7 @@ function App() {
           <button
             class="close"
             title="close (esc) — ends the shell"
-            onClick={() => closeLogin()}
+            onClick={() => closeLogin(true)}
           >
             ✕
           </button>
@@ -6237,11 +6254,11 @@ function App() {
               if (t.context) preRan.add(t.context);
               setTimeout(() => closeLogin(), 900);
             }}
-            onLeave={() => closeLogin()}
+            onLeave={() => closeLogin(true)}
             onMinimize={() => {}}
             onFocusChange={() => {}}
             onCycleTab={() => {}}
-            onCloseTab={() => closeLogin()}
+            onCloseTab={() => closeLogin(true)}
             api={(a) => (shellApi = a)}
           />
         </div>
@@ -6362,6 +6379,16 @@ function App() {
                   <span class="tab-spin" />
                   <span class="tab-name">{name}</span>
                   <span class="tab-connecting">connecting…</span>
+                  <button
+                    class="tab-close"
+                    title="stop trying"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      cancelConnect(name);
+                    }}
+                  >
+                    ✕
+                  </button>
                 </div>
               )}
             </For>

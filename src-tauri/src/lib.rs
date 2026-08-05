@@ -65,6 +65,13 @@ async fn connect(
     k8s::connect(&state, context, path).await
 }
 
+/// Give up on a connection that is still being attempted.
+#[tauri::command]
+async fn cancel_connect(state: State<'_, AppState>, context: String) -> Result<(), String> {
+    k8s::cancel_connect(&state, context).await;
+    Ok(())
+}
+
 #[tauri::command]
 async fn auth_hint(context: String, path: Option<String>) -> Result<k8s::AuthHint, String> {
     k8s::auth_hint(context, path).await
@@ -672,6 +679,7 @@ pub fn run() {
             write_file,
             connect,
             disconnect,
+            cancel_connect,
             auth_hint,
             local_shell_start,
             discover,

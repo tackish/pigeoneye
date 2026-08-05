@@ -35,6 +35,11 @@ pub struct AppState {
     /// Arc so the background page-streamer can cache the completed list
     /// once every page is in.
     pub lists: std::sync::Arc<RwLock<Vec<(String, CachedList)>>>,
+    /// One per connection attempt in flight. Dropping the sender cancels
+    /// the attempt: a cluster behind a dead endpoint, or an SSO login the
+    /// user gave up on, otherwise holds a spinner until the client's own
+    /// timeout — with nothing the user can do about it.
+    pub cancels: RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     /// Names seen per (context, kind), for searching every open cluster at
     /// once. Kept apart from `lists`: that cache holds six whole tables and
     /// evicts, and a search across five contexts would flush every view the
@@ -658,6 +663,31 @@ pub async fn connect(
     if state.clients.read().await.contains_key(&context) {
         return Ok(context);
     }
+    // Race the attempt against a cancel. Dropping the future drops the
+    // request with it, so giving up actually stops the work rather than
+    // just looking away from it.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    state.cancels.write().await.insert(context.clone(), tx);
+    let out = tokio::select! {
+        r = connect_inner(state, &context, path) => r,
+        _ = rx => Err("cancelled".to_string()),
+    };
+    state.cancels.write().await.remove(&context);
+    out
+}
+
+/// Cancel an attempt started by `connect`. Unknown contexts are fine —
+/// the attempt may have just finished on its own.
+pub async fn cancel_connect(state: &AppState, context: String) {
+    state.cancels.write().await.remove(&context);
+}
+
+async fn connect_inner(
+    state: &AppState,
+    context: &str,
+    path: Option<String>,
+) -> Result<String, String> {
+    let context = context.to_string();
     let opts = KubeConfigOptions {
         context: Some(context.clone()),
         ..Default::default()
