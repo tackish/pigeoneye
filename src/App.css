@@ -1039,8 +1039,9 @@ th {
 }
 
 td {
-  /* height must match ROW_H in App.tsx for the virtual window */
-  height: 26px;
+  /* Set from App.tsx, which needs the same number for the virtual
+     window's arithmetic. The fallback is only for the first paint. */
+  height: var(--row-h, 26px);
   padding: 0 14px;
   border-bottom: 1px solid rgba(38, 45, 56, 0.45);
   white-space: nowrap;
@@ -1049,7 +1050,7 @@ td {
 }
 
 tr.row {
-  height: 26px;
+  height: var(--row-h, 26px);
 }
 
 tr.row {
@@ -2340,6 +2341,19 @@ kbd.key {
 /* A tab whose cluster has not answered yet. A glyph that only spins is
    easy to miss at this size, so it also says what it is doing — and the
    whole tab breathes, which the eye catches without being looked at. */
+/* Not connected, still listed: something to retry rather than a gap
+   where a cluster used to be. */
+.tab.failed {
+  border-color: var(--error-fg);
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.tab.failed .tab-name {
+  text-decoration: line-through;
+  text-decoration-color: var(--error-fg);
+}
+
 .tab.pending {
   animation: tab-breathe 1.6s ease-in-out infinite;
   /* The base tab's border is transparent, so dashing it alone shows
@@ -2387,6 +2401,57 @@ kbd.key {
   50% {
     opacity: 1;
   }
+}
+
+/* Answers arrive one cluster at a time, so the header keeps turning
+   until the last one is in. Same ring as a connecting tab — a search that
+   is still running should look like the other things that are. */
+.cmd-spin {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tab-spin 0.8s linear infinite;
+}
+
+/* The one row that leaves this cluster. It sits among rows that all mean
+   "open this kind here", so it needs to look like a different kind of
+   answer, not the next one down the list. */
+.cmd-item.search {
+  color: var(--accent);
+  border-top: 1px solid var(--border);
+}
+
+.cmd-item.search .dim {
+  color: var(--accent);
+  opacity: 0.75;
+}
+
+/* The palette's rows are name + hint; a search result adds the cluster it
+   came from, which has to read at a glance. */
+.row-h-set {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.row-h-val {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  min-width: 34px;
+  text-align: center;
+}
+
+.cmd-item .ctx-dot {
+  flex: 0 0 auto;
+}
+
+.cmd-item .dim {
+  margin-left: auto;
+  padding-left: 12px;
+  white-space: nowrap;
 }
 
 .ctx-pop {
@@ -3926,8 +3991,11 @@ summary.section-title kbd.key {
 
 .cmd-item {
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
+  align-items: center;
+  /* Not space-between: rows carry a context dot as well as a label and a
+     hint, and three children would strand the label in the middle. */
+  justify-content: flex-start;
+  gap: 8px;
   width: 100%;
   text-align: left;
   background: none;

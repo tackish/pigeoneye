@@ -2048,6 +2048,25 @@ function App() {
   const [marked, setMarked] = createSignal<Set<string>>(new Set());
   const rowKeyOf = (r: TableRow) => `${r.namespace ?? ""}/${r.name}`;
 
+  // True while space is down. Nothing reports a held key on later events,
+  // so it is tracked, and released on keyup or when the window loses focus
+  // — a keyup that arrives elsewhere would otherwise leave it stuck on.
+  let spaceHeld = false;
+  const sweepFrom = () => {
+    if (!spaceHeld) return;
+    const vr = view().rows[cursor()];
+    if (vr) markRow(vr.row);
+  };
+  const sweepTo = sweepFrom;
+
+  /// Add to the selection without toggling — what a range extension needs,
+  /// since sweeping back over a row must not unmark it.
+  function markRow(r: TableRow) {
+    const k = rowKeyOf(r);
+    if (marked().has(k)) return;
+    setMarked(new Set(marked()).add(k));
+  }
+
   function toggleMark(r: TableRow) {
     const next = new Set(marked());
     const k = rowKeyOf(r);
@@ -2631,6 +2650,10 @@ function App() {
       const msg = String(e);
       setError(`could not connect to ${name}: ${msg}`);
       setFailed([...failed().filter((f) => f.name !== name), { name, error: msg }]);
+      // The pre-connect command ran and we still could not connect, so it
+      // did not do the job — let the next attempt run it again rather than
+      // silently skipping the one step that might fix things.
+      preRan.delete(name);
       if (isAuthError(msg)) void offerLogin(name);
     } finally {
       endConnect(name);
@@ -4070,7 +4093,25 @@ function App() {
   // ── virtual table ──────────────────────────────────────
   // Rows are a fixed height so the window can be computed instead of
   // measured, and only what fits on screen is ever put in the DOM.
-  const ROW_H = 26;
+  // Row height drives the virtual window's arithmetic *and* the cells'
+  // CSS, and the two must agree exactly or rows drift as you scroll. One
+  // signal owns it; the stylesheet reads it back through a custom
+  // property. Kept apart from zoom: zoom scales everything, this decides
+  // how much air a table row gets at whatever scale you are at.
+  const ROW_H_MIN = 18;
+  const ROW_H_MAX = 40;
+  const [rowH, setRowH] = createSignal(
+    Math.min(
+      ROW_H_MAX,
+      Math.max(ROW_H_MIN, Number(localStorage.getItem("pigeoneye.rowh")) || 26),
+    ),
+  );
+  createEffect(() => {
+    document.documentElement.style.setProperty("--row-h", `${rowH()}px`);
+    localStorage.setItem("pigeoneye.rowh", String(rowH()));
+  });
+  const nudgeRowH = (d: number) =>
+    setRowH(Math.min(ROW_H_MAX, Math.max(ROW_H_MIN, rowH() + d)));
   const HEADER_H = 30;
   const OVERSCAN = 8;
   const [scrollTop, setScrollTop] = createSignal(0);
@@ -4078,8 +4119,8 @@ function App() {
 
   const windowRange = createMemo(() => {
     const total = view().rows.length;
-    const first = Math.max(0, Math.floor(scrollTop() / ROW_H) - OVERSCAN);
-    const visible = Math.ceil(viewH() / ROW_H) + OVERSCAN * 2;
+    const first = Math.max(0, Math.floor(scrollTop() / rowH()) - OVERSCAN);
+    const visible = Math.ceil(viewH() / rowH()) + OVERSCAN * 2;
     return { first, last: Math.min(total, first + visible), total };
   });
 
@@ -4093,10 +4134,10 @@ function App() {
   function scrollRowIntoView(idx: number) {
     const el = tableFocusRef;
     if (!el) return;
-    const top = idx * ROW_H;
+    const top = idx * rowH();
     if (top < el.scrollTop) el.scrollTop = top;
-    else if (top + ROW_H > el.scrollTop + el.clientHeight - HEADER_H) {
-      el.scrollTop = top + ROW_H - el.clientHeight + HEADER_H;
+    else if (top + rowH() > el.scrollTop + el.clientHeight - HEADER_H) {
+      el.scrollTop = top + rowH() - el.clientHeight + HEADER_H;
     }
   }
 
@@ -4128,11 +4169,184 @@ function App() {
   }
 
   // ── `:` command palette ────────────────────────────────
+  // The list scrolls, so there is no reason to hold much back: a machine
+  // with hundreds of contexts should see them all. This is only a backstop
+  // against rendering a pathological list in one frame — and when it does
+  // bite, `moreRow` says so rather than letting the list look complete.
+  const CMD_LIST_MAX = 1000;
+
+  // fn+↑/↓ on a Mac arrives as PageUp/PageDown, so nothing needs to know
+  // about fn — the lists just have to answer the key. The table already
+  // did; the pickers didn't, which made them the slow ones to get down.
+  const pageDir = (e: KeyboardEvent) =>
+    e.key === "PageDown" ? 1 : e.key === "PageUp" ? -1 : 0;
+  const clamp = (i: number, n: number) => Math.min(Math.max(i, 0), n - 1);
+
+  /// A page is what you can see, the way k9s does it — not a fixed number
+  /// of rows. It follows the window size and the row-height setting, and
+  /// keeps one row of overlap so you can tell where you landed.
+  const pageOf = (containerSel: string, itemSel: string, fallback = 20) => {
+    const c = document.querySelector(containerSel) as HTMLElement | null;
+    const item = c?.querySelector(itemSel) as HTMLElement | null;
+    const h = item?.offsetHeight ?? 0;
+    if (!c || !h) return fallback;
+    return Math.max(1, Math.floor(c.clientHeight / h) - 1);
+  };
+
+  /// The table's page comes from the numbers it already keeps for the
+  /// virtual window, so it stays right as either changes.
+  const tablePage = () => Math.max(1, Math.floor(viewH() / rowH()) - 1);
+
+  /// Keep the highlighted row in the scrollport. The list scrolls with the
+  /// mouse, but arrow keys moved the cursor without taking the view along,
+  /// so it walked off the bottom and out of sight.
+  const scrollCmdCursor = () =>
+    requestAnimationFrame(() =>
+      document
+        .querySelector(`.cmd-item[data-cmdi="${cmdIdx()}"]`)
+        ?.scrollIntoView?.({ block: "nearest" }),
+    );
+
+  const moreRow = (shown: number, total: number): CmdItem[] =>
+    total > shown
+      ? [
+          {
+            label: `…and ${total - shown} more`,
+            hint: "keep typing to narrow",
+            run: () => {},
+          },
+        ]
+      : [];
   interface CmdItem {
     label: string;
     hint: string;
     run: () => void;
+    /// Leave the palette open — used by the cross-cluster search, whose
+    /// results replace the item list in place.
+    keepOpen?: boolean;
+    /// Context this row came from, for the colour dot in the results.
+    context?: string;
+    /// Marks the row that leaves this cluster — it does something the
+    /// rows around it don't, and has to look like it.
+    search?: boolean;
+    /// Work still in flight behind this row.
+    busy?: boolean;
+    /// What tab writes into the input. Picking a kind is usually the first
+    /// half of a thought — the argument follows — so completing beats
+    /// running, and the typed argument survives the swap.
+    complete?: string;
   }
+
+  // ── searching every open cluster at once ───────────────
+  //
+  // Only from here. The `/` row filter and a kind's own view stay bound to
+  // the cluster you are looking at — a pod from somewhere else appearing
+  // in that list would be genuinely confusing. This is the one place you
+  // ask a question of every cluster at once, and every answer says which
+  // cluster it came from.
+  type SearchHit = { context: string; namespace: string | null; name: string };
+  const [xSearch, setXSearch] = createSignal<{
+    rt: ResourceType;
+    query: string;
+  } | null>(null);
+  const [xHits, setXHits] = createSignal<SearchHit[]>([]);
+  const [xTotal, setXTotal] = createSignal(0);
+  const [xPending, setXPending] = createSignal<string[]>([]);
+  const [xAge, setXAge] = createSignal<Record<string, number>>({});
+  const [xErrors, setXErrors] = createSignal<Record<string, string>>({});
+
+  function clearXSearch() {
+    setXSearch(null);
+    setXHits([]);
+    setXTotal(0);
+    setXPending([]);
+    setXAge({});
+    setXErrors({});
+  }
+
+  /// Ask every open cluster for one kind, and take the answers as they
+  /// arrive. `refresh` skips the name index, which is what makes a second
+  /// look at a churning kind honest.
+  function runXSearch(rt: ResourceType, query: string, refresh = false) {
+    const targets = tabs();
+    if (!targets.length) return;
+    setXSearch({ rt, query });
+    setXHits([]);
+    setXTotal(0);
+    setXAge({});
+    setXErrors({});
+    setXPending(targets);
+    const chan = new Channel<{
+      context: string;
+      hits: SearchHit[];
+      total: number;
+      age_ms: number;
+      error: string | null;
+    }>();
+    chan.onmessage = (b) => {
+      setXPending(xPending().filter((c) => c !== b.context));
+      if (b.error) {
+        setXErrors({ ...xErrors(), [b.context]: b.error });
+        return;
+      }
+      setXAge({ ...xAge(), [b.context]: b.age_ms });
+      setXTotal(xTotal() + b.total);
+      // Contexts answer out of order; keep them in tab order so the list
+      // does not reshuffle as it fills.
+      const order = new Map(targets.map((t, i) => [t, i]));
+      setXHits(
+        [...xHits(), ...b.hits].sort(
+          (a, z) =>
+            (order.get(a.context) ?? 0) - (order.get(z.context) ?? 0) ||
+            a.name.localeCompare(z.name),
+        ),
+      );
+    };
+    void invoke("search_contexts", {
+      contexts: targets,
+      resource: rt,
+      query,
+      refresh,
+      channel: chan,
+    }).catch((e) => setXErrors({ ...xErrors(), all: String(e) }));
+  }
+
+  /// A row to put the cursor on once its list arrives.
+  let pendingJump: { context: string; kind: string; name: string } | null = null;
+
+  /// Land on a hit: its cluster, its namespace, its kind, cursor on the
+  /// row. Deliberately not the row filter — that runs the full-text search
+  /// (and builds the deep index) to find something we already know the
+  /// name of, which is both slow and alarming to watch.
+  function gotoHit(hit: SearchHit, rt: ResourceType) {
+    clearXSearch();
+    setCmdOpen(false);
+    setCmdText("");
+    if (active() !== hit.context) activate(hit.context);
+    if (hit.namespace) {
+      setNamespace(hit.namespace);
+      const st = tabCache.get(hit.context);
+      if (st) st.namespace = hit.namespace;
+    }
+    pendingJump = { context: hit.context, kind: rt.kind, name: hit.name };
+    gotoKind(rt);
+  }
+
+  // The list arrives asynchronously, so the jump waits for it rather than
+  // guessing when it is ready.
+  createEffect(() => {
+    const rows = view().rows;
+    const j = pendingJump;
+    // Kind as well as context: a jump that never resolved would otherwise
+    // lie in wait and grab a same-named row in some other list.
+    if (!j || !rows.length) return;
+    if (active() !== j.context || selected()?.kind !== j.kind) return;
+    const i = rows.findIndex((vr) => vr.row.name === j.name);
+    if (i < 0) return;
+    pendingJump = null;
+    setCursor(i);
+    scrollRowIntoView(i);
+  });
 
   /// Match a resource kind the way the `:` palette does: exact alias
   /// first, then prefix, then substring on kind or group.
@@ -4168,7 +4382,17 @@ function App() {
   ///   :pod app=web,e=d  → label selector :pod @prod      → context
   /// No arg just opens the kind.
   function kindItem(t: ResourceType, rest: string): CmdItem {
-    if (!rest) return { label: t.kind, hint: t.group || "core", run: () => gotoKind(t) };
+    // Completing means handing back what the row resolved to, so the next
+    // tab has something new to say. Echoing the letters just typed is
+    // what made tab look broken after the kind was filled in.
+    const done = (arg?: string) => `${t.kind} ${arg ?? ""}`.trimEnd() + " ";
+    if (!rest)
+      return {
+        label: t.kind,
+        hint: t.group || "core",
+        complete: done(),
+        run: () => gotoKind(t),
+      };
     if (rest.startsWith("@")) {
       const arg = rest.slice(1);
       const ctx = contexts().find((c) =>
@@ -4178,6 +4402,7 @@ function App() {
       return {
         label: `${t.kind} @ ${name}`,
         hint: "kind in context",
+        complete: done(`@${name}`),
         run: () =>
           void (async () => {
             await openContext(name);
@@ -4192,6 +4417,7 @@ function App() {
       return {
         label: `${t.kind} /${f}`,
         hint: "filter by name",
+        complete: done(`/${f}`),
         run: () =>
           void (async () => {
             await select(t);
@@ -4204,6 +4430,7 @@ function App() {
       return {
         label: `${t.kind} ${rest}`,
         hint: "label selector",
+        complete: done(rest),
         run: () => {
           void select(t, `label:${rest}`);
           revealInSidebar(t);
@@ -4217,15 +4444,22 @@ function App() {
       return {
         label: `${t.kind} · ${rest}`,
         hint: "cluster-scoped — ns ignored",
+        complete: done(rest),
         run: () => gotoKind(t),
       };
+    // Exact, then prefix, then anywhere. Without the prefix step a
+    // single letter lands on whichever namespace happens to contain it —
+    // "c" resolved to action-runner-job-exporter — so typing more letters
+    // appeared to change nothing.
     const ns =
       namespaces().find((n) => n === rest) ??
+      namespaces().find((n) => n.startsWith(rest)) ??
       namespaces().find((n) => n.includes(rest)) ??
       rest;
     return {
       label: `${t.kind} · ${ns}`,
       hint: "in namespace",
+      complete: done(ns),
       run: () => {
         setNamespace(ns);
         const st = tabCache.get(active()!);
@@ -4236,6 +4470,47 @@ function App() {
   }
 
   const cmdItems = createMemo<CmdItem[]>(() => {
+    const xs = xSearch();
+    if (xs) {
+      const ages = xAge();
+      const stale = Object.values(ages).some((a) => a > 1000);
+      const errs = Object.entries(xErrors());
+      return [
+        {
+          label:
+            xTotal() > xHits().length
+              ? `${xs.rt.kind} matching "${xs.query}" · showing ${xHits().length} of ${xTotal()}`
+              : `${xs.rt.kind} matching "${xs.query}" · ${xHits().length} found`,
+          hint: xPending().length
+            ? // Name them: "2 more" says nothing about whether the one you
+              // care about has answered yet.
+              `searching ${xPending().slice(0, 2).join(", ")}${
+                xPending().length > 2 ? ` +${xPending().length - 2}` : ""
+              }…`
+            : stale
+              ? "from the last look — ↵ to re-read"
+              : "just read",
+          busy: xPending().length > 0,
+          keepOpen: true,
+          run: () => runXSearch(xs.rt, xs.query, true),
+        },
+        ...errs.map(([ctx, e]) => ({
+          label: `${ctx}: ${prettyError(e)}`,
+          hint: "not searched",
+          keepOpen: true,
+          run: () => {},
+        })),
+        ...xHits()
+          .slice(0, CMD_LIST_MAX)
+          .map((h) => ({
+            label: h.namespace ? `${h.namespace}/${h.name}` : h.name,
+            hint: h.context,
+            context: h.context,
+            run: () => gotoHit(h, xs.rt),
+          })),
+        ...moreRow(Math.min(xHits().length, CMD_LIST_MAX), xHits().length),
+      ];
+    }
     const raw = cmdText().trim();
     const q = raw.toLowerCase();
     if (q === "0") {
@@ -4250,23 +4525,37 @@ function App() {
         : namespaces();
       return [
         ...(arg ? [] : [{ label: "ns (all)", hint: "clear namespace filter", run: () => pickNamespace("") }]),
-        ...list.slice(0, 12).map((n) => ({
+        ...list.slice(0, CMD_LIST_MAX).map((n) => ({
           label: `ns ${n}`,
           hint: "switch namespace",
+          complete: `ns ${n}`,
           run: () => pickNamespace(n),
         })),
+        ...moreRow(Math.min(list.length, CMD_LIST_MAX), list.length),
       ];
     }
     if (q.startsWith("ctx")) {
       const arg = q.slice(3).trim();
-      return contexts()
+      // Sorted, and open tabs first. The list arrives in kubeconfig order,
+      // so a context added later sat at the bottom — and the cap below cut
+      // it off, which read as "it isn't there" for a cluster that was.
+      const hits = contexts()
         .filter((c) => !arg || c.name.toLowerCase().includes(arg))
-        .slice(0, 12)
-        .map((c) => ({
+        .slice()
+        .sort(
+          (a, b) =>
+            Number(tabs().includes(b.name)) - Number(tabs().includes(a.name)) ||
+            a.name.localeCompare(b.name),
+        );
+      return [
+        ...hits.slice(0, CMD_LIST_MAX).map((c) => ({
           label: `ctx ${c.name}`,
           hint: tabs().includes(c.name) ? "switch tab" : "connect",
+          complete: `ctx ${c.name}`,
           run: () => void openContext(c.name),
-        }));
+        })),
+        ...moreRow(Math.min(hits.length, CMD_LIST_MAX), hits.length),
+      ];
     }
     if (!q) {
       return [
@@ -4283,15 +4572,36 @@ function App() {
     const parts = raw.split(/\s+/);
     const head = (parts[0] ?? "").toLowerCase();
     const rest = parts.slice(1).join(" ").trim();
-    return resolveKinds(head)
-      .slice(0, 12)
-      .map((t) => kindItem(t, rest));
+    const kinds = resolveKinds(head);
+    const items = [
+      ...kinds.slice(0, CMD_LIST_MAX).map((t) => kindItem(t, rest)),
+      ...moreRow(Math.min(kinds.length, CMD_LIST_MAX), kinds.length),
+    ];
+    // A bare word after a kind means a namespace here (k9s), which is
+    // still right when it names one. When it doesn't, the likely question
+    // is "where is this thing?" — so lead with the search, but never take
+    // the other reading away.
+    const first = kinds[0];
+    if (first && rest && !rest.startsWith("@") && !rest.includes("=") && tabs().length > 1) {
+      const known = namespaces().some((n) => n.includes(rest));
+      const search: CmdItem = {
+        label: `⌕ search every cluster · ${first.kind} "${rest.replace(/^\//, "")}"`,
+        hint: `${tabs().length} open`,
+        keepOpen: true,
+        search: true,
+        run: () => runXSearch(first, rest.replace(/^\//, "")),
+      };
+      return known ? [...items, search] : [search, ...items];
+    }
+    return items;
   });
 
   function runCmd(item: CmdItem | undefined) {
     if (!item) return;
-    setCmdOpen(false);
-    setCmdText("");
+    if (!item.keepOpen) {
+      setCmdOpen(false);
+      setCmdText("");
+    }
     item.run();
   }
 
@@ -4620,7 +4930,11 @@ function App() {
     if (tabs().length === 0) {
       if (settingsOpen() || preEdit()) return;
       const list = pickerList();
-      if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "n")) {
+      if (pageDir(e)) {
+        e.preventDefault();
+        const step = pageDir(e) * pageOf(".launcher-list", ".launcher-row");
+        setPickerIdx(clamp(pickerIdx() + step, list.length));
+      } else if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "n")) {
         e.preventDefault();
         setPickerIdx(Math.min(pickerIdx() + 1, list.length - 1));
       } else if (e.key === "ArrowUp" || (e.ctrlKey && e.key === "p")) {
@@ -4829,6 +5143,28 @@ function App() {
       return; // nothing else may act while a confirm is up
     }
     if (typing) return;
+    // ⌥ +/−/0 sets how tall a table row is — the neighbouring question to
+    // ⌘ +/−/0, which scales the whole app. Below the typing guard, unlike
+    // zoom: on a Mac ⌥+ is "±", ⌥− an en dash and ⌥0 "º", so above it
+    // these would eat characters out of the YAML editor and the search
+    // boxes.
+    if (e.altKey && !e.metaKey && !e.ctrlKey) {
+      if (e.code === "Equal" || e.code === "NumpadAdd") {
+        e.preventDefault();
+        nudgeRowH(2);
+        return;
+      }
+      if (e.code === "Minus" || e.code === "NumpadSubtract") {
+        e.preventDefault();
+        nudgeRowH(-2);
+        return;
+      }
+      if (e.code === "Digit0" || e.code === "Numpad0") {
+        e.preventDefault();
+        setRowH(26);
+        return;
+      }
+    }
     if (e.key === "?") {
       e.preventDefault();
       setHelpOpen(!helpOpen());
@@ -4958,6 +5294,11 @@ function App() {
       if (e.key === "G") {
         e.preventDefault();
         moveSidebar(sidebarItems().length);
+        return;
+      }
+      if (pageDir(e)) {
+        e.preventDefault();
+        moveSidebar(pageDir(e) * pageOf(".tree", ".kind"));
         return;
       }
       if (e.key === "Enter" || e.key === "ArrowRight" || e.key === "l") {
@@ -5247,13 +5588,19 @@ function App() {
       }
     } else if (e.key === "ArrowDown" || e.key === "j") {
       e.preventDefault();
+      sweepFrom();
       moveCursor(1);
+      sweepTo();
     } else if (e.key === "ArrowUp" || e.key === "k") {
       e.preventDefault();
       // Past the top row, step up into the header: focus the search box
       // (Tab from there reaches + New) — the list's parent level.
       if (cursor() <= 0) rowSearchRef?.focus();
-      else moveCursor(-1);
+      else {
+        sweepFrom();
+        moveCursor(-1);
+        sweepTo();
+      }
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "d" || e.key === "D")) {
       // Destructive commands work straight off the list; both variants
       // go through the confirmation dialog.
@@ -5308,22 +5655,26 @@ function App() {
     } else if (e.key === "End") {
       e.preventDefault();
       tableFocusRef?.scrollTo({ left: tableFocusRef.scrollWidth });
-    } else if (e.key === "PageDown") {
+    } else if (e.key === "PageDown" || e.key === "PageUp") {
+      // Was a flat 15 rows, which barely moved on a tall window.
       e.preventDefault();
-      moveCursor(15);
-    } else if (e.key === "PageUp") {
-      e.preventDefault();
-      moveCursor(-15);
+      moveCursor(pageDir(e) * tablePage());
     } else if (e.key === "g") {
       moveCursor(-view().rows.length);
     } else if (e.key === "G") {
       moveCursor(view().rows.length);
-    } else if (e.key === " ") {
+    } else if (e.key === " " && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      // Held, space becomes a sweep: the movement keys mark what they
+      // pass over, so a run of rows costs one gesture instead of a press
+      // per row. A tap is unchanged — it still toggles the row under the
+      // cursor. The repeat guard matters: holding a key fires keydown
+      // over and over, and without it the row would flicker in and out of
+      // the selection.
+      spaceHeld = true;
+      if (e.repeat) return;
       const vr = view().rows[cursor()];
-      if (vr) {
-        e.preventDefault();
-        toggleMark(vr.row);
-      }
+      if (vr) toggleMark(vr.row);
     } else if ((e.metaKey || e.ctrlKey) && e.code === "KeyA") {
       e.preventDefault();
       setMarked(new Set(view().rows.map((vr) => rowKeyOf(vr.row))));
@@ -5452,9 +5803,19 @@ function App() {
     });
   });
 
-  onMount(() => document.addEventListener("keydown", onGlobalKey));
+  const onGlobalKeyUp = (e: KeyboardEvent) => {
+    if (e.key === " ") spaceHeld = false;
+  };
+  const dropHeldKeys = () => (spaceHeld = false);
+  onMount(() => {
+    document.addEventListener("keydown", onGlobalKey);
+    document.addEventListener("keyup", onGlobalKeyUp);
+    window.addEventListener("blur", dropHeldKeys);
+  });
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
+    document.removeEventListener("keyup", onGlobalKeyUp);
+    window.removeEventListener("blur", dropHeldKeys);
     stopWatch();
   });
 
@@ -5548,6 +5909,14 @@ function App() {
             Pod shell defaults to kubectl-exec with bash→sh fallback.
           </p>
           <div class="settings-grid">
+            <span class="meta-key">table row height</span>
+            <span class="row-h-set">
+              <button class="btn sm" onClick={() => nudgeRowH(-2)}>−</button>
+              <span class="row-h-val">{rowH()}px</span>
+              <button class="btn sm" onClick={() => nudgeRowH(2)}>+</button>
+              <button class="btn sm" onClick={() => setRowH(26)}>reset</button>
+              <span class="dim">⌥ + / − / 0 · zoom (⌘) is separate</span>
+            </span>
             <span class="meta-key">pod shell command</span>
             <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
               class="search grow"
@@ -5827,7 +6196,7 @@ function App() {
   // the message while you answer it is the wrong shape. Rendered on both
   // screens, but only one of them is ever mounted.
   const loginPanel = () => (
-    <Show when={loginTarget()}>
+    <Show when={loginTarget()} keyed>
       <div class="shell-panel">
         <div class="shell-panel-head">
           <span class="shell-panel-title">
@@ -5950,6 +6319,36 @@ function App() {
               requestAnimationFrame(measureTabs);
             }}
           >
+            {/* A cluster that failed to connect keeps a tab too. It used
+                to vanish, with the only trace in an error banner that can
+                be dismissed — so a context you asked for disappeared and
+                left nothing to click. */}
+            <For
+              each={failed().filter(
+                (f) => !tabs().includes(f.name) && !isConnecting(f.name),
+              )}
+            >
+              {(f) => (
+                <div
+                  class="tab failed"
+                  style={{ "--ctx-hue": ctxHue(f.name) }}
+                  title={`${prettyError(f.error)} — click to try again`}
+                  onClick={() => void reconnect(f.name)}
+                >
+                  <span class="ctx-dot" />
+                  <span class="tab-name">{f.name}</span>
+                  <button
+                    class="tab-close"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFailed(failed().filter((x) => x.name !== f.name));
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+            </For>
             {/* A connection in progress gets a tab of its own, so you can
                 see which cluster is taking its time — and start another
                 while it does. It becomes a real tab when it lands. */}
@@ -6062,7 +6461,12 @@ function App() {
                   e.stopPropagation();
                   const items = ctxItems();
                   if (e.key === "Escape") setCtxOpen(false);
-                  else if (e.key === "ArrowDown") {
+                  else if (pageDir(e)) {
+                    e.preventDefault();
+                    const step =
+                      pageDir(e) * pageOf(".ctx-pop .ns-list", ".launcher-row");
+                    setCtxIdx(clamp(ctxIdx() + step, items.length));
+                  } else if (e.key === "ArrowDown") {
                     e.preventDefault();
                     setCtxIdx(Math.min(ctxIdx() + 1, items.length - 1));
                   } else if (e.key === "ArrowUp") {
@@ -6150,7 +6554,12 @@ function App() {
                   onKeyDown={(e) => {
                     const items = nsItems();
                     if (e.key === "Escape") setNsOpen(false);
-                    else if (e.key === "ArrowDown") {
+                    else if (pageDir(e)) {
+                      e.preventDefault();
+                      const step = pageDir(e) * pageOf(".ns-list", ".ns-item");
+                      setNsIdx(clamp(nsIdx() + step, items.length));
+                      scrollNsCursor();
+                    } else if (e.key === "ArrowDown") {
                       e.preventDefault();
                       setNsIdx(Math.min(nsIdx() + 1, items.length - 1));
                       scrollNsCursor();
@@ -6987,7 +7396,7 @@ function App() {
                     drain
                   </button>
                 </Show>
-                <span class="mark-hint">space marks · ⌘A all · esc clear</span>
+                <span class="mark-hint">space marks · hold + move sweeps · ⌘A all · esc clear</span>
                 <Show when={actionBusy()}>
                   <span class="dim">{actionBusy()}…</span>
                 </Show>
@@ -7161,7 +7570,7 @@ function App() {
                       <Show when={windowRange().first > 0}>
                         <tr
                           class="spacer"
-                          style={{ height: `${windowRange().first * ROW_H}px` }}
+                          style={{ height: `${windowRange().first * rowH()}px` }}
                         />
                       </Show>
                       <For each={windowRows()}>
@@ -7259,7 +7668,7 @@ function App() {
                         <tr
                           class="spacer"
                           style={{
-                            height: `${(windowRange().total - windowRange().last) * ROW_H}px`,
+                            height: `${(windowRange().total - windowRange().last) * rowH()}px`,
                           }}
                         />
                       </Show>
@@ -8043,27 +8452,65 @@ function App() {
           </Show>
 
           <Show when={cmdOpen()}>
-            <div class="modal-backdrop top" onClick={() => setCmdOpen(false)}>
+            <div
+              class="modal-backdrop top"
+              onClick={() => {
+                clearXSearch();
+                setCmdOpen(false);
+              }}
+            >
               <div class="cmd" onClick={(e) => e.stopPropagation()}>
                 <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
                   class="cmd-input"
-                  placeholder=":pods · deploy · rollout · ns kube-system · ctx dev"
+                  placeholder=":pods · deploy api · ns kube-system · ctx dev"
                   ref={(el) => setTimeout(() => el.focus())}
                   value={cmdText()}
                   onInput={(e) => {
+                    // A new question replaces the old answers — but only
+                    // real input does. Doing this on keydown threw the
+                    // results away on shift, ⌘, or a stray arrow.
+                    if (xSearch()) clearXSearch();
                     setCmdText(e.currentTarget.value);
                     setCmdIdx(0);
                   }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter")
                       runCmd(cmdItems()[cmdIdx()] ?? cmdItems()[0]);
-                    else if (e.key === "ArrowDown") {
+                    else if (e.key === "Tab") {
+                      // Complete rather than run: after the kind comes the
+                      // namespace, the name, the selector. Enter is still
+                      // there for when the highlighted row is the answer.
                       e.preventDefault();
-                      setCmdIdx(Math.min(cmdIdx() + 1, cmdItems().length - 1));
-                    } else if (e.key === "ArrowUp") {
+                      const item = cmdItems()[cmdIdx()] ?? cmdItems()[0];
+                      if (item?.complete) {
+                        setCmdText(item.complete);
+                        setCmdIdx(0);
+                      }
+                    }
+                    else if (pageDir(e)) {
                       e.preventDefault();
-                      setCmdIdx(Math.max(cmdIdx() - 1, 0));
-                    } else if (e.key === "Escape") setCmdOpen(false);
+                      const step = pageDir(e) * pageOf(".cmd-list", ".cmd-item");
+                      setCmdIdx(clamp(cmdIdx() + step, cmdItems().length));
+                      scrollCmdCursor();
+                    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const n = cmdItems().length;
+                      if (!n) return;
+                      const step = e.key === "ArrowDown" ? 1 : -1;
+                      // Wraps, unlike the sidebar and the table. Those
+                      // are places you navigate, where running off an end
+                      // should stop; this is a short menu you are picking
+                      // from, and its last row is one key up from the top.
+                      setCmdIdx((cmdIdx() + step + n) % n);
+                      scrollCmdCursor();
+                    } else if (e.key === "Escape") {
+                      // Results first, palette second — one esc should not
+                      // throw away both the search and the query.
+                      if (xSearch()) {
+                        clearXSearch();
+                        setCmdIdx(0);
+                      } else setCmdOpen(false);
+                    }
                   }}
                 />
                 <div class="cmd-list">
@@ -8071,10 +8518,23 @@ function App() {
                     {(item, i) => (
                       <button
                         class="cmd-item"
-                        classList={{ active: cmdIdx() === i() }}
+                        data-cmdi={i()}
+                        classList={{
+                          active: cmdIdx() === i(),
+                          search: !!item.search,
+                        }}
                         onMouseEnter={() => setCmdIdx(i())}
                         onClick={() => runCmd(item)}
                       >
+                        <Show when={item.busy}>
+                          <span class="cmd-spin" />
+                        </Show>
+                        <Show when={item.context}>
+                          <span
+                            class="ctx-dot"
+                            style={{ "--ctx-hue": ctxHue(item.context!) }}
+                          />
+                        </Show>
                         <span>{item.label}</span>
                         <span class="dim">{item.hint}</span>
                       </button>
@@ -8265,11 +8725,14 @@ function App() {
                   <b>n</b><span>new resource (creatable kinds) · ⇧↑ on top row → search</span>
                   <b>f</b><span>filter the sorted column (values or &gt;/&lt; for numbers)</span>
                   <b>⌘F</b><span>focus the row search / find in the open detail</span>
+                  <b>: kind name</b><span>search that kind by name across every open cluster — ↵ on the header re-reads</span>
+                  <b>tab (in :)</b><span>complete to the highlighted kind and keep typing</span>
                   <b>s</b><span>shell (pod / node)</span>
                   <b>l</b><span>logs (pod / workload aggregate)</span>
                   <b>e / y</b><span>edit manifest (YAML) of cursor row</span>
                   <b>⌘C</b><span>copy the manifest (detail open, nothing selected)</span>
                   <b>space</b><span>mark a row · ⌘A all · esc clears</span>
+                  <b>space + ↑↓</b><span>hold space and move to sweep a range of rows</span>
                   <b>⌘/ctrl D</b><span>delete marked rows, or the cursor row (⇧ adds force)</span>
                   <b>⌘/ctrl R</b><span>rollout restart of cursor row</span>
                   <b>c · ⇧D</b><span>cordon · drain the cursor node</span>
@@ -8285,6 +8748,7 @@ function App() {
                   <b>Enter</b><span>open the focused section (folds · editor) or press its button</span>
                   <b>← h</b><span>back to the table — from a section header, or from the first button of a row</span>
                   <b>⇞ ⇟ · g G</b><span>scroll · first / last section</span>
+                  <b>fn ↑↓ (⇞⇟)</b><span>page through any list — table, sidebar, palette, pickers</span>
                   <b>⇧J ⇧K</b><span>previous / next resource, panel follows</span>
                   <b>a · t · v</b><span>toggle annotations · status · events</span>
                   <b>c · ⇧D</b><span>cordon/uncordon · drain (nodes)</span>
@@ -8296,6 +8760,7 @@ function App() {
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
                   <b>0</b><span>back to all namespaces</span>
                   <b>⌘ + / − / 0</b><span>zoom in / out / reset</span>
+                  <b>⌥ + / − / 0</b><span>table row height — tighter / roomier / reset</span>
                   <b>⌘,</b><span>settings (kubeconfig, shell)</span>
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
@@ -8565,7 +9030,11 @@ function App() {
                 onClick={(e) => e.stopPropagation()}
               >
                 <h3>
-                  {dryRun()!.ok ? "✓ dry-run passed" : "dry-run failed"}
+                  {!dryRun()!.ok
+                    ? "dry-run failed"
+                    : dryRun()!.text.startsWith("# previewed with force")
+                      ? "✓ dry-run passed — with force"
+                      : "✓ dry-run passed"}
                   <span class="dim gv">server-side, not persisted</span>
                 </h3>
                 <Show

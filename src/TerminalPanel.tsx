@@ -102,7 +102,15 @@ export default function TerminalPanel(props: {
     items[next]?.focus();
   }
   let sessionId: number | null = null;
-  const isLogs = props.target.kind === "logs" || props.target.kind === "wlogs";
+  // Captured, not read through props on every use: the panel's owner may
+  // drop the target the moment its window closes, and output can still be
+  // in flight — `target.kind` then throws on a null. One target per
+  // panel for its whole life, so there is nothing to lose by pinning it.
+  const target = props.target;
+  // Set on unmount: a channel message that arrives after cleanup has no
+  // terminal left to write to.
+  let disposed = false;
+  const isLogs = target.kind === "logs" || target.kind === "wlogs";
   // Buffer the streamed log text (for copy/download). Capped so a
   // long-lived followed log can't grow the buffer without bound, and
   // ANSI colour codes (the wlogs per-pod prefix) are stripped so the
@@ -182,7 +190,7 @@ export default function TerminalPanel(props: {
   let colorBuf = "";
   function writeLog(d: string) {
     if (isLogs) pushLog(d);
-    if (props.target.kind !== "logs") {
+    if (target.kind !== "logs") {
       term?.write(d);
       return;
     }
@@ -206,9 +214,9 @@ export default function TerminalPanel(props: {
       activeMatchColorOverviewRuler: "#ffcc33",
     },
   };
-  const [logPrev, setLogPrev] = createSignal(!!props.target.logPrevious);
-  const [logTs, setLogTs] = createSignal(!!props.target.logTimestamps);
-  const [logSince, setLogSince] = createSignal(props.target.logSince ?? 0);
+  const [logPrev, setLogPrev] = createSignal(!!target.logPrevious);
+  const [logTs, setLogTs] = createSignal(!!target.logTimestamps);
+  const [logSince, setLogSince] = createSignal(target.logSince ?? 0);
   const [findQ, setFindQ] = createSignal("");
 
   const onWinResize = () => props.active && fit?.fit();
@@ -365,7 +373,7 @@ export default function TerminalPanel(props: {
       return true;
     });
 
-    const t = props.target;
+    const t = target;
     if (t.kind === "node") {
       term.write(
         `\x1b[90mstarting privileged helper pod on ${t.name}… (up to 30s)\x1b[0m\r\n`,
@@ -386,6 +394,9 @@ export default function TerminalPanel(props: {
     if (t.kind === "logs") term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
+      // Stopping a session is not instant: the backend can still be
+      // draining what the process already printed.
+      if (disposed) return;
       // The marker carries a verdict when the session ran one command:
       // ":0" is what a pre-connect step has to clear to go on connecting.
       if (d === "\u0000exit" || d === "\u0000exit:0") {
@@ -488,6 +499,7 @@ export default function TerminalPanel(props: {
   });
 
   onCleanup(() => {
+    disposed = true;
     window.removeEventListener("resize", onWinResize);
     if (sessionId != null) void invoke("exec_stop", { id: sessionId });
     term?.dispose();
@@ -496,8 +508,8 @@ export default function TerminalPanel(props: {
   // A banner at the top of the stream so it's unmistakable which
   // instance you're reading — the running container or its dead one.
   const logHeaderLine = () => {
-    const c = props.target.container
-      ? `container "${props.target.container}"`
+    const c = target.container
+      ? `container "${target.container}"`
       : "the container";
     return logPrev()
       ? `\x1b[30;43m PREVIOUS \x1b[0m \x1b[33mdead instance of ${c} — the crash right before the last restart (only the most recent one)\x1b[0m\r\n`
@@ -506,7 +518,7 @@ export default function TerminalPanel(props: {
 
   // Re-open a pod-log stream with the current toolbar options.
   async function reloadLogs() {
-    if (props.target.kind !== "logs" || !term) return;
+    if (target.kind !== "logs" || !term) return;
     if (sessionId != null) {
       void invoke("exec_stop", { id: sessionId });
       sessionId = null;
@@ -517,15 +529,18 @@ export default function TerminalPanel(props: {
     term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
+      // Stopping a session is not instant: the backend can still be
+      // draining what the process already printed.
+      if (disposed) return;
       if (d === "\u0000exit") return;
       writeLog(d);
     };
     try {
       sessionId = await invoke<number>("log_start", {
-        context: props.target.context,
-        namespace: props.target.namespace,
-        pod: props.target.name,
-        container: props.target.container ?? null,
+        context: target.context,
+        namespace: target.namespace,
+        pod: target.name,
+        container: target.container ?? null,
         tail: 500,
         previous: logPrev(),
         sinceSeconds: logSince() > 0 ? logSince() : null,
@@ -550,7 +565,7 @@ export default function TerminalPanel(props: {
   async function downloadLogs() {
     // The webview ignores <a download>; save through the native dialog.
     const path = await save({
-      defaultPath: `${props.target.name}.log`,
+      defaultPath: `${target.name}.log`,
       filters: [{ name: "log", extensions: ["log", "txt"] }],
     });
     if (!path) return;
@@ -611,7 +626,7 @@ export default function TerminalPanel(props: {
           <button class="btn sm" title="previous match (⇧↵)" onClick={() => doFind(true)}>
             ↑
           </button>
-          <Show when={props.target.kind === "logs"}>
+          <Show when={target.kind === "logs"}>
             <span class="log-sep" />
             <span
               class="log-seg"

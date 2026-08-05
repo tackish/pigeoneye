@@ -151,6 +151,19 @@ async fn watch_start(
     .await
 }
 
+/// Search one kind by name across several open contexts.
+#[tauri::command]
+async fn search_contexts(
+    state: State<'_, AppState>,
+    contexts: Vec<String>,
+    resource: ResourceType,
+    query: String,
+    refresh: bool,
+    channel: Channel<k8s::SearchBatch>,
+) -> Result<(), String> {
+    k8s::search_contexts(&state, contexts, resource, query, refresh, channel).await
+}
+
 #[tauri::command]
 async fn watch_stop(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     k8s::watch_stop(&state, id).await
@@ -666,6 +679,7 @@ pub fn run() {
             cached_list,
             list_snapshot,
             watch_start,
+            search_contexts,
             watch_stop,
             get_resource,
             apply_resource,

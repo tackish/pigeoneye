@@ -42,6 +42,10 @@ coalesced into batches, and a view cache that resumes the watch on return.
   type). **Pin** frequently-used kinds into your own **groups**.
 - **Search that finds things** — full-text over *every* field, plus regex,
   `!`negation, per-column value filters, and numeric comparisons (`> 500`).
+- **Search every open cluster at once** — `: pod api-server` asks all of
+  them and says which cluster each answer came from; picking one switches
+  tab, kind and namespace and lands the cursor on the row. Costs nothing
+  until you ask, and the clusters you have browsed answer from memory.
 - **A real log viewer** — follow, previous (crashed) container, since
   windows, timestamps, in-view search, copy/download, and combined
   workload logs.
@@ -52,10 +56,16 @@ coalesced into batches, and a view cache that resumes the watch on return.
   create-from-template, scale, rollout restart / history / undo, drain,
   CronJob trigger, secret reveal, **port-forward** manager, live **`top`**
   metrics, and **`auth can-i`**.
-- **Keyboard-first**, color-coded multi-cluster tabs, light/dark,
-  **one-click re-login** (AWS SSO, gcloud, Teleport, Azure, OIDC) when a
-  token expires, and **in-app updates** — the top bar flags a new release
-  and upgrades in place, no `brew` needed.
+- **Logins that can ask you things** — an expired token re-logs in from a
+  terminal inside the app (AWS SSO, gcloud, Teleport, Azure, OIDC), so a
+  CLI that wants an OTP or a passphrase has somewhere to ask. A kubeconfig
+  `exec` block holds one command and has no "run this first" hook, so each
+  context can also carry a **pre-connect command** of its own — `tsh
+  login`, a bastion tunnel, a VPN — run before connecting and kept on your
+  machine rather than in a shared kubeconfig.
+- **Keyboard-first**, color-coded multi-cluster tabs, light/dark, and
+  **in-app updates** — the top bar flags a new release and upgrades in
+  place, no `brew` needed.
 
 ## vs. k9s & Lens
 
@@ -76,7 +86,9 @@ coalesced into batches, and a view cache that resumes the watch on return.
 | CronJob trigger / suspend | ✅ | ✅ | — |
 | Node & pod **metrics columns** (metrics-server) | ✅ | ✅ | needs Prometheus |
 | `auth can-i` / permissions | ✅ | reverse-lookup | RBAC views |
-| Auth auto-login (AWS SSO / gcloud) | ✅ | — | — |
+| Search by name across every open cluster | ✅ | — | — |
+| Auth re-login, including CLIs that prompt (OTP) | ✅ | — | — |
+| Per-context pre-connect command (tunnel / `tsh login`) | ✅ | — | — |
 | Time-series metric charts | — | — | ✅ (Prometheus) |
 | Helm / extensions / xray tree / linters | — | xray/popeye/plugins | Helm/extensions |
 
@@ -129,6 +141,14 @@ npm run tauri dev     # or run directly
 3. **More kubeconfig files?** Open **⚙ settings** and add file paths
    (e.g. `~/.kube/staging-config`). All files are merged into the context
    list, and each context remembers which file it came from.
+4. **Cluster needs something first?** Some clusters are only reachable
+   after a login or a tunnel that the kubeconfig cannot express. Hit **⋯**
+   next to a context in either picker and give it a command — it runs in a
+   terminal before the connection, so anything it asks you, you can answer:
+
+   ```
+   tsh status >/dev/null 2>&1 || tsh login --proxy=teleport.example.com:443
+   ```
 
 ## License
 

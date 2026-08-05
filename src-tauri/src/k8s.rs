@@ -35,6 +35,18 @@ pub struct AppState {
     /// Arc so the background page-streamer can cache the completed list
     /// once every page is in.
     pub lists: std::sync::Arc<RwLock<Vec<(String, CachedList)>>>,
+    /// Names seen per (context, kind), for searching every open cluster at
+    /// once. Kept apart from `lists`: that cache holds six whole tables and
+    /// evicts, and a search across five contexts would flush every view the
+    /// user had open. This holds names only — a few hundred KB for a
+    /// cluster whose pod list is 6.8MB — so it can just stay.
+    pub names: RwLock<std::collections::HashMap<String, NameIndex>>,
+}
+
+#[derive(Clone)]
+pub struct NameIndex {
+    pub rows: Vec<(Option<String>, String)>,
+    pub at: std::time::Instant,
 }
 
 pub struct ExecSession {
@@ -1166,6 +1178,198 @@ async fn seed_search_from_rows(
     s.generation
 }
 
+#[derive(Serialize, Clone)]
+pub struct SearchHit {
+    pub context: String,
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+const SEARCH_HITS_MAX: usize = 200;
+
+#[derive(Serialize, Clone)]
+pub struct SearchBatch {
+    pub context: String,
+    pub hits: Vec<SearchHit>,
+    /// Total matches, which is more than `hits` holds when a query is
+    /// broad. Shown rather than dropped: a silently cut list reads as a
+    /// complete answer.
+    pub total: usize,
+    /// How old the names behind these hits are. 0 means just fetched.
+    pub age_ms: u64,
+    pub error: Option<String>,
+}
+
+fn name_key(context: &str, rt: &ResourceType) -> String {
+    format!("{context}|{}/{}", rt.group, rt.kind)
+}
+
+/// Names of one kind in one context, from the index when it holds them and
+/// from the cluster otherwise.
+async fn names_for(
+    state: &AppState,
+    context: &str,
+    rt: &ResourceType,
+    refresh: bool,
+) -> Result<(Vec<(Option<String>, String)>, u64), String> {
+    let key = name_key(context, rt);
+    if !refresh {
+        if let Some(idx) = state.names.read().await.get(&key) {
+            return Ok((idx.rows.clone(), idx.at.elapsed().as_millis() as u64));
+        }
+    }
+    let client = client(state, context).await?;
+    // Same reasoning as list_resources: the printer's first cell is the
+    // name, but a list spanning namespaces needs the object to know which
+    // namespace each row is in.
+    let include = if rt.namespaced { "Metadata" } else { "None" };
+    // Page to the end. A single fetch stops at the server page limit —
+    // 500 rows with object metadata — and an index that quietly holds the
+    // first 500 pods of a cluster is worse than no index at all: the
+    // search would answer "not here" about things that are.
+    let mut rows: Vec<(Option<String>, String)> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        // Bigger pages than a live view uses. That limit exists so rows
+        // reach the screen early; nothing here is streamed, so a 24k-pod
+        // kind costs 12 requests instead of 48.
+        let page =
+            fetch_table_page(&client, rt, None, include, None, token.as_deref(), Some(2000))
+                .await?;
+        if let Some(list) = page.get("rows").and_then(|r| r.as_array()) {
+            rows.extend(list.iter().filter_map(|r| {
+                let cells = r
+                    .get("cells")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let obj = r.get("object").cloned().unwrap_or(serde_json::Value::Null);
+                let row = row_from_object(&obj, cells);
+                (!row.name.is_empty()).then_some((row.namespace, row.name))
+            }));
+        }
+        token = continue_token(&page);
+        // A ceiling on the walk, so one enormous kind cannot pull the app
+        // through hundreds of pages. Names are ~60 bytes each, so this is
+        // a few MB — far past any list a human searches by name.
+        if token.is_none() || rows.len() >= 50_000 {
+            break;
+        }
+    }
+    store_names(state, key, rows.clone()).await;
+    Ok((rows, 0))
+}
+
+/// Search one kind by name across several contexts, one batch per context
+/// as it lands. Nothing here writes the list cache — see `names`.
+pub async fn search_contexts(
+    state: &AppState,
+    contexts: Vec<String>,
+    rt: ResourceType,
+    query: String,
+    refresh: bool,
+    channel: Channel<SearchBatch>,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    let q = query.trim().to_lowercase();
+    let hits_from = |rows: Vec<(Option<String>, String)>, context: &str| -> (Vec<SearchHit>, usize) {
+        let matched: Vec<SearchHit> = rows
+            .into_iter()
+            .filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q))
+            .map(|(namespace, name)| SearchHit {
+                context: context.to_string(),
+                namespace,
+                name,
+            })
+            .collect();
+        let total = matched.len();
+        (matched.into_iter().take(SEARCH_HITS_MAX).collect(), total)
+    };
+    // Contexts in parallel so the wait is one round trip rather than the
+    // sum of them, but only a few at a time: each uncached one pulls a
+    // whole kind, and four of those at once is already a lot of memory in
+    // flight. Each reports on its own, so the list fills as answers land.
+    futures::stream::iter(contexts.into_iter().map(|ctx| {
+        let rt = rt.clone();
+        let channel = channel.clone();
+        async move {
+            let batch = match names_for(state, &ctx, &rt, refresh).await {
+                Ok((rows, age_ms)) => {
+                    let (hits, total) = hits_from(rows, &ctx);
+                    SearchBatch {
+                        hits,
+                        total,
+                        context: ctx,
+                        age_ms,
+                        error: None,
+                    }
+                }
+                Err(e) => SearchBatch {
+                    context: ctx,
+                    hits: Vec::new(),
+                    total: 0,
+                    age_ms: 0,
+                    error: Some(e),
+                },
+            };
+            let _ = channel.send(batch);
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<()>>()
+    .await;
+    Ok(())
+}
+
+/// Fold a list the user already loaded into the name index — the rows are
+/// in hand, so the contexts they visit index themselves for free.
+/// Kinds worth remembering names for. Events are the exception that
+/// matters: tens of thousands of rows whose names are hashes nobody
+/// searches for, rewritten constantly.
+fn indexable(rt: &ResourceType) -> bool {
+    !(rt.group.is_empty() && rt.kind == "Event") && rt.kind != "Event"
+}
+
+/// One index entry per (context, kind) would grow without end across a
+/// long session; keep the most recent ones.
+const NAME_INDEX_MAX: usize = 40;
+
+async fn store_names(state: &AppState, key: String, rows: Vec<(Option<String>, String)>) {
+    let mut idx = state.names.write().await;
+    if idx.len() >= NAME_INDEX_MAX && !idx.contains_key(&key) {
+        if let Some(oldest) = idx
+            .iter()
+            .min_by_key(|(_, v)| v.at)
+            .map(|(k, _)| k.clone())
+        {
+            idx.remove(&oldest);
+        }
+    }
+    idx.insert(
+        key,
+        NameIndex {
+            rows,
+            at: std::time::Instant::now(),
+        },
+    );
+}
+
+pub async fn harvest_names(state: &AppState, context: &str, rt: &ResourceType, rows: &[TableRow]) {
+    if !indexable(rt) {
+        return;
+    }
+    // Only a list of everything describes the whole kind; a namespaced or
+    // filtered view would index a slice and look complete.
+    store_names(
+        state,
+        name_key(context, rt),
+        rows.iter()
+            .map(|r| (r.namespace.clone(), r.name.clone()))
+            .collect(),
+    )
+    .await;
+}
+
 async fn store_cached(
     lists: &RwLock<Vec<(String, CachedList)>>,
     key: String,
@@ -1569,6 +1773,13 @@ pub async fn list_resources(
             )
             .await;
         });
+    }
+    // A list of the whole kind is exactly what the name index wants, and
+    // it is already in hand — so browsing indexes the contexts you visit
+    // at no cost. A namespaced or filtered view is a slice and would look
+    // complete, so those are left alone.
+    if namespace.is_none() && field_selector.is_none() && !truncated {
+        harvest_names(state, &context, &rt, &rows).await;
     }
     Ok(ResourceTable {
         columns,
@@ -2281,18 +2492,33 @@ pub async fn dry_run_apply(
     let value: serde_json::Value = serde_yaml::from_str(&yaml).map_err(err)?;
     let client = client(state, &context).await?;
     let api = dyn_api(client, &rt, namespace.as_deref());
-    // Match the real apply (force:false) so a field-ownership conflict
-    // surfaces in the preview instead of the dry run falsely passing.
-    let pp = PatchParams {
+    let pp = |force: bool| PatchParams {
         dry_run: true,
-        force: false,
+        force,
         field_manager: Some("pigeoneye".into()),
         ..Default::default()
     };
-    let result: DynamicObject = api
-        .patch(&name, &pp, &Patch::Apply(&value))
-        .await
-        .map_err(err)?;
+    // Unforced first, because a field-ownership conflict is worth knowing
+    // about: the real apply would hit it too. But refusing to preview at
+    // all is the wrong answer — anything under a GitOps controller owns
+    // fields, and those are exactly the objects worth previewing. So on a
+    // conflict, force the dry run (nothing is written either way) and
+    // carry the conflict into the preview instead of losing it.
+    let (result, conflict): (DynamicObject, Option<String>) =
+        match api.patch(&name, &pp(false), &Patch::Apply(&value)).await {
+            Ok(r) => (r, None),
+            Err(e) => {
+                let msg = err(&e);
+                if !msg.to_lowercase().contains("conflict") {
+                    return Err(msg);
+                }
+                let forced = api
+                    .patch(&name, &pp(true), &Patch::Apply(&value))
+                    .await
+                    .map_err(err)?;
+                (forced, Some(msg))
+            }
+        };
     let mut v = serde_json::to_value(&result).map_err(err)?;
     // Trim the noise so the returned manifest reads like a desired state.
     if let Some(m) = v.pointer_mut("/metadata").and_then(|m| m.as_object_mut()) {
@@ -2301,7 +2527,16 @@ pub async fn dry_run_apply(
         }
     }
     v.as_object_mut().map(|o| o.remove("status"));
-    serde_yaml::to_string(&v).map_err(err)
+    let yaml = serde_yaml::to_string(&v).map_err(err)?;
+    Ok(match conflict {
+        // A comment, so the body below is still the manifest the server
+        // would produce — and still copyable as YAML.
+        Some(c) => format!(
+            "# previewed with force: another field manager owns some of\n             # these fields, so applying for real needs force too.\n             # {}\n\n{yaml}",
+            c.replace('\n', " ").trim()
+        ),
+        None => yaml,
+    })
 }
 
 /// Create a brand-new object from a manifest (the "New" flow). A plain
