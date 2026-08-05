@@ -71,8 +71,12 @@ async fn auth_hint(context: String, path: Option<String>) -> Result<k8s::AuthHin
 }
 
 #[tauri::command]
-async fn auth_login(context: String, path: Option<String>) -> Result<(), String> {
-    k8s::auth_login(context, path).await
+async fn local_shell_start(
+    state: State<'_, AppState>,
+    command: Option<String>,
+    channel: tauri::ipc::Channel<String>,
+) -> Result<u32, String> {
+    k8s::local_shell_start(&state, command, channel).await
 }
 
 #[tauri::command]
@@ -656,7 +660,7 @@ pub fn run() {
             connect,
             disconnect,
             auth_hint,
-            auth_login,
+            local_shell_start,
             discover,
             list_resources,
             cached_list,

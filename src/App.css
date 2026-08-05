@@ -571,13 +571,21 @@ button.app-ver.err::after {
   gap: 10px;
 }
 
+/* Not a control: the command the Log in button will run, shown so you
+   know what gets spawned. A border and a pill shape next to a primary
+   button read as a secondary button, so it invited a click that could
+   never do anything — keep it plain code, selectable like text. */
 .auth-cmd {
   color: var(--dim);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 2px 6px;
+  font-family: var(--font-mono);
   font-size: 11px;
+  user-select: text;
+  cursor: text;
+}
+
+.auth-cmd::before {
+  content: "runs ";
+  opacity: 0.65;
 }
 
 .error-body {
@@ -2190,6 +2198,13 @@ kbd.key {
   background: var(--bg);
 }
 
+.launcher-tools {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
 .launcher h1 {
   font-size: 20px;
   letter-spacing: -0.02em;
@@ -2286,12 +2301,157 @@ kbd.key {
   padding: 4px 0;
 }
 
+/* The row owns the hover state now: the context button and the
+   pre-connect button sit side by side inside it. */
+.launcher-row {
+  display: flex;
+  align-items: center;
+}
+
+/* "⋯" rather than "+": this opens what the row already has, it does not
+   add another of anything. */
+.launcher-pre {
+  background: none;
+  border: none;
+  color: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  padding: 5px 10px;
+  line-height: 1;
+}
+
+/* Invisible until the row is under the cursor. */
+.launcher-row:hover .launcher-pre,
+.launcher-row.active .launcher-pre {
+  color: var(--dim);
+}
+
+/* A row that holds a command says so without being asked. */
+.launcher-pre.set {
+  color: var(--accent);
+}
+
+.launcher-pre:hover {
+  color: var(--fg);
+}
+
+/* The top bar's picker is a context list, so it needs the width of one. */
+/* A tab whose cluster has not answered yet. A glyph that only spins is
+   easy to miss at this size, so it also says what it is doing — and the
+   whole tab breathes, which the eye catches without being looked at. */
+.tab.pending {
+  animation: tab-breathe 1.6s ease-in-out infinite;
+  /* The base tab's border is transparent, so dashing it alone shows
+     nothing — it needs a colour to dash. */
+  border-color: var(--border);
+  border-style: dashed;
+  /* Nothing to click yet. */
+  cursor: default;
+}
+
+.tab.pending .tab-name {
+  font-style: italic;
+}
+
+.tab-connecting {
+  color: var(--accent);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+/* A ring with one lit quarter reads as motion far better than a
+   character does. */
+.tab-spin {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tab-spin 0.8s linear infinite;
+}
+
+@keyframes tab-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes tab-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.ctx-pop {
+  width: 420px;
+}
+
+.ctx-empty {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.ns-pop .launcher-item {
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
+.launcher-pre-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 10px 8px;
+  background: var(--bg3);
+}
+
+.pre-cmd {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.pre-cmd:focus {
+  outline: none;
+}
+
+.pre-cmd-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.pre-cmd-actions .dim {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .launcher-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   background: none;
   border: none;
   color: var(--fg);
@@ -2302,6 +2462,7 @@ kbd.key {
   text-align: left;
 }
 
+.launcher-row.active,
 .launcher-item.active {
   background: var(--accent-soft);
   color: var(--accent);
@@ -2312,7 +2473,21 @@ kbd.key {
   white-space: nowrap;
 }
 
+/* The name is the row. Without a flex basis of its own it loses the
+   space-between tug of war to a long meta and shrinks to nothing, which
+   reads as the context having vanished. */
 .launcher-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.launcher-item .dim {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2889,15 +3064,31 @@ details.fold[open] > summary::before {
   padding: 3px 8px;
 }
 
+/* ">_" only reads as a terminal in a mono face. */
+.icon-btn.term-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: -0.05em;
+}
+
 .icon-btn:hover {
   color: var(--fg);
   background: var(--bg3);
 }
 
+/* Settings takes the whole area under the top bar. Sharing it with the
+   sidebar and table left a half-covered app behind the panel. */
 .settings {
   background: var(--bg-drawer);
   border-bottom: 1px solid var(--border);
   padding: 12px 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.body.hidden {
+  display: none;
 }
 
 .settings-head {
@@ -3479,6 +3670,56 @@ details.fold[open] > summary::before {
   padding: 18px 20px;
   width: min(440px, 90%);
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+/* The shell that fixes a connection, opening under the banner that says
+   what is wrong — not over it. A row of the app's own layout, so the
+   table below simply moves down. */
+.shell-panel {
+  display: flex;
+  flex-direction: column;
+  height: 320px;
+  min-height: 160px;
+  background: var(--editor-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.shell-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.shell-panel-title {
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+}
+
+.shell-panel-head .dim {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-panel-body {
+  flex: 1;
+  min-height: 0;
+}
+
+/* On the launcher everything is centred and content-width; the shell
+   needs the room a terminal needs. */
+.launcher .shell-panel {
+  width: min(880px, 94vw);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
 }
 
 .modal h3 {

@@ -776,6 +776,11 @@ function App() {
   }
   const [pickerQ, setPickerQ] = createSignal("");
   const [pickerIdx, setPickerIdx] = createSignal(0);
+  // The top bar's context picker. Declared with the launcher's because
+  // ctxItems below reads them, and a memo runs once the moment it is made.
+  const [ctxOpen, setCtxOpen] = createSignal(false);
+  const [ctxQuery, setCtxQuery] = createSignal("");
+  const [ctxIdx, setCtxIdx] = createSignal(0);
   const lastSession: string[] = (() => {
     try {
       return JSON.parse(localStorage.getItem(SESSION_KEY) ?? "{}").tabs ?? [];
@@ -793,6 +798,15 @@ function App() {
       .filter((c) => !q || c.name.toLowerCase().includes(q))
       .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   });
+  /// The top bar's picker: same list minus what is already open.
+  const ctxItems = createMemo(() => {
+    const q = ctxQuery().toLowerCase().trim();
+    return contexts()
+      .filter((c) => !tabs().includes(c.name))
+      .filter((c) => !q || c.name.toLowerCase().includes(q))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  });
+
   // Keep the keyboard-selected context in view as the cursor moves.
   createEffect(() => {
     if (tabs().length) return;
@@ -850,7 +864,15 @@ function App() {
         ?.scrollIntoView?.({ inline: "nearest", block: "nearest" }),
     );
   });
-  const [connecting, setConnecting] = createSignal<string | null>(null);
+  // Every connection in flight, not just one: a cluster behind a dead
+  // endpoint takes its whole timeout to fail, and blocking the picker for
+  // it means one unreachable cluster holds up the entire app.
+  const [connecting, setConnecting] = createSignal<string[]>([]);
+  const isConnecting = (name: string) => connecting().includes(name);
+  const beginConnect = (name: string) =>
+    setConnecting([...connecting().filter((n) => n !== name), name]);
+  const endConnect = (name: string) =>
+    setConnecting(connecting().filter((n) => n !== name));
   // True from launch while last session's tabs reconnect, so the launcher
   // (context picker) doesn't flash before the restored tabs appear. We know
   // synchronously whether there's anything to restore from the saved tabs.
@@ -1154,8 +1176,9 @@ function App() {
     message: string;
     command: string | null;
     can_login: boolean;
+    /// The context's own credential command, verbatim from its exec block.
+    exec_command: string | null;
   } | null>(null);
-  const [loggingIn, setLoggingIn] = createSignal(false);
 
   /// On an auth failure, ask the backend how this context logs in and
   /// offer to do it — an expired SSO session is a browser click away.
@@ -1166,6 +1189,7 @@ function App() {
         message: string;
         command: string | null;
         can_login: boolean;
+        exec_command: string | null;
       }>("auth_hint", { context: name, path: sourceOf(name) || null });
       setAuthHint({ context: name, ...hint });
     } catch {
@@ -1173,25 +1197,173 @@ function App() {
     }
   }
 
-  /// Run the login flow (opens the browser), then reconnect.
-  async function runLogin() {
+  /// The login CLI runs in a terminal of its own rather than off-screen:
+  /// `tsh login` and friends ask for an OTP or a password, and they only
+  /// ask when a tty is on the other end. The window is where the user
+  /// reads what it wants and types the answer back.
+  const [loginTarget, setLoginTarget] = createSignal<ShellTarget | null>(null);
+  let shellApi: { focus: () => void; send: (text: string) => void } | undefined;
+
+  // What a context needs before it can be connected to at all: `tsh login`
+  // for a Teleport cluster, an ssh tunnel to a bastion, a VPN. None of it
+  // is expressible in a kubeconfig — an `exec` block holds one command and
+  // has no "run this first" — and it is per-machine anyway, so it lives
+  // here rather than in a file the team shares.
+  const PRE_KEY = "pigeoneye.preconnect";
+  const [preCmds, setPreCmds] = createSignal<Record<string, string>>(
+    (() => {
+      try {
+        return JSON.parse(localStorage.getItem(PRE_KEY) ?? "{}");
+      } catch {
+        return {};
+      }
+    })(),
+  );
+  // Once per launch is the useful frequency: enough that opening a cluster
+  // just works, few enough that a second tab doesn't re-prompt.
+  const preRan = new Set<string>();
+  const [preEdit, setPreEdit] = createSignal<string | null>(null);
+  const [preText, setPreText] = createSignal("");
+
+  function savePreCmd(context: string, cmd: string) {
+    const next = { ...preCmds() };
+    if (cmd.trim()) next[context] = cmd.trim();
+    else delete next[context];
+    setPreCmds(next);
+    localStorage.setItem(PRE_KEY, JSON.stringify(next));
+    setPreEdit(null);
+  }
+
+  function editPreCmd(context: string) {
+    setPreText(preCmds()[context] ?? "");
+    setPreEdit(preEdit() === context ? null : context);
+  }
+
+  /// Both context pickers — the launcher's list and the top bar's — carry
+  /// the same control, because either is a place you might realise this
+  /// cluster needs a tunnel first.
+  const preConnectButton = (name: string) => (
+    <button
+      class="launcher-pre"
+      classList={{ set: !!preCmds()[name] }}
+      title={
+        preCmds()[name]
+          ? `runs first: ${preCmds()[name]}`
+          : "run something before connecting to this context (⌥↵)"
+      }
+      onClick={(e) => {
+        e.stopPropagation();
+        editPreCmd(name);
+      }}
+    >
+      ⋯
+    </button>
+  );
+
+  const preConnectEditor = (name: string) => (
+    <Show when={preEdit() === name}>
+      <div class="launcher-pre-edit">
+        {/* A login line runs long — proxy, auth method, user — and a
+            single-line input shows whichever end you are not looking at.
+            This wraps, so the whole command is on screen while you edit
+            it. */}
+        <textarea
+          class="pre-cmd"
+          rows={2}
+          spellcheck={false}
+          placeholder="tsh status >/dev/null || tsh login --proxy=…"
+          value={preText()}
+          ref={(el) => setTimeout(() => el.focus())}
+          onInput={(e) => setPreText(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            // ⇧↵ for a second line — chaining two commands is fair game.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              savePreCmd(name, preText());
+            }
+            if (e.key === "Escape") setPreEdit(null);
+          }}
+        />
+        <div class="pre-cmd-actions">
+          <span class="dim">runs before connecting · ↵ save · esc cancel</span>
+          <Show when={preCmds()[name]}>
+            <button class="btn sm" onClick={() => savePreCmd(name, "")}>
+              clear
+            </button>
+          </Show>
+          <button class="btn sm" onClick={() => savePreCmd(name, preText())}>
+            save
+          </button>
+        </div>
+      </div>
+    </Show>
+  );
+
+  /// One shell, in a window, that the buttons type into.
+  ///
+  /// Not a process per button: fixing a cluster is rarely one command —
+  /// `tsh login` and then the token, a tunnel left running, a second try
+  /// with a different flag. Running the command as a line in a live shell
+  /// keeps all of that in one transcript, lets the user edit it before it
+  /// runs, and means a login no longer replaces a shell they were using.
+  function runInShell(context: string, command?: string) {
+    setError(null);
+    const api = shellApi;
+    if (loginTarget() && api) {
+      if (command) api.send(command + "\n");
+      else api.focus();
+      return;
+    }
+    setLoginTarget({
+      kind: "local",
+      context,
+      name: "local shell",
+      initialCommand: command,
+    });
+  }
+
+  function runLogin() {
     const h = authHint();
     if (!h) return;
-    setLoggingIn(true);
-    setError(null);
-    try {
-      await invoke("auth_login", {
-        context: h.context,
-        path: sourceOf(h.context) || null,
-      });
-      setAuthHint(null);
-      await reconnect(h.context);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoggingIn(false);
-    }
+    runInShell(h.context, h.command ?? undefined);
   }
+
+  /// The command the cluster itself names, rather than one we inferred —
+  /// the only one that is right when the kubeconfig points at a wrapper
+  /// that does its own login first.
+  function runCredentialCommand() {
+    const h = authHint();
+    if (!h?.exec_command) return;
+    runInShell(h.context, h.exec_command);
+  }
+
+  function openLocalShell(context = "") {
+    runInShell(context);
+  }
+
+  /// Closing unmounts the terminal, which stops the session and kills the
+  /// shell — so this is also how a login is cancelled.
+  function closeLogin() {
+    const t = loginTarget();
+    setLoginTarget(null);
+    shellApi = undefined;
+    if (!t) return;
+    // No context behind it means it came from the picker, where the useful
+    // thing afterwards is re-reading the kubeconfig: `tsh kube login` and
+    // `aws eks update-kubeconfig` both write new contexts, and a stale list
+    // would hide the cluster the user just went and got.
+    if (!t.context) {
+      void loadContexts(false);
+      return;
+    }
+    // The shell says nothing about whether credentials got fixed, so
+    // closing it always retries — a failed retry just puts back the banner
+    // that was already there.
+    setAuthHint(null);
+    void reconnect(t.context);
+  }
+
   /// Turn a raw kube/exec error into one readable line. The exec
   /// failure dumps the whole get-token command and a Rust Output{...}
   /// struct; the part that matters is the plugin's stderr.
@@ -1203,6 +1375,17 @@ function App() {
       if (/SSO Token|sso/i.test(text)) return "AWS SSO session expired — log in to renew it.";
       if (text) return text;
     }
+    // kube-rs says "failed to load current context: <name>" when the name
+    // isn't in the kubeconfig at all. That is what a restored tab hits
+    // after the tool that wrote the entry took it back out — `tsh logout`
+    // strips its kube contexts, and a rotated kubeconfig loses them too.
+    if (/failed to load (?:the cluster of )?(?:current )?context/i.test(msg))
+      return "this context is no longer in your kubeconfig — re-run the login that created it (tsh kube login, aws eks update-kubeconfig, gcloud container clusters get-credentials), then reconnect.";
+    // kube-rs reports "failed to parse auth exec output" when the plugin
+    // printed no ExecCredential — because it errored, or asked something
+    // it could not ask, and wrote that to stderr instead.
+    if (/parse auth exec output|auth exec/i.test(msg))
+      return "this cluster's credential command produced no credentials — run it below to see what it wanted.";
     if (/exit status: 255|get-token/i.test(msg))
       return "the cluster's auth command failed — your credentials have likely expired.";
     if (/401|Unauthorized/i.test(msg)) return "unauthorized — the token was rejected.";
@@ -1216,14 +1399,14 @@ function App() {
   }
 
   const isAuthError = (msg: string) =>
-    /401|403|Unauthorized|Forbidden|credential|token|expired|exec plugin|no such host|refused|timed out|certificate/i.test(
+    /401|403|Unauthorized|Forbidden|credential|token|expired|exec plugin|auth exec|exec output|no such host|refused|timed out|certificate/i.test(
       msg,
     );
 
   /// Drop the cached client and reconnect — the fix for an expired SSO
   /// token, since kubeconfig exec credentials are re-run on connect.
   async function reconnect(name: string) {
-    setConnecting(name);
+    beginConnect(name);
     setError(null);
     try {
       await invoke("disconnect", { context: name });
@@ -1238,7 +1421,7 @@ function App() {
       setError(`could not connect to ${name}: ${msg}`);
       if (isAuthError(msg)) void offerLogin(name);
     } finally {
-      setConnecting(null);
+      endConnect(name);
     }
   }
 
@@ -2423,7 +2606,22 @@ function App() {
       activate(name);
       return;
     }
-    setConnecting(name);
+    // Do the prerequisite first, in the open, rather than letting the
+    // connection hang on a credential that was never going to work. The
+    // panel connects on its own once the command exits clean.
+    const pre = preCmds()[name];
+    if (pre && !preRan.has(name)) {
+      setError(null);
+      setLoginTarget({
+        kind: "local",
+        context: name,
+        name: "pre-connect",
+        initialCommand: pre,
+        oneShot: true,
+      });
+      return;
+    }
+    beginConnect(name);
     setError(null);
     try {
       await setupContext(name);
@@ -2435,7 +2633,7 @@ function App() {
       setFailed([...failed().filter((f) => f.name !== name), { name, error: msg }]);
       if (isAuthError(msg)) void offerLogin(name);
     } finally {
-      setConnecting(null);
+      endConnect(name);
     }
   }
 
@@ -2489,7 +2687,7 @@ function App() {
       setRestoring(false);
       return;
     }
-    setConnecting(wanted.join(", "));
+    wanted.forEach(beginConnect);
     void Promise.all(
       wanted.map((name) =>
         setupContext(name)
@@ -2521,7 +2719,7 @@ function App() {
         if (act) activate(act);
       })
       .finally(() => {
-        setConnecting(null);
+        wanted.forEach(endConnect);
         setRestoring(false);
       });
   }
@@ -4356,6 +4554,14 @@ function App() {
     });
   }
 
+  /// One level up out of the table. Esc and ← share it so the two keys
+  /// can never drift apart.
+  function leaveTableForSidebar() {
+    setPane("sidebar");
+    const i = sidebarItems().findIndex((t) => t === selected());
+    if (i >= 0) setSideIdx(i);
+  }
+
   function onGlobalKey(e: KeyboardEvent) {
     const el = e.target as HTMLElement | null;
     // Anything inside the terminal dock (the log toolbar's buttons too, not
@@ -4384,6 +4590,15 @@ function App() {
         return;
       }
     }
+    // ⌘⇧S opens a shell on this machine, from anywhere — including the
+    // launcher, where the whole point is to fix credentials *before*
+    // spending a connection timeout finding out they were stale. Not ⌘⇧T:
+    // off-Mac that is already the terminal dock's own toggle.
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "s" || e.key === "S")) {
+      e.preventDefault();
+      if (!loginTarget()) openLocalShell();
+      return;
+    }
     // ⌘/Ctrl+⇧+↑/↓ resizes the open log/shell dock. While the terminal has
     // focus its own key handler forwards these (see TerminalPanel), so this
     // path is for when focus is elsewhere — hence the !termFocused guard.
@@ -4403,7 +4618,7 @@ function App() {
     // where focus sits, so it's fully keyboard-first. Letters still fall
     // through to the search box (which filters via onInput).
     if (tabs().length === 0) {
-      if (settingsOpen()) return;
+      if (settingsOpen() || preEdit()) return;
       const list = pickerList();
       if (e.key === "ArrowDown" || (e.ctrlKey && e.key === "n")) {
         e.preventDefault();
@@ -4420,7 +4635,9 @@ function App() {
       } else if (e.key === "Enter") {
         e.preventDefault();
         const c = list[pickerIdx()];
-        if (c) void openContext(c.name);
+        if (!c) return;
+        if (e.altKey) editPreCmd(c.name);
+        else void openContext(c.name);
       }
       return;
     }
@@ -4436,6 +4653,12 @@ function App() {
       return;
     }
     if (e.key === "Escape") {
+      // The login terminal handles its own Esc when it has focus; this is
+      // for when focus sits on the dialog's close button instead.
+      if (loginTarget()) {
+        closeLogin();
+        return;
+      }
       if (newOpen()) {
         // The editor's own Esc keymap blurred it and set nav mode; don't
         // also close on the same event.
@@ -4465,9 +4688,7 @@ function App() {
         setMatched(null);
       } else if (pane() === "table") {
         // one level up: the sidebar owns the arrow keys again
-        setPane("sidebar");
-        const i = sidebarItems().findIndex((t) => t === selected());
-        if (i >= 0) setSideIdx(i);
+        leaveTableForSidebar();
       } else popHistory();
       return;
     }
@@ -4555,7 +4776,8 @@ function App() {
       access() ||
       history() ||
       nsOpen() ||
-      cmdOpen()
+      cmdOpen() ||
+      loginTarget()
     )
       return;
     // The per-column filter menu has its own keyboard nav below; block the
@@ -4789,7 +5011,11 @@ function App() {
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
         if (BUTTON_ROWS[panelSec()]) {
           e.preventDefault();
-          moveWithinRow(e.key === "ArrowRight" ? 1 : -1);
+          // The left edge of the row is the end of the line, so ← keeps
+          // meaning "step up" there instead of dying against the clamp —
+          // the same thing it does from a section header.
+          if (e.key === "ArrowLeft" && actionIdx() <= 0) closeDetail();
+          else moveWithinRow(e.key === "ArrowRight" ? 1 : -1);
           return;
         }
         // Content sections: → steps onto their copy button(s); ← steps
@@ -5067,10 +5293,15 @@ function App() {
     } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
       // wide tables get cut off; pan them without a mouse
       e.preventDefault();
-      tableFocusRef?.scrollBy({
-        left: e.key === "ArrowRight" ? 260 : -260,
-        behavior: "auto",
-      });
+      // Panned fully left there is nothing more to give, so ← steps up to
+      // the sidebar rather than doing nothing — same level Esc leaves for.
+      if (e.key === "ArrowLeft" && (tableFocusRef?.scrollLeft ?? 0) <= 0)
+        leaveTableForSidebar();
+      else
+        tableFocusRef?.scrollBy({
+          left: e.key === "ArrowRight" ? 260 : -260,
+          behavior: "auto",
+        });
     } else if (e.key === "Home") {
       e.preventDefault();
       tableFocusRef?.scrollTo({ left: 0 });
@@ -5465,26 +5696,42 @@ function App() {
             <div class="auth-actions">
               <button
                 class="btn primary"
-                disabled={loggingIn()}
                 onClick={() => void runLogin()}
               >
-                {loggingIn()
-                  ? "logging in…"
-                  : authHint()!.kind === "aws-sso"
-                    ? `Log in with SSO${authHint()!.context ? ` (${authHint()!.context})` : ""}`
-                    : "Log in"}
+                {authHint()!.kind === "aws-sso"
+                  ? `Log in with SSO${authHint()!.context ? ` (${authHint()!.context})` : ""}`
+                  : "Log in"}
               </button>
               <Show when={authHint()!.command}>
                 <code class="auth-cmd">{authHint()!.command}</code>
               </Show>
             </div>
           </Show>
+          <div class="auth-actions">
+            <Show when={authHint()?.exec_command}>
+              <button
+                class="btn sm"
+                title={`run ${authHint()!.exec_command} with a terminal attached`}
+                onClick={() => runCredentialCommand()}
+              >
+                run credential command
+              </button>
+            </Show>
+            <button
+              class="btn sm"
+              title="run tsh login, aws sso login, a VPN — whatever this cluster needs"
+              onClick={() => openLocalShell(authHint()?.context ?? "")}
+            >
+              local shell
+            </button>
+          </div>
           <details class="error-detail">
             <summary>show details</summary>
             <pre>{error()}</pre>
           </details>
         </div>
       </Show>
+      {loginPanel()}
       <input
         class="search launcher-search"
         placeholder="search contexts…"
@@ -5498,35 +5745,59 @@ function App() {
       <div class="launcher-list">
         <For each={pickerList()}>
           {(c, i) => (
-            <button
-              class="launcher-item"
-              classList={{ active: pickerIdx() === i() }}
-              disabled={connecting() !== null}
-              onMouseEnter={() => setPickerIdx(i())}
-              onClick={() => void openContext(c.name)}
-            >
-              <span class="launcher-name">{c.name}</span>
-              <span class="dim">
-                {connecting() === c.name
-                  ? "connecting…"
-                  : [
-                      c.is_current ? "current" : "",
-                      lastSession.includes(c.name) ? "recent" : "",
-                      c.source ? basename(c.source) : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-              </span>
-            </button>
+            <>
+              <div
+                class="launcher-row"
+                classList={{ active: pickerIdx() === i() }}
+                onMouseEnter={() => setPickerIdx(i())}
+              >
+                <button
+                  class="launcher-item"
+                  disabled={isConnecting(c.name)}
+                  onClick={() => void openContext(c.name)}
+                >
+                  <span class="launcher-name">{c.name}</span>
+                  <span class="dim">
+                    {isConnecting(c.name)
+                      ? "connecting…"
+                      : [
+                          c.is_current ? "current" : "",
+                          lastSession.includes(c.name) ? "recent" : "",
+                          preCmds()[c.name] ? "pre-connect" : "",
+                          c.source ? basename(c.source) : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                  </span>
+                </button>
+                {/* Whatever this cluster needs first belongs next to the
+                    cluster, not buried in a settings page. */}
+                {preConnectButton(c.name)}
+              </div>
+              {preConnectEditor(c.name)}
+            </>
           )}
         </For>
         <Show when={pickerList().length === 0}>
           <p class="dim">no contexts found in your kubeconfig</p>
         </Show>
       </div>
-      <button class="btn" onClick={() => setSettingsOpen(true)}>
-        ⚙ kubeconfig files
-      </button>
+      <div class="launcher-tools">
+        <button class="btn" onClick={() => setSettingsOpen(true)}>
+          ⚙ kubeconfig files
+        </button>
+        {/* Here rather than only on the error banner: the credentials a
+            cluster needs are usually knowable before you pick it, and
+            finding out by waiting for a connection to time out is a bad
+            way to spend a minute. */}
+        <button
+          class="btn"
+          title="run tsh login, aws sso login, a VPN — whatever a cluster needs (⌘⇧S)"
+          onClick={() => openLocalShell()}
+        >
+          ▸ local shell
+        </button>
+      </div>
       <Show when={settingsOpen()}>{settingsPanel()}</Show>
     </div>
   );
@@ -5551,7 +5822,66 @@ function App() {
     </div>
   );
 
+  // Under the error banner rather than over everything: what the shell is
+  // there to fix is written directly above it, and a window that covers
+  // the message while you answer it is the wrong shape. Rendered on both
+  // screens, but only one of them is ever mounted.
+  const loginPanel = () => (
+    <Show when={loginTarget()}>
+      <div class="shell-panel">
+        <div class="shell-panel-head">
+          <span class="shell-panel-title">
+            {loginTarget()!.context
+              ? `shell — ${loginTarget()!.context}`
+              : "shell on this machine"}
+          </span>
+          <span class="dim">
+            answer whatever it asks · the buttons above type into it
+            {loginTarget()!.context ? " · closing retries the connection" : ""}
+          </span>
+          <button
+            class="close"
+            title="close (esc) — ends the shell"
+            onClick={() => closeLogin()}
+          >
+            ✕
+          </button>
+        </div>
+        <div class="shell-panel-body">
+          <TerminalPanel
+            target={loginTarget()!}
+            theme={theme()}
+            active={true}
+            // A pre-connect run holds the screen after it finishes: on
+            // success just long enough to read the verdict before the
+            // connection takes over, and on failure until the user has
+            // read why and closed it. A shell the user typed `exit` into
+            // needs neither.
+            onExit={(ok) => {
+              const t = loginTarget();
+              if (!t?.oneShot) return closeLogin();
+              if (!ok) return;
+              // Only a run that worked counts as done. Marking it earlier
+              // would mean a login the user got wrong could never be
+              // retried — picking the context again would skip straight to
+              // the connection that is going to fail.
+              if (t.context) preRan.add(t.context);
+              setTimeout(() => closeLogin(), 900);
+            }}
+            onLeave={() => closeLogin()}
+            onMinimize={() => {}}
+            onFocusChange={() => {}}
+            onCycleTab={() => {}}
+            onCloseTab={() => closeLogin()}
+            api={(a) => (shellApi = a)}
+          />
+        </div>
+      </div>
+    </Show>
+  );
+
   return (
+    <>
     <Show
       when={tabs().length > 0}
       fallback={restoring() ? restoreSplash() : launcher()}
@@ -5620,11 +5950,27 @@ function App() {
               requestAnimationFrame(measureTabs);
             }}
           >
+            {/* A connection in progress gets a tab of its own, so you can
+                see which cluster is taking its time — and start another
+                while it does. It becomes a real tab when it lands. */}
+            <For each={connecting().filter((n) => !tabs().includes(n))}>
+              {(name) => (
+                <div
+                  class="tab pending"
+                  style={{ "--ctx-hue": ctxHue(name) }}
+                  title={`connecting to ${name}…`}
+                >
+                  <span class="tab-spin" />
+                  <span class="tab-name">{name}</span>
+                  <span class="tab-connecting">connecting…</span>
+                </div>
+              )}
+            </For>
             <For each={tabs()}>
               {(name) => (
                 <div
                   class="tab"
-                  classList={{ active: active() === name }}
+                  classList={{ active: active() === name, pending: isConnecting(name) }}
                   style={{ "--ctx-hue": ctxHue(name) }}
                   onClick={() => active() !== name && activate(name)}
                 >
@@ -5685,29 +6031,94 @@ function App() {
             </Show>
           </Show>
         </div>
-        <select
-          class="ctx"
-          disabled={connecting() !== null}
-          value=""
-          onChange={(e) => {
-            const v = e.currentTarget.value;
-            e.currentTarget.value = "";
-            if (v) void openContext(v);
-          }}
-        >
-          <option value="">
-            {connecting() ? `connecting ${connecting()}…` : "+ add context"}
-          </option>
-          <For each={contexts().filter((c) => !tabs().includes(c.name))}>
-            {(c) => (
-              <option value={c.name}>
-                {c.name}
-                {c.is_current ? " (current)" : ""}
-                {c.source ? ` — ${basename(c.source)}` : ""}
-              </option>
-            )}
-          </For>
-        </select>
+        {/* A native select can't be searched, and can't hold the
+            pre-connect control — and a list of every cluster you have is
+            exactly the list you want to type into. */}
+        <div class="ns-picker">
+          <button
+            class="ctx ns-btn"
+            onClick={() => {
+              setCtxOpen(!ctxOpen());
+              setCtxQuery("");
+              setCtxIdx(0);
+            }}
+          >
+            + add context{" "}
+            <span class="dim">▾</span>
+          </button>
+          <Show when={ctxOpen()}>
+            <div class="ns-backdrop" onClick={() => setCtxOpen(false)} />
+            <div class="ns-pop ctx-pop">
+              <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
+                class="search"
+                placeholder="search contexts…"
+                ref={(el) => setTimeout(() => el.focus())}
+                value={ctxQuery()}
+                onInput={(e) => {
+                  setCtxQuery(e.currentTarget.value);
+                  setCtxIdx(0);
+                }}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  const items = ctxItems();
+                  if (e.key === "Escape") setCtxOpen(false);
+                  else if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setCtxIdx(Math.min(ctxIdx() + 1, items.length - 1));
+                  } else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setCtxIdx(Math.max(ctxIdx() - 1, 0));
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    const c = items[ctxIdx()];
+                    if (!c) return;
+                    if (e.altKey) editPreCmd(c.name);
+                    else {
+                      setCtxOpen(false);
+                      void openContext(c.name);
+                    }
+                  }
+                }}
+              />
+              <div class="ns-list">
+                <For each={ctxItems()}>
+                  {(c, i) => (
+                    <>
+                      <div
+                        class="launcher-row"
+                        classList={{ active: ctxIdx() === i() }}
+                        onMouseEnter={() => setCtxIdx(i())}
+                      >
+                        <button
+                          class="launcher-item"
+                          onClick={() => {
+                            setCtxOpen(false);
+                            void openContext(c.name);
+                          }}
+                        >
+                          <span class="launcher-name">{c.name}</span>
+                          <span class="dim">
+                            {[
+                              c.is_current ? "current" : "",
+                              preCmds()[c.name] ? "pre-connect" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </span>
+                        </button>
+                        {preConnectButton(c.name)}
+                      </div>
+                      {preConnectEditor(c.name)}
+                    </>
+                  )}
+                </For>
+                <Show when={ctxItems().length === 0}>
+                  <p class="dim ctx-empty">no matching context</p>
+                </Show>
+              </div>
+            </div>
+          </Show>
+        </div>
         <Show when={active()}>
           <div class="ns-picker">
             <button
@@ -5796,6 +6207,16 @@ function App() {
         <span class="badge">
           <Show when={active()}>{types().length} kinds</Show>
         </span>
+        {/* Always here, not only on an error banner: the moment you need
+            it most is while a connection is still hanging on a stale
+            credential, and that moment has no banner yet. */}
+        <button
+          class="icon-btn term-btn"
+          title="shell on this machine — tsh login, aws sso login, a VPN (⌘⇧S)"
+          onClick={() => openLocalShell()}
+        >
+          {">_"}
+        </button>
         <button
           class="icon-btn"
           title="toggle theme"
@@ -5835,14 +6256,11 @@ function App() {
               <div class="auth-actions">
                 <button
                   class="btn primary"
-                  disabled={loggingIn()}
-                  onClick={() => void runLogin()}
+                    onClick={() => void runLogin()}
                 >
-                  {loggingIn()
-                    ? "logging in…"
-                    : authHint()!.kind === "aws-sso"
-                      ? "Log in with SSO"
-                      : "Log in"}
+                  {authHint()!.kind === "aws-sso"
+                    ? "Log in with SSO"
+                    : "Log in"}
                 </button>
                 <Show when={authHint()!.command}>
                   <code class="auth-cmd" title="the command that runs">
@@ -5857,13 +6275,38 @@ function App() {
               {(name) => (
                 <button
                   class="btn sm"
-                  disabled={connecting() !== null}
+                  disabled={isConnecting(name)}
                   onClick={() => void reconnect(name)}
                 >
-                  {connecting() === name ? "reconnecting…" : `reconnect ${name}`}
+                  {isConnecting(name) ? "reconnecting…" : `reconnect ${name}`}
                 </button>
               )}
             </For>
+            {/* Offered on every error, not just the ones we can name a
+                login for: the cluster whose credentials need a step the
+                kubeconfig never mentions is exactly the one we cannot
+                help with a derived command. */}
+            {/* The command the cluster itself names, rather than one we
+                inferred — the only one that is right when the kubeconfig
+                points at a wrapper doing its own login. */}
+            <Show when={authHint()?.exec_command}>
+              <button
+                class="btn sm"
+                title={`run ${authHint()!.exec_command} with a terminal attached`}
+                onClick={() => runCredentialCommand()}
+              >
+                run credential command
+              </button>
+            </Show>
+            <button
+              class="btn sm"
+              title="run tsh login, aws sso login, a VPN — whatever this cluster needs"
+              onClick={() =>
+                openLocalShell(failed()[0]?.name ?? active() ?? "")
+              }
+            >
+              local shell
+            </button>
             <button class="close" onClick={() => setError(null)}>
               ✕
             </button>
@@ -5871,7 +6314,11 @@ function App() {
         </div>
       </Show>
 
-      <div class="body">
+      {loginPanel()}
+
+      {/* Hidden rather than unmounted while settings is open: the table
+          keeps its watch, its scroll position and its cursor. */}
+      <div class="body" classList={{ hidden: settingsOpen() }}>
         <aside
           class="sidebar"
           classList={{
@@ -7813,7 +8260,7 @@ function App() {
                   <b>esc</b><span>step up: detail → table → sidebar</span>
                   <b>j k ↑ ↓</b><span>move cursor · g/G first/last</span>
                   <b>enter · →</b><span>from the sidebar: open that kind</span>
-                  <b>← →</b><span>pan wide tables · Home/End first/last column</span>
+                  <b>← →</b><span>pan wide tables · ← at the left edge steps up to the sidebar · Home/End first/last column</span>
                   <b>Enter</b><span>open detail — on a namespace, scope to it and list its pods</span>
                   <b>n</b><span>new resource (creatable kinds) · ⇧↑ on top row → search</span>
                   <b>f</b><span>filter the sorted column (values or &gt;/&lt; for numbers)</span>
@@ -7836,7 +8283,7 @@ function App() {
                   <b>↑ ↓ · j k</b><span>move between sections</span>
                   <b>← →</b><span>reach a section's buttons — actions, copy / copy all, Apply</span>
                   <b>Enter</b><span>open the focused section (folds · editor) or press its button</span>
-                  <b>← h</b><span>back to the table (from a section header)</span>
+                  <b>← h</b><span>back to the table — from a section header, or from the first button of a row</span>
                   <b>⇞ ⇟ · g G</b><span>scroll · first / last section</span>
                   <b>⇧J ⇧K</b><span>previous / next resource, panel follows</span>
                   <b>a · t · v</b><span>toggle annotations · status · events</span>
@@ -7853,6 +8300,7 @@ function App() {
                   <b>tab · ⇧tab</b><span>next / previous cluster tab</span>
                   <b>ctrl+1-9</b><span>jump straight to a cluster tab</span>
                   <b>⌘T</b><span>show / hide the terminal dock</span>
+                  <b>⌘⇧S</b><span>a shell on this machine — tsh login, aws sso login, a VPN</span>
                   <b>⌘⇧↑ / ↓</b><span>resize the log / shell dock (or drag its top edge)</span>
                   <b>in logs: j/k ↑↓ · g/G · /</b><span>scroll · top / bottom · find</span>
                   <b>tab (in logs)</b><span>enter the log toolbar → ←/→ move · ↵ press · esc back</span>
@@ -8326,6 +8774,7 @@ function App() {
       </div>
     </div>
     </Show>
+    </>
   );
 }
 

@@ -40,11 +40,24 @@ pub struct AppState {
 pub struct ExecSession {
     /// None for read-only sessions (log streaming).
     stdin: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    resize: Option<futures::channel::mpsc::Sender<TerminalSize>>,
+    resize: Option<Resizer>,
     aborts: Vec<tokio::task::AbortHandle>,
     /// (context, namespace, pod) to delete when the session ends —
     /// used by node shells to reap their helper pod.
     cleanup: Option<(String, String, String)>,
+    /// Local pty sessions only: the child to kill when the session ends.
+    /// A remote exec dies with its aborted tasks, but a local process
+    /// would outlive them and keep holding the tty.
+    kill: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+}
+
+/// Where a session's window size goes. A remote exec forwards it to the
+/// API server over its own channel; a local pty is resized in place by
+/// the thread that owns the master, so both look the same to the UI.
+#[derive(Clone)]
+enum Resizer {
+    Remote(futures::channel::mpsc::Sender<TerminalSize>),
+    Pty(tokio::sync::mpsc::Sender<(u16, u16)>),
 }
 
 pub struct PfSession {
@@ -267,6 +280,11 @@ pub struct AuthHint {
     pub command: Option<String>,
     /// True when we know how to run it and re-authenticate in place.
     pub can_login: bool,
+    /// The context's own credential command, verbatim from its exec block.
+    /// Unlike `command` this is nothing we guessed — it is what the cluster
+    /// says produces its credentials, and it is what we can offer to run in
+    /// a terminal when it turns out to want an answer from a human.
+    pub exec_command: Option<String>,
 }
 
 /// The login command that fixes a given context's credentials, derived
@@ -316,6 +334,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             ),
             command: Some(cmd),
             can_login: true,
+            exec_command: None,
         };
     }
     if base == "gke-gcloud-auth-plugin" || base == "gcloud" {
@@ -324,6 +343,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             message: "Google Cloud credentials have expired. Logging in opens your browser.".into(),
             command: Some("gcloud auth login".into()),
             can_login: true,
+            exec_command: None,
         };
     }
     // Teleport: the exec command is usually the absolute path to `tsh`.
@@ -333,6 +353,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             message: "Teleport session expired. Logging in opens your browser to re-authenticate.".into(),
             command: Some("tsh login".into()),
             can_login: true,
+            exec_command: None,
         };
     }
     if base == "az" {
@@ -341,6 +362,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             message: "Azure credentials have expired. Logging in opens your browser.".into(),
             command: Some("az login".into()),
             can_login: true,
+            exec_command: None,
         };
     }
     // kubelogin / oidc-login (kubectl OIDC): re-running fetches a token via
@@ -351,6 +373,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             message: "OIDC token expired. Logging in opens your browser to re-authenticate.".into(),
             command: Some(format!("{exec_command} {}", args.join(" ")).trim().to_string()),
             can_login: true,
+            exec_command: None,
         };
     }
     if base == "doctl" {
@@ -359,6 +382,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             message: "DigitalOcean credentials expired. Re-run `doctl auth init`.".into(),
             command: Some("doctl auth init".into()),
             can_login: true,
+            exec_command: None,
         };
     }
     // an exec plugin we don't recognise: tell the user how it authenticates
@@ -370,6 +394,7 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
         ),
         command: None,
         can_login: false,
+        exec_command: None,
     }
 }
 
@@ -383,12 +408,24 @@ pub async fn auth_hint(
         Some(p) => Kubeconfig::read_from(shellexpand_home(&p)).map_err(err)?,
         None => Kubeconfig::read().map_err(err)?,
     };
-    let user = kc
-        .contexts
-        .iter()
-        .find(|c| c.name == context)
-        .and_then(|c| c.context.as_ref())
-        .and_then(|c| c.user.clone());
+    // A context that isn't in the file at all is a different problem from
+    // one with no exec block, and answering "static credentials" for it
+    // would be a plain lie. A restored tab lands here whenever the tool
+    // that wrote the entry took it back out — `tsh logout` strips its kube
+    // contexts, a rotated kubeconfig drops them — and there is nothing to
+    // log into, because we no longer know how this cluster authenticated.
+    let Some(nc) = kc.contexts.iter().find(|c| c.name == context) else {
+        return Ok(AuthHint {
+            kind: "missing".into(),
+            message: format!(
+                "`{context}` is no longer in your kubeconfig. Re-run the login that created it, then reconnect."
+            ),
+            command: None,
+            can_login: false,
+            exec_command: None,
+        });
+    };
+    let user = nc.context.as_ref().and_then(|c| c.user.clone());
     let auth = user.and_then(|u| {
         kc.auth_infos
             .iter()
@@ -401,6 +438,7 @@ pub async fn auth_hint(
             message: "This cluster uses static credentials — nothing to refresh here.".into(),
             command: None,
             can_login: false,
+            exec_command: None,
         });
     };
     let env: Vec<(String, String)> = exec
@@ -414,42 +452,181 @@ pub async fn auth_hint(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(login_plan(
+    let mut hint = login_plan(
         exec.command.as_deref().unwrap_or(""),
         exec.args.as_deref().unwrap_or(&[]),
         &env,
-    ))
+    );
+    // What the cluster itself says produces credentials, as a line the
+    // user can run: the plugin's own env in front, since the kubeconfig
+    // sets it and a shell would not, and the credential redirected away —
+    // it is a bearer token, and the prompts we care about are on stderr.
+    let mut line = String::new();
+    for (k, v) in &env {
+        line.push_str(&format!("{k}={} ", shell_quote(v)));
+    }
+    line.push_str(
+        &std::iter::once(exec.command.clone().unwrap_or_default())
+            .chain(exec.args.clone().unwrap_or_default())
+            .map(|a| shell_quote(&a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    line.push_str(" >/dev/null");
+    hint.exec_command = Some(line);
+    Ok(hint)
 }
 
-/// Run the login command from a hint and wait for it. It opens its own
-/// browser window; we just report when it finishes so the UI can
-/// reconnect.
-pub async fn auth_login(context: String, path: Option<String>) -> Result<(), String> {
-    let hint = auth_hint(context, path).await?;
-    let Some(cmd) = hint.command.filter(|_| hint.can_login) else {
-        return Err("no automatic login is available for this cluster".into());
-    };
-    // We built this string ourselves from a fixed template, so a plain
-    // shell split is safe here.
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    let program = parts.first().ok_or("empty login command")?.to_string();
-    let rest: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-    let cmd2 = cmd.clone();
-    // the login CLI blocks while the browser flow runs; keep it off the
-    // async runtime
-    tokio::task::spawn_blocking(move || {
-        let status = std::process::Command::new(&program)
-            .args(&rest)
-            .status()
-            .map_err(|e| format!("could not run `{cmd2}`: {e}"))?;
-        if !status.success() {
-            return Err(format!("`{cmd2}` exited with {status}"));
+/// Run a local program under a pseudo-terminal and hand it to the webview
+/// as an ordinary session, so it lands in a terminal the user can read and
+/// type into.
+///
+/// A tty is the whole point. These CLIs ask things — an OTP, a password,
+/// "tap your key" — and they only ask when they believe a human is on the
+/// other end: they call isatty() or open /dev/tty outright, so a plain
+/// pipe gets them to give up (or, worse, to echo a password). Spawned
+/// straight from a GUI the way login used to be, stdin is /dev/null and
+/// anything interactive hangs forever with the prompt going nowhere.
+/// Run the user's login shell under a pseudo-terminal and hand it to the
+/// webview as an ordinary session.
+///
+/// A tty is the whole point. The CLIs this exists for ask things — an OTP,
+/// a password, "tap your key" — and they only ask when they believe a
+/// human is on the other end: they call isatty() or open /dev/tty
+/// outright, so a plain pipe gets them to give up (or, worse, to echo a
+/// password). Spawned straight from a GUI, stdin is /dev/null and anything
+/// interactive hangs forever with the prompt going nowhere.
+///
+/// A shell rather than each command on its own, because the fix for a
+/// cluster is rarely one command: `tsh login` then the token, a tunnel
+/// left running, a second try with a different flag. The buttons type
+/// into this; the user can type anything else.
+pub async fn local_shell_start(
+    state: &AppState,
+    command: Option<String>,
+    channel: Channel<String>,
+) -> Result<u32, String> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let command = command.filter(|c| !c.trim().is_empty());
+    let had_command = command.is_some();
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(err)?;
+    let mut builder = CommandBuilder::new(&shell);
+    // A login shell, so it reads the same profile the user's terminal does
+    // — the one that puts tsh, aws-vault and the rest on PATH. Given a
+    // command it runs that and exits, which is what makes its exit status
+    // worth something: the caller can connect on a zero and stay put on
+    // anything else.
+    match &command {
+        Some(c) => builder.args(["-lc", c]),
+        None => builder.args(["-l"]),
+    }
+    // A GUI launch inherits no TERM, and a shell that cannot identify the
+    // terminal drops to dumb output.
+    builder.env("TERM", "xterm-256color");
+    if let Ok(home) = std::env::var("HOME") {
+        builder.cwd(home);
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| format!("could not run `{shell}`: {e}"))?;
+    // Our copy of the slave has to go, or the master never sees EOF when
+    // the child exits and the reader below waits on it forever.
+    drop(pair.slave);
+
+    let killer = child.clone_killer();
+    let mut reader = pair.master.try_clone_reader().map_err(err)?;
+    let mut writer = pair.master.take_writer().map_err(err)?;
+
+    // The master lives in the resize thread and dies with it: the session
+    // going away drops the sender, which ends the loop, which drops the
+    // pty. Nothing else needs to own it.
+    let (rtx, mut rrx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+    let master = pair.master;
+    std::thread::spawn(move || {
+        while let Some((cols, rows)) = rrx.blocking_recv() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
         }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(err)??;
-    Ok(())
+    });
+
+    // pty reads and writes are blocking, so they get threads rather than
+    // tasks — an async runtime worker parked on a tty helps nobody.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        while let Some(b) = rx.blocking_recv() {
+            if writer.write_all(&b).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = channel.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                }
+            }
+        }
+        // Reap only after the output is drained, so the verdict prints last.
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        // Only a one-command run has a verdict worth stating; a shell the
+        // user typed `exit` into does not.
+        if had_command {
+            let _ = channel.send(if ok {
+                "\r\n\u{1b}[32m[done — connecting]\u{1b}[0m\r\n".to_string()
+            } else {
+                "\r\n\u{1b}[31m[exited without finishing — not connecting]\u{1b}[0m\r\n"
+                    .to_string()
+            });
+        }
+        let _ = channel.send(if ok { "\u{0}exit:0" } else { "\u{0}exit" }.to_string());
+    });
+
+    let id = state
+        .next_exec
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.exec.write().await.insert(
+        id,
+        ExecSession {
+            stdin: Some(tx),
+            resize: Some(Resizer::Pty(rtx)),
+            aborts: Vec::new(),
+            cleanup: None,
+            kill: Some(killer),
+        },
+    );
+    Ok(id)
+}
+
+/// Quote for a shell only when the value would otherwise break — an
+/// unquoted kubeconfig is the common case and reads better bare.
+fn shell_quote(v: &str) -> String {
+    if !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c))
+    {
+        return v.to_string();
+    }
+    format!("'{}'", v.replace('\'', r"'\''"))
 }
 
 fn shellexpand_home(p: &str) -> String {
@@ -2888,9 +3065,10 @@ async fn start_exec_session(
         id,
         ExecSession {
             stdin: Some(tx),
-            resize,
+            resize: resize.map(Resizer::Remote),
             aborts: vec![writer.abort_handle(), reader.abort_handle()],
             cleanup,
+            kill: None,
         },
     );
     Ok(id)
@@ -3139,6 +3317,7 @@ pub async fn log_start(
             resize: None,
             aborts: vec![reader.abort_handle()],
             cleanup: None,
+            kill: None,
         },
     );
     Ok(id)
@@ -3247,6 +3426,7 @@ pub async fn logs_selector_start(
             resize: None,
             aborts,
             cleanup: None,
+            kill: None,
         },
     );
     Ok(id)
@@ -3571,11 +3751,17 @@ pub async fn exec_resize(state: &AppState, id: u32, cols: u16, rows: u16) -> Res
         .await
         .get(&id)
         .and_then(|s| s.resize.clone());
-    if let Some(mut tx) = resize {
-        let _ = tx.try_send(TerminalSize {
-            width: cols,
-            height: rows,
-        });
+    match resize {
+        Some(Resizer::Remote(mut tx)) => {
+            let _ = tx.try_send(TerminalSize {
+                width: cols,
+                height: rows,
+            });
+        }
+        Some(Resizer::Pty(tx)) => {
+            let _ = tx.try_send((cols, rows));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -3586,6 +3772,11 @@ pub async fn exec_stop(state: &AppState, id: u32) -> Result<(), String> {
     };
     for a in &session.aborts {
         a.abort();
+    }
+    // A local login CLI sits in its own process group waiting on the tty;
+    // dropping our end is not enough to end it.
+    if let Some(mut kill) = session.kill {
+        let _ = kill.kill();
     }
     if let Some((ctx, ns, pod)) = session.cleanup {
         if let Ok(client) = client(state, &ctx).await {

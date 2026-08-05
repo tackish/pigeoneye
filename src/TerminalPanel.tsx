@@ -15,7 +15,7 @@ export interface ResourceTypeRef {
 }
 
 export interface ShellTarget {
-  kind: "pod" | "node" | "logs" | "wlogs" | "debug";
+  kind: "pod" | "node" | "logs" | "wlogs" | "debug" | "local";
   context: string;
   namespace?: string;
   name: string;
@@ -29,6 +29,11 @@ export interface ShellTarget {
   logTimestamps?: boolean;
   /// pod shells: override shell command ("bash || sh" by default)
   command?: string;
+  /// local: a line to run. With `oneShot` the shell runs just this and
+  /// exits, so its status means something; otherwise it is typed into an
+  /// interactive shell that stays.
+  initialCommand?: string;
+  oneShot?: boolean;
   /// node shells: helper-pod customization
   podName?: string;
   image?: string;
@@ -62,14 +67,14 @@ export default function TerminalPanel(props: {
   target: ShellTarget;
   theme: "dark" | "light";
   active: boolean;
-  onExit: () => void;
+  onExit: (ok?: boolean) => void;
   onLeave: () => void;
   onMinimize: () => void;
   onFocusChange: (focused: boolean) => void;
   onCycleTab: (delta: number) => void;
   onCloseTab: () => void;
   onResize?: (delta: number) => void;
-  api?: (a: { focus: () => void }) => void;
+  api?: (a: { focus: () => void; send: (text: string) => void }) => void;
 }) {
   let host!: HTMLDivElement;
   let term: Terminal | undefined;
@@ -246,7 +251,16 @@ export default function TerminalPanel(props: {
     // the app has to know where focus actually is.
     term.textarea?.addEventListener("focus", () => props.onFocusChange(true));
     term.textarea?.addEventListener("blur", () => props.onFocusChange(false));
-    props.api?.({ focus: () => term?.focus() });
+    // Typing on the user's behalf goes through the same path their
+    // keystrokes do, so what a button runs is a line in the transcript
+    // like any other — visible, editable before it runs, and repeatable
+    // with the shell's own history.
+    const send = (text: string) => {
+      if (sessionId != null)
+        void invoke("exec_stdin", { id: sessionId, data: text }).catch(() => {});
+      term?.focus();
+    };
+    props.api?.({ focus: () => term?.focus(), send });
 
     // xterm swallows every key, so carve out ways back to the app.
     // Esc leaves the panel — programs that need a real ESC still get
@@ -254,6 +268,26 @@ export default function TerminalPanel(props: {
     // is lost and the key means the same thing as everywhere else.
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
+      // A plain space is the one printable key xterm does not send from
+      // keydown: evaluateKeyboardEvent only takes keys with keyCode >= 48,
+      // so space (32) rides the legacy `keypress` event. Anything that
+      // preventDefaults the keydown first — ours, the webview's own
+      // space-scrolls-the-page default — swallows it silently while every
+      // other key still types. Send it here so a space never depends on
+      // that. Composition is left alone: the IME uses space to commit.
+      if (
+        !isLogs &&
+        ev.code === "Space" &&
+        !ev.ctrlKey &&
+        !ev.altKey &&
+        !ev.metaKey &&
+        !ev.isComposing &&
+        ev.keyCode !== 229
+      ) {
+        ev.preventDefault();
+        term?.input(" ");
+        return false;
+      }
       const appMod = IS_MAC ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
       if (appMod && (ev.key === "t" || ev.key === "T")) {
         ev.preventDefault();
@@ -342,11 +376,20 @@ export default function TerminalPanel(props: {
         `\x1b[90mattaching ephemeral debug container to ${t.name}… (pulling ${t.image ?? "busybox:1.36"}, up to 60s)\x1b[0m\r\n`,
       );
     }
+    if (t.kind === "local") {
+      term.write(
+        t.oneShot
+          ? `\x1b[35m❯\x1b[0m ${t.initialCommand}\r\n`
+          : `\x1b[90ma shell on this machine — the buttons above type into it\x1b[0m\r\n`,
+      );
+    }
     if (t.kind === "logs") term.write(logHeaderLine());
     const chan = new Channel<string>();
     chan.onmessage = (d) => {
-      if (d === "\u0000exit") {
-        props.onExit();
+      // The marker carries a verdict when the session ran one command:
+      // ":0" is what a pre-connect step has to clear to go on connecting.
+      if (d === "\u0000exit" || d === "\u0000exit:0") {
+        props.onExit(d.endsWith(":0"));
         return;
       }
       writeLog(d);
@@ -369,6 +412,11 @@ export default function TerminalPanel(props: {
                 pod: t.name,
                 image: t.image ?? null,
                 target: t.container ?? null,
+                channel: chan,
+              })
+          : t.kind === "local"
+            ? await invoke<number>("local_shell_start", {
+                command: t.oneShot ? t.initialCommand : null,
                 channel: chan,
               })
           : t.kind === "logs"
@@ -419,6 +467,13 @@ export default function TerminalPanel(props: {
             () => {},
           ),
       );
+      // A line to run on arrival. It waits for the shell to finish drawing
+      // its first prompt — type into zsh before its line editor is up and
+      // the characters are swallowed.
+      if (t.kind === "local" && t.initialCommand && !t.oneShot) {
+        const line = t.initialCommand;
+        setTimeout(() => send(line + "\n"), 400);
+      }
       term.onResize(
         ({ cols, rows }) =>
           sessionId != null &&
