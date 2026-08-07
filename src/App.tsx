@@ -11,6 +11,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { onOpenUrl, getCurrent as getCurrentDeepLinks } from "@tauri-apps/plugin-deep-link";
 import YamlEditor from "./YamlEditor";
 import TerminalPanel, { type ShellTarget } from "./TerminalPanel";
 import StatusView from "./StatusView";
@@ -18,6 +19,12 @@ import logoUrl from "./assets/svg/app-icon.svg";
 import lookUrl from "./assets/svg/pigeon-search.svg";
 import puzzledUrl from "./assets/svg/pigeon-thinking.svg";
 import flyingUrl from "./assets/svg/pigeon-flying.svg";
+// The "share" mark — our pigeon-on-a-rocket mascot: launching = sending =
+// sharing. Recognisable down to ~22px, and on-brand where a copy glyph read
+// like the clipboard.
+import rocketUrl from "./assets/svg/pigeon-rocket.svg";
+// "my permissions" mark — pigeon guarding a padlocked shield = access rights.
+import shieldUrl from "./assets/svg/pigeon-shield.svg";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -46,6 +53,9 @@ interface ContextInfo {
   namespace: string | null;
   is_current: boolean;
   source: string;
+  /// The cluster's API server URL — the same for everyone who can reach the
+  /// cluster, so a deep link can match by it regardless of the local name.
+  server: string;
 }
 
 interface ResourceType {
@@ -777,7 +787,7 @@ function App() {
   const [pickerQ, setPickerQ] = createSignal("");
   const [pickerIdx, setPickerIdx] = createSignal(0);
   // The top bar's context picker. Declared with the launcher's because
-  // ctxItems below reads them, and a memo runs once the moment it is made.
+  // ctxAddSections below reads them, and a memo runs once the moment it is made.
   const [ctxOpen, setCtxOpen] = createSignal(false);
   const [ctxQuery, setCtxQuery] = createSignal("");
   const [ctxIdx, setCtxIdx] = createSignal(0);
@@ -789,23 +799,149 @@ function App() {
     }
   })();
 
-  /// Startup list: previously-open contexts first, then the rest.
-  const pickerList = createMemo(() => {
+  // Context favorites (★) and collapsed auto-groups, persisted. Groups are
+  // by name prefix (alpha-*, prod-*, k3s-*…) — zero config for regular
+  // naming; ★ pins a cluster to the top regardless of its prefix.
+  const loadSet = (key: string): Set<string> => {
+    try {
+      const v = JSON.parse(localStorage.getItem(key) ?? "[]");
+      return new Set(
+        Array.isArray(v) ? v.filter((x) => typeof x === "string") : [],
+      );
+    } catch {
+      return new Set();
+    }
+  };
+  const [ctxFavs, setCtxFavsRaw] = createSignal<Set<string>>(
+    loadSet("pigeoneye.ctxfavs"),
+  );
+  const [ctxCollapsed, setCtxCollapsedRaw] = createSignal<Set<string>>(
+    loadSet("pigeoneye.ctxgroups"),
+  );
+  const persistSet = (key: string, s: Set<string>) =>
+    localStorage.setItem(key, JSON.stringify([...s]));
+  const toggleCtxFav = (name: string) => {
+    const s = new Set(ctxFavs());
+    if (s.has(name)) s.delete(name);
+    else s.add(name);
+    setCtxFavsRaw(s);
+    persistSet("pigeoneye.ctxfavs", s);
+  };
+  const toggleCtxGroup = (g: string) => {
+    const s = new Set(ctxCollapsed());
+    if (s.has(g)) s.delete(g);
+    else s.add(g);
+    setCtxCollapsedRaw(s);
+    persistSet("pigeoneye.ctxgroups", s);
+    // Collapsing shrinks the flat list; keep the keyboard cursor in range.
+    setPickerIdx(0);
+    setCtxIdx(0);
+  };
+  const FAV_GROUP = "★ favorites";
+  const ctxPrefix = (name: string) => name.split(/[-_/]/)[0] || name;
+
+  /// Contexts grouped for the launcher: a ★ favorites section, then one
+  /// collapsible section per name prefix. A search query flattens it to a
+  /// single ranked list (favorites/recent first) for fast find.
+  type CtxSection = { group: string; collapsed: boolean; items: ContextInfo[] };
+  const ctxSections = createMemo<CtxSection[]>(() => {
     const q = pickerQ().toLowerCase().trim();
-    const rank = (c: ContextInfo) =>
-      (lastSession.includes(c.name) ? 0 : 1) + (c.is_current ? -0.5 : 0);
-    return contexts()
-      .filter((c) => !q || c.name.toLowerCase().includes(q))
-      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    const favs = ctxFavs();
+    const all = contexts().filter(
+      (c) => !q || c.name.toLowerCase().includes(q),
+    );
+    const byName = (a: ContextInfo, b: ContextInfo) =>
+      a.name.localeCompare(b.name);
+    if (q) {
+      const rank = (c: ContextInfo) =>
+        (favs.has(c.name) ? -1 : 0) +
+        (lastSession.includes(c.name) ? 0 : 1) +
+        (c.is_current ? -0.5 : 0);
+      const items = [...all].sort((a, b) => rank(a) - rank(b) || byName(a, b));
+      return [{ group: "", collapsed: false, items }];
+    }
+    const favItems = all.filter((c) => favs.has(c.name)).sort(byName);
+    const gmap = new Map<string, ContextInfo[]>();
+    for (const c of all) {
+      if (favs.has(c.name)) continue;
+      const p = ctxPrefix(c.name);
+      if (!gmap.has(p)) gmap.set(p, []);
+      gmap.get(p)!.push(c);
+    }
+    const sections: CtxSection[] = [];
+    if (favItems.length)
+      sections.push({
+        group: FAV_GROUP,
+        collapsed: ctxCollapsed().has(FAV_GROUP),
+        items: favItems,
+      });
+    for (const g of [...gmap.keys()].sort())
+      sections.push({
+        group: g,
+        collapsed: ctxCollapsed().has(g),
+        items: gmap.get(g)!.sort(byName),
+      });
+    return sections;
   });
+  /// Flat selectable list (collapsed groups contribute nothing) — the
+  /// keyboard cursor (pickerIdx) indexes into this.
+  const pickerList = createMemo(() =>
+    ctxSections().flatMap((s) => (s.collapsed ? [] : s.items)),
+  );
+  const pickerIndexOf = createMemo(
+    () => new Map(pickerList().map((c, i) => [c.name, i])),
+  );
   /// The top bar's picker: same list minus what is already open.
-  const ctxItems = createMemo(() => {
+  /// The "+ add context" picker: same grouping as the launcher, minus what
+  /// is already open. Flat list + index map drive its keyboard cursor.
+  const ctxAddSections = createMemo<CtxSection[]>(() => {
     const q = ctxQuery().toLowerCase().trim();
-    return contexts()
+    const favs = ctxFavs();
+    const all = contexts()
       .filter((c) => !tabs().includes(c.name))
-      .filter((c) => !q || c.name.toLowerCase().includes(q))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .filter((c) => !q || c.name.toLowerCase().includes(q));
+    const byName = (a: ContextInfo, b: ContextInfo) =>
+      a.name.localeCompare(b.name);
+    if (q) {
+      const rank = (c: ContextInfo) =>
+        (favs.has(c.name) ? -1 : 0) + (c.is_current ? -0.5 : 0);
+      return [
+        {
+          group: "",
+          collapsed: false,
+          items: [...all].sort((a, b) => rank(a) - rank(b) || byName(a, b)),
+        },
+      ];
+    }
+    const favItems = all.filter((c) => favs.has(c.name)).sort(byName);
+    const gmap = new Map<string, ContextInfo[]>();
+    for (const c of all) {
+      if (favs.has(c.name)) continue;
+      const p = ctxPrefix(c.name);
+      if (!gmap.has(p)) gmap.set(p, []);
+      gmap.get(p)!.push(c);
+    }
+    const sections: CtxSection[] = [];
+    if (favItems.length)
+      sections.push({
+        group: FAV_GROUP,
+        collapsed: ctxCollapsed().has(FAV_GROUP),
+        items: favItems,
+      });
+    for (const g of [...gmap.keys()].sort())
+      sections.push({
+        group: g,
+        collapsed: ctxCollapsed().has(g),
+        items: gmap.get(g)!.sort(byName),
+      });
+    return sections;
   });
+  const ctxAddFlat = createMemo(() =>
+    ctxAddSections().flatMap((s) => (s.collapsed ? [] : s.items)),
+  );
+  const ctxAddIndexOf = createMemo(
+    () => new Map(ctxAddFlat().map((c, i) => [c.name, i])),
+  );
 
   // Keep the keyboard-selected context in view as the cursor moves.
   createEffect(() => {
@@ -840,6 +976,26 @@ function App() {
   const [nsQuery, setNsQuery] = createSignal("");
   const [tabs, setTabs] = createSignal<string[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
+  /// The open tabs, grouped the same way for the topbar ▾ overflow menu:
+  /// ★ favorites first, then one header per name prefix. (Declared here,
+  /// after `tabs`, so the eager memo doesn't read it in its TDZ.)
+  const tabSections = createMemo<{ group: string; items: string[] }[]>(() => {
+    const names = tabs();
+    const favs = ctxFavs();
+    const favNames = names.filter((n) => favs.has(n)).sort();
+    const gmap = new Map<string, string[]>();
+    for (const n of names) {
+      if (favs.has(n)) continue;
+      const p = ctxPrefix(n);
+      if (!gmap.has(p)) gmap.set(p, []);
+      gmap.get(p)!.push(n);
+    }
+    const out: { group: string; items: string[] }[] = [];
+    if (favNames.length) out.push({ group: FAV_GROUP, items: favNames });
+    for (const g of [...gmap.keys()].sort())
+      out.push({ group: g, items: gmap.get(g)!.sort() });
+    return out;
+  });
   // The strip's ResizeObserver is attached in its ref callback (below) —
   // the topbar lives behind <Show when={tabs().length}>, so at the
   // component's onMount the strip may not exist yet; attaching on mount
@@ -2294,6 +2450,9 @@ function App() {
     if (!d) return [] as string[];
     const isNodeKind = selected()?.group === "" && selected()?.kind === "Node";
     return [
+      // The header's "share view" sits above everything — ↑ from the actions
+      // row reaches it, matching where it is on screen.
+      "share",
       "actions",
       ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
       ...(d.containers?.length ? ["containers"] : []),
@@ -2310,6 +2469,7 @@ function App() {
   /// Rows of real buttons (action bar, Apply/Reset) are driven by
   /// native focus so Enter/Space activate them without extra wiring.
   const BUTTON_ROWS: Record<string, string> = {
+    share: ".drawer-head .share-btn",
     actions: ".drawer .actions",
     containers: ".drawer .ctr-list",
     apply: ".drawer .yaml-actions",
@@ -2343,10 +2503,15 @@ function App() {
     if (!sel) return [];
     // Checkboxes (the Apply row's "force") are navigable too; click()
     // toggles them just like Enter/Space on a button.
+    // Match buttons INSIDE the selector (an action bar) *and* the selector
+    // itself when it is the button (the header's lone "share view"). A Set
+    // keeps order and de-dupes.
+    const q = 'button, input[type="checkbox"]';
     return [
-      ...document.querySelectorAll<HTMLElement>(
-        `${sel} :is(button, input[type="checkbox"]):not(:disabled)`,
-      ),
+      ...new Set<HTMLElement>([
+        ...document.querySelectorAll<HTMLElement>(`${sel}:is(${q}):not(:disabled)`),
+        ...document.querySelectorAll<HTMLElement>(`${sel} :is(${q}):not(:disabled)`),
+      ]),
     ];
   }
 
@@ -2676,6 +2841,209 @@ function App() {
       endConnect(name);
     }
   }
+
+  // ── deep links (peye://) ───────────────────────────────
+  // Share the exact view — context, kind, namespace, filter, open resource —
+  // as a peye:// link. Opening it drives the same navigation on the other
+  // side (as long as they have that context in their kubeconfig). No secrets
+  // travel in the URL; each side authenticates with its own kubeconfig.
+  const [sharedCopied, setSharedCopied] = createSignal(false);
+  const serverHost = (url: string) => {
+    try {
+      return new URL(url).host;
+    } catch {
+      return "";
+    }
+  };
+  function currentViewLink(): string | null {
+    const ctx = active();
+    if (!ctx) return null;
+    const p = new URLSearchParams();
+    p.set("ctx", ctx);
+    // The cluster's server host identifies the cluster independently of the
+    // local context name, so the recipient can match it even if they named
+    // the same cluster differently.
+    const host = serverHost(contexts().find((c) => c.name === ctx)?.server ?? "");
+    if (host) p.set("cluster", host);
+    const s = selected();
+    if (s) p.set("k", typeKey(s));
+    const d = detail();
+    // Address by the resource's OWN namespace when a detail is open — the
+    // view's namespace filter is empty in the all-namespaces list, but the
+    // resource still lives in one, and a link with a name but no namespace
+    // can't open a namespaced resource. Fall back to the view's namespace.
+    const ns = d?.namespace || namespace();
+    if (ns) p.set("ns", ns);
+    const fs = activeFieldSel();
+    if (fs) p.set("fs", fs);
+    const q = rowFilter().trim();
+    if (q) p.set("q", q);
+    if (d) p.set("name", d.name);
+    return `peye://open?${p.toString()}`;
+  }
+  async function copyShareLink() {
+    const link = currentViewLink();
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setSharedCopied(true);
+      setTimeout(() => setSharedCopied(false), 1400);
+    } catch (e) {
+      setError(`could not copy link: ${String(e)}`);
+    }
+  }
+
+  // A link that arrives before the app is ready (a cold-started peye:// link
+  // fires getCurrent() before the context list loads and the previous
+  // session restores). Held here and retried by the effect below once both
+  // are done — applying early would bypass host-matching, misread the
+  // kubeconfig source, and get clobbered by the session restore.
+  let pendingLink: string | null = null;
+  // A deep link whose cluster/context isn't in this kubeconfig — surfaced as
+  // a modal so it's unmissable, with an "add this cluster" hint.
+  const [deepLinkMiss, setDeepLinkMiss] = createSignal<{
+    ctx: string;
+    host: string;
+  } | null>(null);
+  /// Guess the cluster's provider from its API-server host and give the
+  /// command that adds it. EKS/AKS encode region (and AKS the name) in the
+  /// host so those are exact; GKE/DigitalOcean can't be fully derived (GKE
+  /// endpoints are bare IPs), so they get a template with placeholders.
+  /// Anything unrecognised (native/on-prem) returns no command.
+  function clusterAddHint(
+    host: string,
+    ctx: string,
+  ): { provider: string; cmd: string | null } {
+    const name = ctx || "<cluster-name>";
+    let m = host.match(/\.([a-z]{2}-[a-z]+-\d)\.eks\.amazonaws\.com$/i);
+    if (m)
+      return {
+        provider: "EKS",
+        cmd: `aws eks update-kubeconfig --name ${name} --region ${m[1]} --alias ${name}`,
+      };
+    // AKS: <name>-<hash>.hcp.<region>.azmk8s.io — name & region parseable.
+    m = host.match(/^([a-z0-9-]+?)-[a-z0-9]+\.hcp\.([a-z0-9]+)\.azmk8s\.io$/i);
+    if (m)
+      return {
+        provider: "AKS",
+        cmd: `az aks get-credentials --resource-group <resource-group> --name ${m[1]}`,
+      };
+    if (/\.k8s\.ondigitalocean\.com$/i.test(host))
+      return {
+        provider: "DigitalOcean",
+        cmd: `doctl kubernetes cluster kubeconfig save ${name}`,
+      };
+    if (/\.gke\.goog$/i.test(host) || /\bgoogleapis\.com$/i.test(host))
+      return {
+        provider: "GKE",
+        cmd: `gcloud container clusters get-credentials ${name} --location <region-or-zone> --project <project>`,
+      };
+    return { provider: "", cmd: null };
+  }
+  const [dlCopied, setDlCopied] = createSignal(false);
+  async function copyDlCmd(cmd: string) {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setDlCopied(true);
+      setTimeout(() => setDlCopied(false), 1400);
+    } catch {
+      /* ignore */
+    }
+  }
+  createEffect(() => {
+    const ready = contexts().length > 0 && !restoring();
+    active(); // also retry when a connection lands (post-login/pre-connect)
+    if (ready && pendingLink) {
+      const u = pendingLink;
+      pendingLink = null;
+      void applyDeepLink(u);
+    }
+  });
+
+  /// Drive navigation from a peye://open?… link. Best-effort: a step that
+  /// can't be satisfied (context not in this kubeconfig, kind not served)
+  /// stops the chain with an error rather than throwing.
+  async function applyDeepLink(url: string) {
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      return;
+    }
+    if (u.protocol !== "peye:" || u.hostname !== "open") return;
+    // Not ready yet (cold start): hold the link and let the effect retry it.
+    if (contexts().length === 0 || restoring()) {
+      pendingLink = url;
+      return;
+    }
+    const p = u.searchParams;
+    // Prefer matching the cluster by its server host (name-independent);
+    // fall back to the literal context name the link was made with.
+    const wantHost = p.get("cluster");
+    const named = p.get("ctx");
+    const byHost = wantHost
+      ? contexts().find((c) => serverHost(c.server) === wantHost)?.name
+      : undefined;
+    const byName =
+      named && contexts().some((c) => c.name === named) ? named : undefined;
+    const ctx = byHost ?? byName;
+    if (!ctx) {
+      // Neither the cluster (by server host) nor the named context exists in
+      // this kubeconfig — pop the "add this cluster" modal.
+      if (named || wantHost)
+        setDeepLinkMiss({ ctx: named ?? "", host: wantHost ?? "" });
+      return;
+    }
+    await openContext(ctx);
+    if (active() !== ctx) {
+      // A login or pre-connect step is up (openContext returns before
+      // connecting): hold the link and re-apply once the tab connects,
+      // rather than dropping the target view. Otherwise openContext already
+      // surfaced its own auth/connect error.
+      if (loginTarget() || authHint()?.context === ctx) pendingLink = url;
+      return;
+    }
+    const k = p.get("k");
+    if (!k) return;
+    const t = types().find((x) => typeKey(x).toLowerCase() === k.toLowerCase());
+    if (!t) {
+      setError(`${k} is not served by ${ctx}`);
+      return;
+    }
+    const ns = p.get("ns");
+    if (ns && t.namespaced) {
+      const st = tabCache.get(active()!);
+      if (st) st.namespace = ns;
+      setNamespace(ns);
+    }
+    await select(t, p.get("fs") || undefined);
+    const q = p.get("q");
+    if (q) onRowFilterInput(q);
+    const name = p.get("name");
+    if (name) {
+      if (t.namespaced && !ns) {
+        // A namespaced resource can't be opened without a namespace — an
+        // older/partial link. Locate it in the list instead of erroring.
+        onRowFilterInput(name);
+      } else {
+        await showDetail(t.namespaced ? ns : null, name);
+      }
+    }
+    revealInSidebar(t);
+  }
+
+  // Register both entry points: onOpenUrl for a link opened while running,
+  // getCurrent for the URL that cold-started the app.
+  onMount(() => {
+    void onOpenUrl((urls) => {
+      if (urls[0]) void applyDeepLink(urls[0]);
+    }).catch(() => {});
+    void getCurrentDeepLinks()
+      .then((urls) => {
+        if (urls && urls[0]) void applyDeepLink(urls[0]);
+      })
+      .catch(() => {});
+  });
 
   function closeTab(name: string) {
     void invoke("disconnect", { context: name }).catch(() => {});
@@ -6129,38 +6497,77 @@ function App() {
         }}
       />
       <div class="launcher-list">
-        <For each={pickerList()}>
-          {(c, i) => (
+        <For each={ctxSections()}>
+          {(sec) => (
             <>
-              <div
-                class="launcher-row"
-                classList={{ active: pickerIdx() === i() }}
-                onMouseEnter={() => setPickerIdx(i())}
-              >
+              {/* A search flattens to one headerless section; otherwise each
+                  prefix group gets a collapsible header. */}
+              <Show when={sec.group}>
                 <button
-                  class="launcher-item"
-                  disabled={isConnecting(c.name)}
-                  onClick={() => void openContext(c.name)}
+                  class="ctx-group-head"
+                  onClick={() => toggleCtxGroup(sec.group)}
+                  title={sec.collapsed ? "expand" : "collapse"}
                 >
-                  <span class="launcher-name">{c.name}</span>
-                  <span class="dim">
-                    {isConnecting(c.name)
-                      ? "connecting…"
-                      : [
-                          c.is_current ? "current" : "",
-                          lastSession.includes(c.name) ? "recent" : "",
-                          preCmds()[c.name] ? "pre-connect" : "",
-                          c.source ? basename(c.source) : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                  </span>
+                  <span class="ctx-chev">{sec.collapsed ? "▸" : "▾"}</span>
+                  <span class="ctx-group-name">{sec.group}</span>
+                  <span class="dim">{sec.items.length}</span>
                 </button>
-                {/* Whatever this cluster needs first belongs next to the
-                    cluster, not buried in a settings page. */}
-                {preConnectButton(c.name)}
-              </div>
-              {preConnectEditor(c.name)}
+              </Show>
+              <Show when={!sec.collapsed}>
+                <For each={sec.items}>
+                  {(c) => {
+                    const gi = () => pickerIndexOf().get(c.name) ?? -1;
+                    return (
+                      <>
+                        <div
+                          class="launcher-row"
+                          classList={{ active: pickerIdx() === gi() }}
+                          onMouseEnter={() => setPickerIdx(gi())}
+                        >
+                          <button
+                            class="ctx-star"
+                            classList={{ on: ctxFavs().has(c.name) }}
+                            title={
+                              ctxFavs().has(c.name)
+                                ? "remove from favorites"
+                                : "add to favorites"
+                            }
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleCtxFav(c.name);
+                            }}
+                          >
+                            {ctxFavs().has(c.name) ? "★" : "☆"}
+                          </button>
+                          <button
+                            class="launcher-item"
+                            disabled={isConnecting(c.name)}
+                            onClick={() => void openContext(c.name)}
+                          >
+                            <span class="launcher-name">{c.name}</span>
+                            <span class="dim">
+                              {isConnecting(c.name)
+                                ? "connecting…"
+                                : [
+                                    c.is_current ? "current" : "",
+                                    lastSession.includes(c.name) ? "recent" : "",
+                                    preCmds()[c.name] ? "pre-connect" : "",
+                                    c.source ? basename(c.source) : "",
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" · ")}
+                            </span>
+                          </button>
+                          {/* Whatever this cluster needs first belongs next to
+                              the cluster, not buried in a settings page. */}
+                          {preConnectButton(c.name)}
+                        </div>
+                        {preConnectEditor(c.name)}
+                      </>
+                    );
+                  }}
+                </For>
+              </Show>
             </>
           )}
         </For>
@@ -6427,30 +6834,55 @@ function App() {
             <Show when={tabsMenuOpen()}>
               <div class="tabs-backdrop" onClick={() => setTabsMenuOpen(false)} />
               <div class="tabs-pop">
-                <For each={tabs()}>
-                  {(name) => (
-                    <div
-                      class="tabs-pop-row"
-                      classList={{ active: active() === name }}
-                      style={{ "--ctx-hue": ctxHue(name) }}
-                      onClick={() => {
-                        setTabsMenuOpen(false);
-                        if (active() !== name) activate(name);
-                      }}
-                    >
-                      <span class="ctx-dot" />
-                      <span class="tabs-pop-name">{name}</span>
-                      <button
-                        class="tab-close"
-                        title="close context"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          closeTab(name);
-                        }}
-                      >
-                        ✕
-                      </button>
-                    </div>
+                <For each={tabSections()}>
+                  {(sec) => (
+                    <>
+                      <div class="tabs-pop-head">
+                        <span class="ctx-group-name">{sec.group}</span>
+                        <span class="dim">{sec.items.length}</span>
+                      </div>
+                      <For each={sec.items}>
+                        {(name) => (
+                          <div
+                            class="tabs-pop-row"
+                            classList={{ active: active() === name }}
+                            style={{ "--ctx-hue": ctxHue(name) }}
+                            onClick={() => {
+                              setTabsMenuOpen(false);
+                              if (active() !== name) activate(name);
+                            }}
+                          >
+                            <span class="ctx-dot" />
+                            <span class="tabs-pop-name">{name}</span>
+                            <button
+                              class="ctx-star sm"
+                              classList={{ on: ctxFavs().has(name) }}
+                              title={
+                                ctxFavs().has(name)
+                                  ? "remove from favorites"
+                                  : "add to favorites"
+                              }
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleCtxFav(name);
+                              }}
+                            >
+                              {ctxFavs().has(name) ? "★" : "☆"}
+                            </button>
+                            <button
+                              class="tab-close"
+                              title="close context"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                closeTab(name);
+                              }}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        )}
+                      </For>
+                    </>
                   )}
                 </For>
               </div>
@@ -6486,7 +6918,7 @@ function App() {
                 }}
                 onKeyDown={(e) => {
                   e.stopPropagation();
-                  const items = ctxItems();
+                  const items = ctxAddFlat();
                   if (e.key === "Escape") setCtxOpen(false);
                   else if (pageDir(e)) {
                     e.preventDefault();
@@ -6512,38 +6944,77 @@ function App() {
                 }}
               />
               <div class="ns-list">
-                <For each={ctxItems()}>
-                  {(c, i) => (
+                <For each={ctxAddSections()}>
+                  {(sec) => (
                     <>
-                      <div
-                        class="launcher-row"
-                        classList={{ active: ctxIdx() === i() }}
-                        onMouseEnter={() => setCtxIdx(i())}
-                      >
+                      <Show when={sec.group}>
                         <button
-                          class="launcher-item"
-                          onClick={() => {
-                            setCtxOpen(false);
-                            void openContext(c.name);
-                          }}
+                          class="ctx-group-head"
+                          onClick={() => toggleCtxGroup(sec.group)}
+                          title={sec.collapsed ? "expand" : "collapse"}
                         >
-                          <span class="launcher-name">{c.name}</span>
-                          <span class="dim">
-                            {[
-                              c.is_current ? "current" : "",
-                              preCmds()[c.name] ? "pre-connect" : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")}
+                          <span class="ctx-chev">
+                            {sec.collapsed ? "▸" : "▾"}
                           </span>
+                          <span class="ctx-group-name">{sec.group}</span>
+                          <span class="dim">{sec.items.length}</span>
                         </button>
-                        {preConnectButton(c.name)}
-                      </div>
-                      {preConnectEditor(c.name)}
+                      </Show>
+                      <Show when={!sec.collapsed}>
+                        <For each={sec.items}>
+                          {(c) => {
+                            const gi = () => ctxAddIndexOf().get(c.name) ?? -1;
+                            return (
+                              <>
+                                <div
+                                  class="launcher-row"
+                                  classList={{ active: ctxIdx() === gi() }}
+                                  onMouseEnter={() => setCtxIdx(gi())}
+                                >
+                                  <button
+                                    class="ctx-star"
+                                    classList={{ on: ctxFavs().has(c.name) }}
+                                    title={
+                                      ctxFavs().has(c.name)
+                                        ? "remove from favorites"
+                                        : "add to favorites"
+                                    }
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleCtxFav(c.name);
+                                    }}
+                                  >
+                                    {ctxFavs().has(c.name) ? "★" : "☆"}
+                                  </button>
+                                  <button
+                                    class="launcher-item"
+                                    onClick={() => {
+                                      setCtxOpen(false);
+                                      void openContext(c.name);
+                                    }}
+                                  >
+                                    <span class="launcher-name">{c.name}</span>
+                                    <span class="dim">
+                                      {[
+                                        c.is_current ? "current" : "",
+                                        preCmds()[c.name] ? "pre-connect" : "",
+                                      ]
+                                        .filter(Boolean)
+                                        .join(" · ")}
+                                    </span>
+                                  </button>
+                                  {preConnectButton(c.name)}
+                                </div>
+                                {preConnectEditor(c.name)}
+                              </>
+                            );
+                          }}
+                        </For>
+                      </Show>
                     </>
                   )}
                 </For>
-                <Show when={ctxItems().length === 0}>
+                <Show when={ctxAddFlat().length === 0}>
                   <p class="dim ctx-empty">no matching context</p>
                 </Show>
               </div>
@@ -7093,11 +7564,17 @@ function App() {
               </Show>
               <Show when={selected()}>
                 <button
-                  class="btn sm"
-                  title="which actions you're allowed to perform on this kind (kubectl auth can-i)"
-                  onClick={openAccess}
+                  class="btn sm share-btn"
+                  title="copy a peye:// link to this exact view — anyone with this cluster opens the same place"
+                  onClick={() => void copyShareLink()}
                 >
-                  my permissions
+                  {sharedCopied() ? (
+                    "link copied ✓"
+                  ) : (
+                    <>
+                      <img class="share-ico" src={rocketUrl} alt="" /> share view
+                    </>
+                  )}
                 </button>
               </Show>
               <Show when={table()}>
@@ -7309,6 +7786,18 @@ function App() {
                     </div>
                   </Show>
                 </div>
+                {/* Permissions is a "check now and then" thing, not a primary
+                    action — tucked into the right corner as an icon so it's
+                    out of the way of the search/send controls. */}
+                <Show when={selected()}>
+                  <button
+                    class="btn sm perm-btn"
+                    title="what you're allowed to do on this kind (kubectl auth can-i)"
+                    onClick={openAccess}
+                  >
+                    <img class="perm-ico" src={shieldUrl} alt="" /> permissions
+                  </button>
+                </Show>
                 {/* Stable count first so its position never moves; the
                     volatile indexing / loading indicators trail after it
                     and grow into empty space instead of shoving it. */}
@@ -7724,6 +8213,19 @@ function App() {
                 <span class="drawer-hint">
                   <kbd class="key">?</kbd> shortcuts
                 </span>
+                <button
+                  class="btn sm share-btn drawer-share"
+                  title="copy a peye:// link straight to this resource — opens the same place for anyone with the cluster"
+                  onClick={() => void copyShareLink()}
+                >
+                  {sharedCopied() ? (
+                    "link copied ✓"
+                  ) : (
+                    <>
+                      <img class="share-ico" src={rocketUrl} alt="" /> share view
+                    </>
+                  )}
+                </button>
                 <button class="close" onClick={closeDetail}>
                   ✕
                 </button>
@@ -8736,6 +9238,83 @@ function App() {
             </div>
           </Show>
 
+          <Show when={deepLinkMiss()} keyed>
+            {(miss) => (
+              <div
+                class="modal-backdrop"
+                onClick={() => setDeepLinkMiss(null)}
+              >
+                <div class="modal" onClick={(e) => e.stopPropagation()}>
+                  <h3>Cluster not in your kubeconfig</h3>
+                  <p>
+                    This link opens{" "}
+                    <Show when={miss.ctx} fallback={<>a cluster</>}>
+                      <b>{miss.ctx}</b>
+                    </Show>
+                    , but no context here points to it
+                    <Show when={miss.host}>
+                      {" "}
+                      (<code>{miss.host}</code>)
+                    </Show>
+                    . Add the cluster to your kubeconfig, then reopen the link.
+                  </p>
+                  {(() => {
+                    const hint = clusterAddHint(miss.host, miss.ctx);
+                    return (
+                      <>
+                        <Show when={hint.provider}>
+                          <p class="dim">Looks like a {hint.provider} cluster.</p>
+                        </Show>
+                        <Show
+                          when={hint.cmd}
+                          fallback={
+                            <p class="dim">
+                              Couldn't identify the provider from the endpoint —
+                              add the context with your provider's CLI (GKE:{" "}
+                              <code>
+                                gcloud container clusters get-credentials …
+                              </code>
+                              , or merge the kubeconfig you were given), then
+                              reopen the link.
+                            </p>
+                          }
+                        >
+                          <div class="dl-cmd">
+                            <code>{hint.cmd!}</code>
+                            <button
+                              class="btn sm"
+                              onClick={() => void copyDlCmd(hint.cmd!)}
+                            >
+                              {dlCopied() ? "copied ✓" : "copy"}
+                            </button>
+                          </div>
+                          <Show
+                            when={
+                              hint.provider === "GKE" ||
+                              hint.provider === "AKS"
+                            }
+                          >
+                            <p class="dim dl-note">
+                              Fill in the &lt;placeholders&gt; first.
+                            </p>
+                          </Show>
+                        </Show>
+                      </>
+                    );
+                  })()}
+                  <div class="modal-actions">
+                    <button
+                      class="btn primary"
+                      onClick={() => setDeepLinkMiss(null)}
+                    >
+                      Got it
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </Show>
+
           <Show when={helpOpen()}>
             <div class="modal-backdrop" onClick={() => setHelpOpen(false)}>
               <div class="modal help" onClick={(e) => e.stopPropagation()}>
@@ -8770,7 +9349,7 @@ function App() {
                   <span>sort by age · name · status · ready · restarts · cpu · mem · ip · node</span>
                   <b>Esc</b><span>close → clear filter → view history back</span>
                   <b class="help-sec">detail panel</b>
-                  <b>↑ ↓ · j k</b><span>move between sections</span>
+                  <b>↑ ↓ · j k</b><span>move between sections (↑ to the top reaches share view)</span>
                   <b>← →</b><span>reach a section's buttons — actions, copy / copy all, Apply</span>
                   <b>Enter</b><span>open the focused section (folds · editor) or press its button</span>
                   <b>← h</b><span>back to the table — from a section header, or from the first button of a row</span>

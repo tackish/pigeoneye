@@ -338,6 +338,30 @@ button.app-ver.err::after {
   white-space: nowrap;
 }
 
+/* Group header inside the ▾ overflow menu. */
+.tabs-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px 2px;
+}
+.tabs-pop-head .ctx-group-name {
+  font-size: 11px;
+}
+.tabs-pop-head .dim {
+  margin-left: auto;
+  font-size: 11px;
+}
+.tabs-pop-head:first-child {
+  padding-top: 2px;
+}
+/* In the menu the star is always shown (rows aren't hover-reveal here). */
+.ctx-star.sm {
+  opacity: 1;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
 /* Browser/editor-style tabs. Inactive tabs are quiet and flat; the active
    tab lifts onto the content color with a thin identity-colored top accent —
    clean, not a heavy filled card. Each context's hue is set inline. */
@@ -2163,6 +2187,18 @@ kbd.key {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* The header share button and the corner permissions button sit at panel
+   edges where a 2px outer outline gets clipped, and share already carries an
+   accent border — so the keyboard cursor uses an INSET ring plus a fill,
+   which never clips and reads clearly as "selected" (vs. the plain
+   accent-soft hover). */
+.share-btn.btn-cursor,
+.perm-btn.btn-cursor {
+  outline: none;
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
+  border-color: var(--accent);
+}
 
 .actions button:focus-visible,
 .yaml-actions button:focus-visible {
@@ -2335,6 +2371,68 @@ kbd.key {
 
 .launcher-pre:hover {
   color: var(--fg);
+}
+
+/* Auto-group header in the context picker — collapsible prefix sections.
+   Sticky so the current group stays labelled at the top while scrolling
+   (otherwise the cursor landing mid-group scrolls the header out of view,
+   which reads as "the header/contexts vanished"). */
+.ctx-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: var(--bg2);
+  border: none;
+  cursor: pointer;
+  color: var(--dim);
+  font-family: var(--font-ui);
+  padding: 8px 12px 3px;
+  text-align: left;
+}
+.ctx-group-head:hover .ctx-group-name {
+  color: var(--accent);
+}
+.ctx-chev {
+  color: var(--accent);
+  font-size: 9px;
+  width: 10px;
+}
+.ctx-group-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.ctx-group-head .dim {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+/* Favorite star — quiet until the row is hovered/active; accent ★ when on. */
+.ctx-star {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 4px 2px 4px 12px;
+  color: var(--dim);
+  opacity: 0;
+  transition:
+    opacity 0.1s ease,
+    color 0.1s ease;
+}
+.launcher-row:hover .ctx-star,
+.launcher-row.active .ctx-star,
+.ctx-star.on {
+  opacity: 1;
+}
+.ctx-star.on,
+.ctx-star:hover {
+  color: var(--accent);
 }
 
 /* The top bar's picker is a context list, so it needs the width of one. */
@@ -2517,6 +2615,8 @@ kbd.key {
   gap: 12px;
   flex: 1;
   min-width: 0;
+  /* keep the keyboard-scrolled row clear of the sticky group header */
+  scroll-margin-top: 30px;
   background: none;
   border: none;
   color: var(--fg);
@@ -3088,6 +3188,49 @@ details.fold[open] > summary::before {
 .btn:disabled {
   opacity: 0.45;
   cursor: default;
+}
+
+/* Share is an action, not a copy — a quiet accent CTA so it reads as
+   "hand this view to someone", not the clipboard. */
+.btn.sm.share-btn {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px; /* icon + label runs a touch smaller than a plain button */
+}
+.share-ico {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  margin: -3px 0; /* the illustration has its own padding; keep the button slim */
+}
+
+/* my-permissions: icon-only in the right corner, but it must still read as a
+   button — keep the chrome obvious and give the icon room inside it. */
+.btn.sm.perm-btn {
+  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  background: var(--bg3);
+  border-color: var(--border);
+}
+.btn.sm.perm-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+.perm-ico {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  margin: -2px 0;
+}
+.btn.sm.share-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .btn.primary {
@@ -3810,6 +3953,30 @@ details.fold[open] > summary::before {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 16px;
+}
+
+/* deep-link "cluster not found" — the copy-and-run add command. */
+.dl-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 4px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.dl-cmd code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+.dl-cmd .btn.sm {
+  flex: none;
 }
 
 .modal.help {
