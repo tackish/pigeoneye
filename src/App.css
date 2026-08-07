@@ -908,6 +908,22 @@ button.app-ver.err::after {
 .pin-pick {
   width: 210px;
 }
+/* the context's current home, ticked */
+.pin-pick .ns-item.on {
+  color: var(--accent);
+}
+.pin-pick .ns-item.on::after {
+  content: " ✓";
+}
+.pin-pick .ctx-pin-remove {
+  color: var(--error-fg);
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+}
+.pin-pick .ctx-pin-remove:hover {
+  color: var(--error-fg);
+  background: var(--error-bg);
+}
 .pin-pick-new {
   display: flex;
   gap: 4px;
@@ -2345,35 +2361,84 @@ kbd.key {
   align-items: center;
 }
 
-/* "⋯" rather than "+": this opens what the row already has, it does not
-   add another of anything. */
-.launcher-pre {
-  background: none;
-  border: none;
-  color: transparent;
-  cursor: pointer;
-  font-size: 14px;
-  letter-spacing: 0.05em;
-  padding: 5px 10px;
-  line-height: 1;
+/* A grouped context wears a left accent rail (drawn inside, so the star and
+   name stay aligned with ungrouped rows — no content shift). The rail runs
+   continuously from the group header down through its members, so a group
+   reads as one bracketed unit while every row still starts at the same x. */
+.launcher-row.grouped {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
-/* Invisible until the row is under the cursor. */
-.launcher-row:hover .launcher-pre,
-.launcher-row.active .launcher-pre {
+/* The divider that opens the ungrouped tail below the groups. */
+.ctx-loose-sep {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--dim);
+  padding: 9px 12px 3px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+/* Shown in the ★ group picker when no groups exist yet. */
+.ctx-pin-empty {
+  padding: 6px 12px;
+  font-size: 11.5px;
   color: var(--dim);
 }
 
-/* A row that holds a command says so without being asked. */
-.launcher-pre.set {
+/* The connect button — the row body edits pre-connect, this actually
+   connects. An accent chip: the label stays accent-coloured in every state
+   (never white-on-accent, which read as an empty block and hid the text),
+   the hover only deepens the fill. */
+.launcher-connect {
+  flex: none;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 5px;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  padding: 3px 12px;
+  margin-right: 2px;
+  opacity: 0;
+  transition:
+    opacity 0.1s ease,
+    background 0.1s ease,
+    border-color 0.1s ease;
+}
+.launcher-row:hover .launcher-connect,
+.launcher-row.active .launcher-connect,
+.launcher-connect:focus-visible,
+.launcher-connect:disabled {
+  opacity: 1;
+}
+.launcher-connect:hover {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  border-color: var(--accent);
   color: var(--accent);
 }
-
-.launcher-pre:hover {
+.launcher-connect:disabled {
+  cursor: default;
+  color: var(--dim);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+/* An already-open context: the button switches to its tab, so it reads as a
+   neutral "go to", not a connect. */
+.launcher-connect.open {
+  background: none;
+  border-color: var(--border);
+  color: var(--dim);
+}
+.launcher-connect.open:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
   color: var(--fg);
 }
 
-/* Auto-group header in the context picker — collapsible prefix sections.
+/* Group header in the context picker — collapsible custom-group sections.
    Sticky so the current group stays labelled at the top while scrolling
    (otherwise the cursor landing mid-group scrolls the header out of view,
    which reads as "the header/contexts vanished"). */
@@ -2387,6 +2452,8 @@ kbd.key {
   width: 100%;
   background: var(--bg2);
   border: none;
+  /* same left rail as its member rows, for a continuous group bracket */
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
   cursor: pointer;
   color: var(--dim);
   font-family: var(--font-ui);
@@ -2409,6 +2476,124 @@ kbd.key {
 .ctx-group-head .dim {
   margin-left: auto;
   font-size: 11px;
+}
+/* "open all" — connect every context in the group at once (hover-reveal). */
+/* "connect all" is the group's primary action, so it reads bigger and more
+   solid than a row's "connect" (larger text, more padding, accent fill). */
+.ctx-group-open {
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: var(--accent-soft);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 4px 14px;
+  border-radius: 5px;
+  opacity: 0;
+  transition:
+    opacity 0.1s ease,
+    background 0.1s ease,
+    color 0.1s ease;
+}
+.ctx-group-head:hover .ctx-group-open,
+.ctx-group-open:focus-visible {
+  opacity: 1;
+}
+.ctx-group-open:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* inline group rename (double-click the group name) */
+.ctx-group-rename {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 6px;
+}
+
+/* per-context ⋯ menu (move to group / manage) */
+.ctx-menu-wrap {
+  position: relative;
+  flex: none;
+}
+.ctx-menu-btn {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 4px;
+  opacity: 0;
+}
+.launcher-row:hover .ctx-menu-btn,
+.ctx-menu-btn:focus-visible,
+.ctx-menu-wrap:has(.ctx-menu) .ctx-menu-btn {
+  opacity: 1;
+}
+.ctx-menu-btn:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.ctx-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+.ctx-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 31;
+  min-width: 180px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ctx-menu-lab {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+  padding: 4px 8px 2px;
+}
+.ctx-menu-item {
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+}
+.ctx-menu-item:hover {
+  background: var(--bg-hover);
+}
+.ctx-menu-item.on {
+  color: var(--accent);
+}
+.ctx-menu-new {
+  margin-top: 4px;
+  font-size: 12px;
 }
 
 /* Favorite star — quiet until the row is hovered/active; accent ★ when on. */
@@ -2647,6 +2832,14 @@ kbd.key {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A row carrying a pre-connect command wears a small accent dot, so you
+   can tell at a glance which contexts run something first. */
+.launcher-item.pre-set .launcher-name::before {
+  content: "•";
+  color: var(--accent);
+  margin-right: 6px;
 }
 
 .launcher-item .dim {

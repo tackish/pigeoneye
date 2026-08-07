@@ -799,9 +799,8 @@ function App() {
     }
   })();
 
-  // Context favorites (★) and collapsed auto-groups, persisted. Groups are
-  // by name prefix (alpha-*, prod-*, k3s-*…) — zero config for regular
-  // naming; ★ pins a cluster to the top regardless of its prefix.
+  // Collapsed-group state, persisted. Groups are entirely user-made (see
+  // ctxGroupOf below) — there is no auto grouping and no built-in favorites.
   const loadSet = (key: string): Set<string> => {
     try {
       const v = JSON.parse(localStorage.getItem(key) ?? "[]");
@@ -812,21 +811,11 @@ function App() {
       return new Set();
     }
   };
-  const [ctxFavs, setCtxFavsRaw] = createSignal<Set<string>>(
-    loadSet("pigeoneye.ctxfavs"),
-  );
   const [ctxCollapsed, setCtxCollapsedRaw] = createSignal<Set<string>>(
     loadSet("pigeoneye.ctxgroups"),
   );
   const persistSet = (key: string, s: Set<string>) =>
     localStorage.setItem(key, JSON.stringify([...s]));
-  const toggleCtxFav = (name: string) => {
-    const s = new Set(ctxFavs());
-    if (s.has(name)) s.delete(name);
-    else s.add(name);
-    setCtxFavsRaw(s);
-    persistSet("pigeoneye.ctxfavs", s);
-  };
   const toggleCtxGroup = (g: string) => {
     const s = new Set(ctxCollapsed());
     if (s.has(g)) s.delete(g);
@@ -837,16 +826,282 @@ function App() {
     setPickerIdx(0);
     setCtxIdx(0);
   };
-  const FAV_GROUP = "★ favorites";
-  const ctxPrefix = (name: string) => name.split(/[-_/]/)[0] || name;
+  // Custom context groups: a context is ungrouped until the user puts it in a
+  // named group (like pinning to a group in the left panel). No auto grouping
+  // by name prefix and no built-in favorites — the flat list is the default,
+  // groups are entirely user-made. Persisted.
+  const [ctxGroupOf, setCtxGroupOfRaw] = createSignal<Record<string, string>>(
+    (() => {
+      try {
+        const v = JSON.parse(
+          localStorage.getItem("pigeoneye.ctxgroupof") ?? "{}",
+        );
+        return v && typeof v === "object" ? v : {};
+      } catch {
+        return {};
+      }
+    })(),
+  );
+  /// A context's group, or "" when it is ungrouped (the default).
+  const groupKeyOf = (name: string) => ctxGroupOf()[name] || "";
+  const persistCtxGroupOf = (m: Record<string, string>) => {
+    setCtxGroupOfRaw(m);
+    localStorage.setItem("pigeoneye.ctxgroupof", JSON.stringify(m));
+  };
+  const setCtxGroup = (name: string, group: string) => {
+    const m = { ...ctxGroupOf() };
+    const g = group.trim();
+    if (!g) delete m[name]; // ungrouped
+    else m[name] = g;
+    persistCtxGroupOf(m);
+  };
+  /// Rename a group by moving every context filed under it to the new name.
+  /// Walk the assignment map itself (not the loaded context list) so a
+  /// context that is grouped but absent from the current kubeconfig still
+  /// moves, and carry the collapsed state over so the group doesn't spring
+  /// open on rename.
+  const renameCtxGroup = (from: string, to: string) => {
+    const t = to.trim();
+    if (!t || t === from) return;
+    const m = { ...ctxGroupOf() };
+    for (const k of Object.keys(m)) {
+      if (m[k] === from) m[k] = t;
+    }
+    persistCtxGroupOf(m);
+    const cc = ctxCollapsed();
+    if (cc.has(from)) {
+      const s = new Set(cc);
+      s.delete(from);
+      s.add(t);
+      setCtxCollapsedRaw(s);
+      persistSet("pigeoneye.ctxgroups", s);
+    }
+  };
+  const [renamingCtxGroup, setRenamingCtxGroup] = createSignal<string | null>(
+    null,
+  );
+  /// Connect to every context in a group at once — the point of a group is
+  /// to treat those clusters as one set. Skips any already open.
+  ///
+  /// A context with an un-run pre-connect command opens a login terminal
+  /// (one `loginTarget` at a time), so we can only kick off the FIRST such
+  /// context — starting a second would silently overwrite the first's pending
+  /// login. The rest are left for the user to connect individually; everything
+  /// that connects without interaction opens immediately.
+  function openGroup(group: string) {
+    setCtxOpen(false);
+    let startedPre = false;
+    for (const c of contexts()) {
+      if (groupKeyOf(c.name) !== group || tabs().includes(c.name)) continue;
+      const needsPre = !!preCmds()[c.name] && !preRan.has(c.name);
+      if (needsPre) {
+        if (startedPre) continue;
+        startedPre = true;
+      }
+      void openContext(c.name);
+    }
+  }
+  // The ★ group-picker popover. A context's star opens this picker to choose
+  // which group to file the context under (an existing group, or a new one
+  // typed inline), like the left panel's pin-to-group flow. A context is
+  // either in one named group or ungrouped.
+  const [ctxNewGroup, setCtxNewGroup] = createSignal("");
+  const [ctxPinFor, setCtxPinFor] = createSignal<string | null>(null);
+  const [ctxPinAt, setCtxPinAt] = createSignal<{ x: number; y: number } | null>(
+    null,
+  );
+  const ctxGroupNames = () =>
+    [...new Set(contexts().map((c) => groupKeyOf(c.name)))]
+      .filter((g) => !!g)
+      .sort();
+  /// A context is "pinned" when it is filed into a group — its star fills.
+  const isCtxPinned = (name: string) => !!groupKeyOf(name);
+  /// Open the ★ group picker anchored under the clicked star.
+  const openCtxPin = (name: string, el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setCtxNewGroup("");
+    setCtxPinAt({ x: r.left, y: r.bottom + 6 });
+    setCtxPinFor(ctxPinFor() === name ? null : name);
+  };
+  /// The star button for a context row — opens the group picker anchored to it.
+  const ctxStar = (name: string) => (
+    <button
+      class="ctx-star"
+      classList={{ on: isCtxPinned(name) }}
+      title="file under a group"
+      onClick={(e) => {
+        e.stopPropagation();
+        openCtxPin(name, e.currentTarget);
+      }}
+    >
+      {isCtxPinned(name) ? "★" : "☆"}
+    </button>
+  );
+  /// The ★ group picker, rendered once at the app root (fixed-positioned to
+  /// the clicked star). Mirrors the left panel's pin-to-group popover.
+  function ctxPinPicker() {
+    const name = () => ctxPinFor();
+    return (
+      <Show when={name()}>
+        <div class="col-menu-backdrop" onClick={() => setCtxPinFor(null)} />
+        <div
+          class="col-menu pin-pick"
+          style={{
+            left: `${ctxPinAt()?.x ?? 0}px`,
+            top: `${ctxPinAt()?.y ?? 0}px`,
+          }}
+        >
+          <div class="col-menu-head">
+            file <b>{name()}</b> under…
+          </div>
+          <div class="col-menu-list">
+            <Show
+              when={ctxGroupNames().length}
+              fallback={
+                <div class="ctx-pin-empty">
+                  no groups yet — name one below
+                </div>
+              }
+            >
+              <For each={ctxGroupNames()}>
+                {(g) => (
+                  <button
+                    class="ns-item"
+                    classList={{ on: groupKeyOf(name()!) === g }}
+                    onClick={() => {
+                      setCtxGroup(name()!, g);
+                      setCtxPinFor(null);
+                    }}
+                  >
+                    {g}
+                  </button>
+                )}
+              </For>
+            </Show>
+            <Show when={isCtxPinned(name()!)}>
+              <button
+                class="ns-item ctx-pin-remove"
+                onClick={() => {
+                  setCtxGroup(name()!, "");
+                  setCtxPinFor(null);
+                }}
+              >
+                ✕ remove from {groupKeyOf(name()!)}
+              </button>
+            </Show>
+          </div>
+          <div class="pin-pick-new">
+            <input
+              class="search"
+              placeholder="new group…"
+              value={ctxNewGroup()}
+              ref={(el) => setTimeout(() => el.focus())}
+              onInput={(e) => setCtxNewGroup(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter" && ctxNewGroup().trim()) {
+                  setCtxGroup(name()!, ctxNewGroup().trim());
+                  setCtxPinFor(null);
+                } else if (e.key === "Escape") setCtxPinFor(null);
+              }}
+            />
+            <button
+              class="btn sm"
+              disabled={!ctxNewGroup().trim()}
+              onClick={() => {
+                setCtxGroup(name()!, ctxNewGroup().trim());
+                setCtxPinFor(null);
+              }}
+            >
+              add
+            </button>
+          </div>
+        </div>
+      </Show>
+    );
+  }
+  /// A collapsible group header, shared by the pickers: click toggles,
+  /// double-click on the name renames the whole group.
+  function GroupHeader(props: {
+    sec: { group: string; collapsed: boolean; items: unknown[] };
+  }) {
+    const sec = () => props.sec;
+    const renaming = () => renamingCtxGroup() === sec().group;
+    return (
+      <div
+        class="ctx-group-head"
+        classList={{ renaming: renaming() }}
+        title={
+          renaming()
+            ? ""
+            : (sec().collapsed ? "expand" : "collapse") +
+              " · double-click to rename"
+        }
+        onClick={() => {
+          if (!renaming()) toggleCtxGroup(sec().group);
+        }}
+      >
+        <span class="ctx-chev">{sec().collapsed ? "▸" : "▾"}</span>
+        <Show
+          when={renaming()}
+          fallback={
+            <span
+              class="ctx-group-name"
+              onDblClick={(e) => {
+                e.stopPropagation();
+                setRenamingCtxGroup(sec().group);
+              }}
+            >
+              {sec().group}
+            </span>
+          }
+        >
+          <input
+            class="ctx-group-rename"
+            value={sec().group}
+            ref={(el) =>
+              setTimeout(() => {
+                el.focus();
+                el.select();
+              })
+            }
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") {
+                renameCtxGroup(sec().group, e.currentTarget.value);
+                setRenamingCtxGroup(null);
+              } else if (e.key === "Escape") setRenamingCtxGroup(null);
+            }}
+            onBlur={(e) => {
+              renameCtxGroup(sec().group, e.currentTarget.value);
+              setRenamingCtxGroup(null);
+            }}
+          />
+        </Show>
+        <span class="dim">{sec().items.length}</span>
+        <Show when={!renaming()}>
+          <button
+            class="ctx-group-open"
+            title={`connect to all ${sec().items.length} contexts in this group`}
+            onClick={(e) => {
+              e.stopPropagation();
+              openGroup(sec().group);
+            }}
+          >
+            connect all
+          </button>
+        </Show>
+      </div>
+    );
+  }
 
-  /// Contexts grouped for the launcher: a ★ favorites section, then one
-  /// collapsible section per name prefix. A search query flattens it to a
-  /// single ranked list (favorites/recent first) for fast find.
+  /// Contexts for the launcher: one collapsible section per custom group,
+  /// then the ungrouped contexts as a flat headerless tail. A search query
+  /// flattens it to a single ranked list (recent/current first) for fast find.
   type CtxSection = { group: string; collapsed: boolean; items: ContextInfo[] };
   const ctxSections = createMemo<CtxSection[]>(() => {
     const q = pickerQ().toLowerCase().trim();
-    const favs = ctxFavs();
     const all = contexts().filter(
       (c) => !q || c.name.toLowerCase().includes(q),
     );
@@ -854,33 +1109,31 @@ function App() {
       a.name.localeCompare(b.name);
     if (q) {
       const rank = (c: ContextInfo) =>
-        (favs.has(c.name) ? -1 : 0) +
-        (lastSession.includes(c.name) ? 0 : 1) +
-        (c.is_current ? -0.5 : 0);
+        (lastSession.includes(c.name) ? 0 : 1) + (c.is_current ? -0.5 : 0);
       const items = [...all].sort((a, b) => rank(a) - rank(b) || byName(a, b));
       return [{ group: "", collapsed: false, items }];
     }
-    const favItems = all.filter((c) => favs.has(c.name)).sort(byName);
     const gmap = new Map<string, ContextInfo[]>();
+    const loose: ContextInfo[] = [];
     for (const c of all) {
-      if (favs.has(c.name)) continue;
-      const p = ctxPrefix(c.name);
-      if (!gmap.has(p)) gmap.set(p, []);
-      gmap.get(p)!.push(c);
+      const g = groupKeyOf(c.name);
+      if (!g) {
+        loose.push(c);
+        continue;
+      }
+      if (!gmap.has(g)) gmap.set(g, []);
+      gmap.get(g)!.push(c);
     }
     const sections: CtxSection[] = [];
-    if (favItems.length)
-      sections.push({
-        group: FAV_GROUP,
-        collapsed: ctxCollapsed().has(FAV_GROUP),
-        items: favItems,
-      });
     for (const g of [...gmap.keys()].sort())
       sections.push({
         group: g,
         collapsed: ctxCollapsed().has(g),
         items: gmap.get(g)!.sort(byName),
       });
+    // Ungrouped contexts trail the groups as one headerless, flat section.
+    if (loose.length)
+      sections.push({ group: "", collapsed: false, items: loose.sort(byName) });
     return sections;
   });
   /// Flat selectable list (collapsed groups contribute nothing) — the
@@ -896,15 +1149,14 @@ function App() {
   /// is already open. Flat list + index map drive its keyboard cursor.
   const ctxAddSections = createMemo<CtxSection[]>(() => {
     const q = ctxQuery().toLowerCase().trim();
-    const favs = ctxFavs();
-    const all = contexts()
-      .filter((c) => !tabs().includes(c.name))
-      .filter((c) => !q || c.name.toLowerCase().includes(q));
+    // Open contexts stay in the list (marked "open") rather than vanishing —
+    // clicking one just switches to its tab. Dropping them made contexts look
+    // like they disappeared when connected.
+    const all = contexts().filter((c) => !q || c.name.toLowerCase().includes(q));
     const byName = (a: ContextInfo, b: ContextInfo) =>
       a.name.localeCompare(b.name);
     if (q) {
-      const rank = (c: ContextInfo) =>
-        (favs.has(c.name) ? -1 : 0) + (c.is_current ? -0.5 : 0);
+      const rank = (c: ContextInfo) => (c.is_current ? -0.5 : 0);
       return [
         {
           group: "",
@@ -913,27 +1165,26 @@ function App() {
         },
       ];
     }
-    const favItems = all.filter((c) => favs.has(c.name)).sort(byName);
     const gmap = new Map<string, ContextInfo[]>();
+    const loose: ContextInfo[] = [];
     for (const c of all) {
-      if (favs.has(c.name)) continue;
-      const p = ctxPrefix(c.name);
-      if (!gmap.has(p)) gmap.set(p, []);
-      gmap.get(p)!.push(c);
+      const g = groupKeyOf(c.name);
+      if (!g) {
+        loose.push(c);
+        continue;
+      }
+      if (!gmap.has(g)) gmap.set(g, []);
+      gmap.get(g)!.push(c);
     }
     const sections: CtxSection[] = [];
-    if (favItems.length)
-      sections.push({
-        group: FAV_GROUP,
-        collapsed: ctxCollapsed().has(FAV_GROUP),
-        items: favItems,
-      });
     for (const g of [...gmap.keys()].sort())
       sections.push({
         group: g,
         collapsed: ctxCollapsed().has(g),
         items: gmap.get(g)!.sort(byName),
       });
+    if (loose.length)
+      sections.push({ group: "", collapsed: false, items: loose.sort(byName) });
     return sections;
   });
   const ctxAddFlat = createMemo(() =>
@@ -977,23 +1228,25 @@ function App() {
   const [tabs, setTabs] = createSignal<string[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
   /// The open tabs, grouped the same way for the topbar ▾ overflow menu:
-  /// ★ favorites first, then one header per name prefix. (Declared here,
+  /// one header per custom group, then the ungrouped tabs. (Declared here,
   /// after `tabs`, so the eager memo doesn't read it in its TDZ.)
   const tabSections = createMemo<{ group: string; items: string[] }[]>(() => {
     const names = tabs();
-    const favs = ctxFavs();
-    const favNames = names.filter((n) => favs.has(n)).sort();
     const gmap = new Map<string, string[]>();
+    const loose: string[] = [];
     for (const n of names) {
-      if (favs.has(n)) continue;
-      const p = ctxPrefix(n);
-      if (!gmap.has(p)) gmap.set(p, []);
-      gmap.get(p)!.push(n);
+      const g = groupKeyOf(n);
+      if (!g) {
+        loose.push(n);
+        continue;
+      }
+      if (!gmap.has(g)) gmap.set(g, []);
+      gmap.get(g)!.push(n);
     }
     const out: { group: string; items: string[] }[] = [];
-    if (favNames.length) out.push({ group: FAV_GROUP, items: favNames });
     for (const g of [...gmap.keys()].sort())
       out.push({ group: g, items: gmap.get(g)!.sort() });
+    if (loose.length) out.push({ group: "", items: loose.sort() });
     return out;
   });
   // The strip's ResizeObserver is attached in its ref callback (below) —
@@ -1403,27 +1656,6 @@ function App() {
     setPreText(preCmds()[context] ?? "");
     setPreEdit(preEdit() === context ? null : context);
   }
-
-  /// Both context pickers — the launcher's list and the top bar's — carry
-  /// the same control, because either is a place you might realise this
-  /// cluster needs a tunnel first.
-  const preConnectButton = (name: string) => (
-    <button
-      class="launcher-pre"
-      classList={{ set: !!preCmds()[name] }}
-      title={
-        preCmds()[name]
-          ? `runs first: ${preCmds()[name]}`
-          : "run something before connecting to this context (⌥↵)"
-      }
-      onClick={(e) => {
-        e.stopPropagation();
-        editPreCmd(name);
-      }}
-    >
-      ⋯
-    </button>
-  );
 
   const preConnectEditor = (name: string) => (
     <Show when={preEdit() === name}>
@@ -6498,20 +6730,18 @@ function App() {
       />
       <div class="launcher-list">
         <For each={ctxSections()}>
-          {(sec) => (
+          {(sec, i) => (
             <>
               {/* A search flattens to one headerless section; otherwise each
-                  prefix group gets a collapsible header. */}
+                  custom group gets a collapsible header, and the ungrouped
+                  tail (group "") renders headerless — with a divider above it
+                  when groups precede it, so grouped and loose contexts read
+                  apart. */}
               <Show when={sec.group}>
-                <button
-                  class="ctx-group-head"
-                  onClick={() => toggleCtxGroup(sec.group)}
-                  title={sec.collapsed ? "expand" : "collapse"}
-                >
-                  <span class="ctx-chev">{sec.collapsed ? "▸" : "▾"}</span>
-                  <span class="ctx-group-name">{sec.group}</span>
-                  <span class="dim">{sec.items.length}</span>
-                </button>
+                <GroupHeader sec={sec} />
+              </Show>
+              <Show when={!sec.group && i() > 0}>
+                <div class="ctx-loose-sep">ungrouped</div>
               </Show>
               <Show when={!sec.collapsed}>
                 <For each={sec.items}>
@@ -6521,46 +6751,46 @@ function App() {
                       <>
                         <div
                           class="launcher-row"
-                          classList={{ active: pickerIdx() === gi() }}
+                          classList={{
+                            active: pickerIdx() === gi(),
+                            grouped: !!sec.group,
+                          }}
                           onMouseEnter={() => setPickerIdx(gi())}
                         >
-                          <button
-                            class="ctx-star"
-                            classList={{ on: ctxFavs().has(c.name) }}
-                            title={
-                              ctxFavs().has(c.name)
-                                ? "remove from favorites"
-                                : "add to favorites"
-                            }
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleCtxFav(c.name);
-                            }}
-                          >
-                            {ctxFavs().has(c.name) ? "★" : "☆"}
-                          </button>
+                          {ctxStar(c.name)}
+                          {/* The row body opens the pre-connect editor —
+                              whatever this cluster needs first belongs next to
+                              the cluster. Connecting is the button on the
+                              right. (Keyboard: ↵ connects, ⌥↵ edits.) */}
                           <button
                             class="launcher-item"
-                            disabled={isConnecting(c.name)}
-                            onClick={() => void openContext(c.name)}
+                            classList={{ "pre-set": !!preCmds()[c.name] }}
+                            title="edit what runs before connecting"
+                            onClick={() => editPreCmd(c.name)}
                           >
                             <span class="launcher-name">{c.name}</span>
                             <span class="dim">
-                              {isConnecting(c.name)
-                                ? "connecting…"
-                                : [
-                                    c.is_current ? "current" : "",
-                                    lastSession.includes(c.name) ? "recent" : "",
-                                    preCmds()[c.name] ? "pre-connect" : "",
-                                    c.source ? basename(c.source) : "",
-                                  ]
-                                    .filter(Boolean)
-                                    .join(" · ")}
+                              {[
+                                c.is_current ? "current" : "",
+                                lastSession.includes(c.name) ? "recent" : "",
+                                preCmds()[c.name] ? "pre-connect" : "",
+                                c.source ? basename(c.source) : "",
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
                             </span>
                           </button>
-                          {/* Whatever this cluster needs first belongs next to
-                              the cluster, not buried in a settings page. */}
-                          {preConnectButton(c.name)}
+                          <button
+                            class="launcher-connect"
+                            disabled={isConnecting(c.name)}
+                            title={`connect to ${c.name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void openContext(c.name);
+                            }}
+                          >
+                            {isConnecting(c.name) ? "connecting…" : "connect"}
+                          </button>
                         </div>
                         {preConnectEditor(c.name)}
                       </>
@@ -6571,7 +6801,7 @@ function App() {
             </>
           )}
         </For>
-        <Show when={pickerList().length === 0}>
+        <Show when={ctxSections().every((s) => s.items.length === 0)}>
           <p class="dim">no contexts found in your kubeconfig</p>
         </Show>
       </div>
@@ -6675,6 +6905,9 @@ function App() {
 
   return (
     <>
+    {/* The ★ group picker lives at the fragment root so it renders over both
+        the launcher (no tabs) and the main view. */}
+    {ctxPinPicker()}
     <Show
       when={tabs().length > 0}
       fallback={restoring() ? restoreSplash() : launcher()}
@@ -6837,10 +7070,12 @@ function App() {
                 <For each={tabSections()}>
                   {(sec) => (
                     <>
-                      <div class="tabs-pop-head">
-                        <span class="ctx-group-name">{sec.group}</span>
-                        <span class="dim">{sec.items.length}</span>
-                      </div>
+                      <Show when={sec.group}>
+                        <div class="tabs-pop-head">
+                          <span class="ctx-group-name">{sec.group}</span>
+                          <span class="dim">{sec.items.length}</span>
+                        </div>
+                      </Show>
                       <For each={sec.items}>
                         {(name) => (
                           <div
@@ -6856,18 +7091,14 @@ function App() {
                             <span class="tabs-pop-name">{name}</span>
                             <button
                               class="ctx-star sm"
-                              classList={{ on: ctxFavs().has(name) }}
-                              title={
-                                ctxFavs().has(name)
-                                  ? "remove from favorites"
-                                  : "add to favorites"
-                              }
+                              classList={{ on: isCtxPinned(name) }}
+                              title="file under a group"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                toggleCtxFav(name);
+                                openCtxPin(name, e.currentTarget);
                               }}
                             >
-                              {ctxFavs().has(name) ? "★" : "☆"}
+                              {isCtxPinned(name) ? "★" : "☆"}
                             </button>
                             <button
                               class="tab-close"
@@ -6945,20 +7176,13 @@ function App() {
               />
               <div class="ns-list">
                 <For each={ctxAddSections()}>
-                  {(sec) => (
+                  {(sec, i) => (
                     <>
                       <Show when={sec.group}>
-                        <button
-                          class="ctx-group-head"
-                          onClick={() => toggleCtxGroup(sec.group)}
-                          title={sec.collapsed ? "expand" : "collapse"}
-                        >
-                          <span class="ctx-chev">
-                            {sec.collapsed ? "▸" : "▾"}
-                          </span>
-                          <span class="ctx-group-name">{sec.group}</span>
-                          <span class="dim">{sec.items.length}</span>
-                        </button>
+                        <GroupHeader sec={sec} />
+                      </Show>
+                      <Show when={!sec.group && i() > 0}>
+                        <div class="ctx-loose-sep">ungrouped</div>
                       </Show>
                       <Show when={!sec.collapsed}>
                         <For each={sec.items}>
@@ -6968,34 +7192,23 @@ function App() {
                               <>
                                 <div
                                   class="launcher-row"
-                                  classList={{ active: ctxIdx() === gi() }}
+                                  classList={{
+                                    active: ctxIdx() === gi(),
+                                    grouped: !!sec.group,
+                                  }}
                                   onMouseEnter={() => setCtxIdx(gi())}
                                 >
-                                  <button
-                                    class="ctx-star"
-                                    classList={{ on: ctxFavs().has(c.name) }}
-                                    title={
-                                      ctxFavs().has(c.name)
-                                        ? "remove from favorites"
-                                        : "add to favorites"
-                                    }
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      toggleCtxFav(c.name);
-                                    }}
-                                  >
-                                    {ctxFavs().has(c.name) ? "★" : "☆"}
-                                  </button>
+                                  {ctxStar(c.name)}
                                   <button
                                     class="launcher-item"
-                                    onClick={() => {
-                                      setCtxOpen(false);
-                                      void openContext(c.name);
-                                    }}
+                                    classList={{ "pre-set": !!preCmds()[c.name] }}
+                                    title="edit what runs before connecting"
+                                    onClick={() => editPreCmd(c.name)}
                                   >
                                     <span class="launcher-name">{c.name}</span>
                                     <span class="dim">
                                       {[
+                                        tabs().includes(c.name) ? "open" : "",
                                         c.is_current ? "current" : "",
                                         preCmds()[c.name] ? "pre-connect" : "",
                                       ]
@@ -7003,7 +7216,31 @@ function App() {
                                         .join(" · ")}
                                     </span>
                                   </button>
-                                  {preConnectButton(c.name)}
+                                  <button
+                                    class="launcher-connect"
+                                    classList={{ open: tabs().includes(c.name) }}
+                                    disabled={isConnecting(c.name)}
+                                    title={
+                                      tabs().includes(c.name)
+                                        ? `switch to ${c.name}`
+                                        : `connect to ${c.name}`
+                                    }
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setCtxOpen(false);
+                                      // Already open → just switch to its tab;
+                                      // openContext activates a live tab too,
+                                      // but be explicit here.
+                                      if (tabs().includes(c.name)) activate(c.name);
+                                      else void openContext(c.name);
+                                    }}
+                                  >
+                                    {isConnecting(c.name)
+                                      ? "connecting…"
+                                      : tabs().includes(c.name)
+                                        ? "go to ›"
+                                        : "connect"}
+                                  </button>
                                 </div>
                                 {preConnectEditor(c.name)}
                               </>
@@ -7014,7 +7251,7 @@ function App() {
                     </>
                   )}
                 </For>
-                <Show when={ctxAddFlat().length === 0}>
+                <Show when={ctxAddSections().every((s) => s.items.length === 0)}>
                   <p class="dim ctx-empty">no matching context</p>
                 </Show>
               </div>
