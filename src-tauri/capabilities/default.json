@@ -11,6 +11,7 @@
     "core:webview:allow-set-webview-zoom",
     "opener:default",
     "dialog:default",
-    "opener:allow-open-url"
+    "opener:allow-open-url",
+    "deep-link:default"
   ]
 }

@@ -557,6 +557,21 @@ async fn sample_fields(
 /// the usual bin dirs, so exec-based auth resolves the same as in a
 /// terminal. Launching via the `peye` symlink already inherits the shell
 /// PATH; this makes the GUI launch behave identically.
+/// A PigeonEye launched from inside an `aws-vault exec` subshell inherits
+/// AWS_VAULT, which makes a kubeconfig exec of the form `aws-vault exec
+/// <profile> -- …` refuse to run ("running in an existing aws-vault
+/// subshell"). Unset only that marker so the nested aws-vault runs (it
+/// re-derives credentials from its own keychain regardless). We deliberately
+/// KEEP the injected AWS_ACCESS_KEY_ID/etc: a kubeconfig whose exec is a
+/// plain `aws eks get-token` relies on exactly those ambient credentials, and
+/// removing them would break it. (A `--profile` flag already wins over the
+/// ambient env creds, so profile-based execs are unaffected either way.)
+fn clear_aws_vault_env() {
+    if std::env::var_os("AWS_VAULT").is_some() {
+        std::env::remove_var("AWS_VAULT");
+    }
+}
+
 fn augment_path() {
     let mut dirs: Vec<String> = Vec::new();
     let push = |d: String, dirs: &mut Vec<String>| {
@@ -634,12 +649,22 @@ fn augment_path() {
 }
 
 pub fn run() {
+    clear_aws_vault_env();
     augment_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::default())
         .setup(|app| {
+            // Register the peye:// scheme at runtime too, so deep links work
+            // in `tauri dev` (where the bundle Info.plist isn't applied). A
+            // real build registers via the bundle; both are harmless.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = app.deep_link().register_all();
+            }
             // The default macOS menu binds ⌘W to "Close Window", which
             // would throw away every open cluster tab. Build the menu
             // without it so ⌘W reaches the app and closes just the

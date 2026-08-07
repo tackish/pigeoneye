@@ -142,6 +142,10 @@ pub struct ContextInfo {
     pub is_current: bool,
     /// Which kubeconfig file this context came from ("" = default chain).
     pub source: String,
+    /// The cluster's API server URL. This is the same across everyone who
+    /// can reach the cluster, no matter what they named the context — so a
+    /// shared deep link can match by it instead of the local name.
+    pub server: String,
 }
 
 /// One listable resource type, straight from API discovery.
@@ -272,8 +276,19 @@ pub async fn list_contexts(paths: Vec<String>) -> Result<Vec<ContextInfo>, Strin
     let mut out = Vec::new();
     for (src, kc) in sources {
         let current = kc.current_context.clone().unwrap_or_default();
+        // Resolve each context's cluster to its API server URL, so the UI
+        // can identify a cluster independently of the local context name.
+        let servers: std::collections::HashMap<String, String> = kc
+            .clusters
+            .iter()
+            .filter_map(|nc| {
+                let s = nc.cluster.as_ref()?.server.clone()?;
+                Some((nc.name.clone(), s))
+            })
+            .collect();
         for nc in &kc.contexts {
             let ctx = nc.context.clone().unwrap_or_default();
+            let server = servers.get(&ctx.cluster).cloned().unwrap_or_default();
             out.push(ContextInfo {
                 name: nc.name.clone(),
                 cluster: ctx.cluster,
@@ -281,6 +296,7 @@ pub async fn list_contexts(paths: Vec<String>) -> Result<Vec<ContextInfo>, Strin
                 namespace: ctx.namespace,
                 is_current: nc.name == current,
                 source: src.clone(),
+                server,
             });
         }
     }
