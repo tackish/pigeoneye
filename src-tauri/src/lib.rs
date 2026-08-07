@@ -557,18 +557,53 @@ async fn sample_fields(
 /// the usual bin dirs, so exec-based auth resolves the same as in a
 /// terminal. Launching via the `peye` symlink already inherits the shell
 /// PATH; this makes the GUI launch behave identically.
-/// A PigeonEye launched from inside an `aws-vault exec` subshell inherits
-/// AWS_VAULT, which makes a kubeconfig exec of the form `aws-vault exec
-/// <profile> -- …` refuse to run ("running in an existing aws-vault
-/// subshell"). Unset only that marker so the nested aws-vault runs (it
-/// re-derives credentials from its own keychain regardless). We deliberately
-/// KEEP the injected AWS_ACCESS_KEY_ID/etc: a kubeconfig whose exec is a
-/// plain `aws eks get-token` relies on exactly those ambient credentials, and
-/// removing them would break it. (A `--profile` flag already wins over the
-/// ambient env creds, so profile-based execs are unaffected either way.)
+/// Scrub the AWS credential state a PigeonEye inherits when it is launched
+/// from a terminal that already has an aws-vault / SSO session exported.
+///
+/// AWS_VAULT: inheriting it makes a kubeconfig exec of the form `aws-vault
+/// exec <profile> -- …` refuse to run ("running in an existing aws-vault
+/// subshell"). Always drop it; the nested aws-vault re-derives credentials
+/// from its own keychain regardless.
+///
+/// The inherited session credentials (AWS_ACCESS_KEY_ID / _SECRET_ACCESS_KEY /
+/// _SESSION_TOKEN / _CREDENTIAL_EXPIRATION) are the subtler trap. botocore
+/// ranks *environment* credentials ABOVE a profile's SSO config — so they win
+/// even over an exec's own `--profile`/`AWS_PROFILE`. And because
+/// AWS_CREDENTIAL_EXPIRATION marks them refreshable, once they expire botocore
+/// "refreshes" (re-reads the same dead values) and returns
+///   "Credentials were refreshed, but the refreshed credentials are still
+///    expired",
+/// hijacking resolution away from the context's own SSO / aws-vault exec.
+/// `aws sso login` cannot fix it — it refreshes the SSO cache, not the
+/// environment. (Proven: the identical `aws eks get-token --profile …` fails
+/// with these vars present and succeeds the instant they are removed.)
+///
+/// So we drop them when either they are already expired, or we were launched
+/// inside an aws-vault subshell (their creds are an ephemeral session this GUI
+/// must not pin itself to — every context here re-derives its own credentials
+/// via SSO, aws-vault exec, or tsh). A plain-terminal launch with still-valid
+/// ambient creds keeps them, for a kubeconfig that genuinely relies on them.
 fn clear_aws_vault_env() {
-    if std::env::var_os("AWS_VAULT").is_some() {
-        std::env::remove_var("AWS_VAULT");
+    let in_aws_vault = std::env::var_os("AWS_VAULT").is_some();
+    std::env::remove_var("AWS_VAULT");
+
+    let expired = std::env::var("AWS_CREDENTIAL_EXPIRATION")
+        .ok()
+        .and_then(|s| k8s_openapi::chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|exp| exp.timestamp() <= k8s_openapi::chrono::Utc::now().timestamp())
+        .unwrap_or(false);
+
+    if in_aws_vault || expired {
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_CREDENTIAL_EXPIRATION",
+            "AWS_SESSION_EXPIRATION",
+        ] {
+            std::env::remove_var(k);
+        }
     }
 }
 
