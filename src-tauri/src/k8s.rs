@@ -351,7 +351,14 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             }
         });
 
-    if base == "aws" || base == "aws-vault" || args.iter().any(|a| a == "eks") {
+    // The aws CLI's own SSO is a SEPARATE login from the get-token call:
+    // `aws eks get-token` does NOT open a browser on its own when the SSO
+    // token is stale, so a plain re-run in a tty can't fix it — it needs
+    // `aws sso login`. (Only the *direct* `aws` exec belongs here. An
+    // `aws-vault exec … -- aws … eks get-token` command has base `aws-vault`
+    // and is handled by the generic exec-in-a-tty path below, which triggers
+    // aws-vault's own browser login — no special case needed.)
+    if base == "aws" {
         let cmd = match &profile {
             Some(p) => format!("aws sso login --profile {p}"),
             None => "aws sso login".to_string(),
@@ -418,12 +425,16 @@ fn login_plan(exec_command: &str, args: &[String], env: &[(String, String)]) -> 
             exec_command: None,
         };
     }
-    // an exec plugin we don't recognise: tell the user how it authenticates
+    // Any other exec plugin (aws-vault, kubelogin, oidc-login, a custom
+    // script…): we don't hardcode a login per binary. The universal fix is to
+    // re-run the context's OWN credential command with a tty attached — which
+    // `auth_hint` promotes to the primary action (see there). Device-flow
+    // plugins open their browser / prompt only when they see a terminal, then
+    // emit the token, so this covers new binaries with no special case.
     AuthHint {
         kind: "exec".into(),
         message: format!(
-            "This cluster authenticates with `{}`. Re-run its login, then reconnect.",
-            exec_command
+            "This cluster authenticates with `{base}`. Running its credential command here — with a terminal attached — lets it prompt or open its browser, then reconnects."
         ),
         command: None,
         can_login: false,
@@ -506,7 +517,22 @@ pub async fn auth_hint(
             .join(" "),
     );
     line.push_str(" >/dev/null");
-    hint.exec_command = Some(line);
+    if hint.command.is_none() {
+        // No tailored login for this plugin (login_plan left command empty).
+        // The login IS the context's own credential command, run with a tty
+        // attached — how aws-vault, kubelogin and other device-flow plugins
+        // open their browser / prompt. Promote it to the primary action so
+        // every exec-based cluster gets a working login button without a
+        // per-binary special case in login_plan. (No separate "run credential
+        // command" button — it would run the identical line.)
+        hint.command = Some(line);
+        hint.can_login = true;
+    } else {
+        // A tailored login (aws sso login, tsh login, …) is the primary action;
+        // still offer the raw credential command as a fallback, since the real
+        // fix is occasionally a re-run rather than a fresh browser login.
+        hint.exec_command = Some(line);
+    }
     Ok(hint)
 }
 

@@ -471,6 +471,68 @@ button.app-ver.err::after {
   font-weight: 600;
 }
 
+/* version history / rollback */
+.ver-history {
+  margin-top: 8px;
+}
+.ver-hist-toggle {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 2px 0;
+}
+.ver-hist-toggle:hover {
+  color: var(--fg);
+}
+.ver-loading {
+  font-size: 12px;
+  padding: 2px 0;
+}
+.ver-list {
+  max-height: 220px;
+  overflow-y: auto;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.ver-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+.ver-row:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+.ver-tag {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.ver-row .dim {
+  font-size: 11px;
+}
+.ver-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  padding: 0;
+}
+.ver-link:hover {
+  text-decoration: underline;
+}
+.ver-all {
+  margin-top: 6px;
+  display: inline-block;
+}
+
 /* ── namespace picker ────────────────────────────────── */
 
 .ns-picker {

@@ -702,6 +702,47 @@ function App() {
   const [upgrading, setUpgrading] = createSignal(false);
   const [upgradeDone, setUpgradeDone] = createSignal(false);
   const [upgradeErr, setUpgradeErr] = createSignal("");
+  // Version history / rollback: the machine's arch (for the right asset) plus
+  // the list of released versions, fetched on demand when the panel opens.
+  const [appArch, setAppArch] = createSignal("");
+  const [releases, setReleases] = createSignal<string[]>([]);
+  const [versionsOpen, setVersionsOpen] = createSignal(false);
+  const [releasesLoading, setReleasesLoading] = createSignal(false);
+  // The list request failed (offline, or GitHub's 60/hr unauthenticated API
+  // limit is exhausted). The releases page fallback works regardless.
+  const [releasesErr, setReleasesErr] = createSignal(false);
+  const RELEASES_PAGE = "https://github.com/tackish/pigeoneye/releases";
+  async function loadReleases() {
+    if (releases().length || releasesLoading()) return;
+    setReleasesLoading(true);
+    setReleasesErr(false);
+    try {
+      const res = await fetch(
+        "https://api.github.com/repos/tackish/pigeoneye/releases?per_page=30",
+        { headers: { Accept: "application/vnd.github+json" } },
+      );
+      const list = res.ok ? await res.json() : null;
+      if (Array.isArray(list) && list.length) {
+        setReleases(
+          list
+            .map((r) => String(r?.tag_name ?? "").replace(/^v/, ""))
+            .filter(Boolean),
+        );
+      } else {
+        // rate-limited / error responses come back as a JSON object, not a list
+        setReleasesErr(true);
+      }
+    } catch {
+      setReleasesErr(true);
+    }
+    setReleasesLoading(false);
+  }
+  /// The macOS tarball for a given version and this machine's arch. Opening it
+  /// downloads the build; the user extracts it and moves PigeonEye.app into
+  /// Applications to roll back (no self-replacing installer — that can't be
+  /// verified safely and could brick an install).
+  const rollbackUrl = (version: string) =>
+    `https://github.com/tackish/pigeoneye/releases/download/v${version}/PigeonEye-darwin-${appArch() || "arm64"}.tar.gz`;
   // Context tabs collapse into a ▾ dropdown when they can't all fit, so a
   // context scrolled off the edge is never silently hidden.
   const [tabsOverflow, setTabsOverflow] = createSignal(false);
@@ -6401,6 +6442,7 @@ function App() {
       } catch {
         return;
       }
+      void invoke<string>("app_arch").then(setAppArch).catch(() => {});
       void checkLatestRelease();
     })();
     const id = window.setInterval(
@@ -6667,6 +6709,72 @@ function App() {
               </span>
             </Show>
           </div>
+          <div class="ver-history">
+            <button
+              class="ver-hist-toggle"
+              onClick={() => {
+                const opening = !versionsOpen();
+                setVersionsOpen(opening);
+                if (opening) void loadReleases();
+              }}
+            >
+              {versionsOpen() ? "▾" : "▸"} version history · roll back
+            </button>
+            <Show when={versionsOpen()}>
+              <p class="settings-note dim">
+                Download an older build, then quit PigeonEye and move the
+                extracted <b>PigeonEye.app</b> into Applications to roll back.
+                {appArch() ? ` (this Mac: ${appArch()})` : ""}
+              </p>
+              <Show when={releasesLoading()}>
+                <p class="dim ver-loading">loading releases…</p>
+              </Show>
+              <Show when={!releasesLoading() && !releases().length}>
+                <p class="dim ver-loading">
+                  {releasesErr()
+                    ? "couldn't load the release list (offline, or GitHub's API rate limit is hit — resets within an hour)."
+                    : "no releases found."}{" "}
+                  <button
+                    class="ver-link"
+                    onClick={() => void openUrl(RELEASES_PAGE)}
+                  >
+                    open releases page ↗
+                  </button>
+                </p>
+              </Show>
+              <Show when={releases().length}>
+                <div class="ver-list">
+                  <For each={releases()}>
+                    {(v) => (
+                      <div class="ver-row">
+                        <span class="ver-tag">v{v}</span>
+                        <Show
+                          when={v !== appVersion()}
+                          fallback={<span class="dim">installed</span>}
+                        >
+                          <button
+                            class="btn sm"
+                            title={`download PigeonEye v${v} for ${appArch() || "arm64"}`}
+                            onClick={() => void openUrl(rollbackUrl(v))}
+                          >
+                            {cmpSemver(v, appVersion()) > 0
+                              ? "download (newer)"
+                              : "download"}
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <button
+                  class="ver-link ver-all"
+                  onClick={() => void openUrl(RELEASES_PAGE)}
+                >
+                  all releases on GitHub ↗
+                </button>
+              </Show>
+            </Show>
+          </div>
         </div>
   );
 
@@ -6686,7 +6794,7 @@ function App() {
               >
                 {authHint()!.kind === "aws-sso"
                   ? `Log in with SSO${authHint()!.context ? ` (${authHint()!.context})` : ""}`
-                  : "Log in"}
+                  : `Log in${authHint()!.context ? ` (${authHint()!.context})` : ""}`}
               </button>
               <Show when={authHint()!.command}>
                 <code class="auth-cmd">{authHint()!.command}</code>
@@ -7402,9 +7510,7 @@ function App() {
                   class="btn primary"
                     onClick={() => void runLogin()}
                 >
-                  {authHint()!.kind === "aws-sso"
-                    ? "Log in with SSO"
-                    : "Log in"}
+                  {authHint()!.kind === "aws-sso" ? "Log in with SSO" : "Log in"}
                 </button>
                 <Show when={authHint()!.command}>
                   <code class="auth-cmd" title="the command that runs">

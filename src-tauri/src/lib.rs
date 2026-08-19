@@ -48,6 +48,18 @@ async fn self_upgrade() -> Result<String, String> {
     }
 }
 
+/// The macOS build architecture as it appears in release asset names
+/// (`arm64` / `x86_64`), so the version-history rollback UI can point at the
+/// right tarball for this machine.
+#[tauri::command]
+fn app_arch() -> String {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64".to_string(),
+        "x86_64" => "x86_64".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Relaunch the app, replacing the running process. Called after
 /// `self_upgrade` so the freshly-installed bundle takes over. `restart`
 /// exits and re-execs, so this never returns.
@@ -784,6 +796,7 @@ pub fn run() {
             custom_columns,
             sample_fields,
             self_upgrade,
+            app_arch,
             restart_app
         ])
         .run(tauri::generate_context!())
