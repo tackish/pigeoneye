@@ -1337,9 +1337,16 @@ function App() {
     abandoned.add(name);
     endConnect(name);
     void invoke("cancel_connect", { context: name }).catch(() => {});
+    // Cancelling the last thing the splash was waiting for drops it.
+    if (!connecting().length && !tabs().length) setRestoring(false);
   }
-  const beginConnect = (name: string) =>
+  const beginConnect = (name: string) => {
+    // Starting again means the outcome matters again: without this, a
+    // context cancelled once would keep its tombstone and silently eat the
+    // next real failure — or refuse to open on the next success.
+    abandoned.delete(name);
     setConnecting([...connecting().filter((n) => n !== name), name]);
+  };
   const endConnect = (name: string) =>
     setConnecting(connecting().filter((n) => n !== name));
   // True from launch while last session's tabs reconnect, so the launcher
@@ -1787,7 +1794,6 @@ function App() {
 
   let nextShellKey = 1;
   const [failed, setFailed] = createSignal<{ name: string; error: string }[]>([]);
-  const failedTabs: { name: string; error: string }[] = [];
   const [authHint, setAuthHint] = createSignal<{
     context: string;
     kind: string;
@@ -2155,8 +2161,8 @@ function App() {
     .catch(() => {});
   const podStats = () => P().podStats();
   const nodeStats = () => P().nodeStats();
-  async function loadNodeStats(ctx: string) {
-    const s0 = panes[0];
+  async function loadNodeStats(ctx: string, pane = panes[0]) {
+    const s0 = pane;
     try {
       const stats = await invoke<NodeStat[]>("node_stats", { context: ctx });
       const sel = s0.selected();
@@ -2888,9 +2894,11 @@ function App() {
     ns: string | null,
     rv: string | null,
     include: string,
-  ) {
+  ): Promise<boolean> {
+    // Reports whether the watch is live, so a caller that painted cached
+    // rows knows if anything will keep them honest.
     sStopWatch();
-    if (!rv) return;
+    if (!rv) return false;
     const seq = sListSeq;
     const chan = new Channel<{ type: string; rows?: TableRow[] }>();
     chan.onmessage = (ev) => {
@@ -2916,8 +2924,10 @@ function App() {
       });
       if (seq !== sListSeq) void invoke("watch_stop", { id }).catch(() => {});
       else sWatchId = id;
+      return true;
     } catch {
       /* watch refused — the list still shows */
+      return false;
     }
   }
   async function sSelect(rt: ResourceType) {
@@ -2935,33 +2945,76 @@ function App() {
     const ns = rt.namespaced && sNs() ? sNs() : null;
     const seq = ++sListSeq;
     setSLoading(true);
+    const isPod = rt.group === "" && rt.kind === "Pod";
+    const isNode = rt.group === "" && rt.kind === "Node";
+
+    // Same strategy as pane 1, which this used to skip: a cached snapshot
+    // paints at once and the watch resumes from its version, so revisiting
+    // a kind costs nothing. Without it pane 2 re-listed every time and felt
+    // slower than pane 1 on the same cluster.
+    let cached: ResourceTable | null = null;
     try {
-      const cached = await invoke<ResourceTable | null>("cached_list", {
+      cached = await invoke<ResourceTable | null>("cached_list", {
         context: ctx,
         resource: rt,
         namespace: ns,
         fieldSelector: null,
       });
-      if (seq === sListSeq && cached) setSTable(cached);
     } catch {
-      /* no cache */
+      /* no cache is fine */
     }
+    if (seq !== sListSeq) return;
+    if (cached?.resource_version) {
+      setSTable(cached);
+      setSLoading(false);
+      S1.setStreaming(false);
+      if (isPod) void loadPodStats(ctx, ns, S1);
+      if (isNode) void loadNodeStats(ctx, S1);
+      persist();
+      const started = await sStartWatch(
+        ctx,
+        rt,
+        ns,
+        cached.resource_version,
+        cached.include,
+      );
+      // A server that refuses the watch would leave these rows to go stale,
+      // so fall through to a full fetch instead.
+      if (started || seq !== sListSeq) return;
+      setSLoading(true);
+    }
+
     try {
+      // The first page renders immediately and the rest arrives on this
+      // channel. Pane 2 passed a channel nobody listened to, so on a big
+      // cluster it showed one page and silently stopped there.
+      const chan = new Channel<{ rows: TableRow[]; done: boolean }>();
+      chan.onmessage = (page) => {
+        if (seq !== sListSeq) return;
+        setSTable((prev) =>
+          prev ? { ...prev, rows: [...prev.rows, ...page.rows] } : prev,
+        );
+        S1.setStreaming(!page.done);
+      };
       const t = await invoke<ResourceTable>("list_resources", {
         context: ctx,
         resource: rt,
         namespace: ns,
         fieldSelector: null,
-        channel: new Channel(),
+        channel: chan,
       });
       if (seq !== sListSeq) return;
+      S1.setStreaming(t.truncated);
       setSTable(t);
       setSLoading(false);
+      if (isPod) void loadPodStats(ctx, ns, S1);
+      if (isNode) void loadNodeStats(ctx, S1);
       persist(); // remember pane 2's kind for session restore
       await sStartWatch(ctx, rt, ns, t.resource_version, t.include);
     } catch (e) {
       if (seq === sListSeq) {
         setSLoading(false);
+        S1.setStreaming(false);
         S1.setError(String(e)); // pane 1's error, never the focused pane's
       }
     }
@@ -3917,6 +3970,12 @@ function App() {
   });
 
   function closeTab(name: string) {
+    // A tab can be closed while it is still trying to connect — an expired
+    // SSO session is the usual reason, and it takes the client's whole
+    // timeout to give up. Stop the attempt with the tab: otherwise it runs
+    // on invisibly and its eventual failure resurrects the context as an
+    // error banner and a failed tab the user already dismissed.
+    if (isConnecting(name)) cancelConnect(name);
     void invoke("disconnect", { context: name }).catch(() => {});
     tabCache.delete(name);
     const rest = tabs().filter((t) => t !== name);
@@ -3976,56 +4035,94 @@ function App() {
       return;
     }
     wanted.forEach(beginConnect);
-    void Promise.all(
-      wanted.map((name) =>
-        setupContext(name)
-          .then(() => name)
-          .catch((e) => {
-            failedTabs.push({ name, error: String(e) });
-            return null;
-          }),
-      ),
-    )
-      .then((results) => {
-        const opened = results.filter((n): n is string => n !== null);
-        if (failedTabs.length) {
-          setError(
-            failedTabs
-              .map((f) => `could not connect to ${f.name}: ${f.error}`)
-              .join("\n"),
-          );
-          setFailed([...failedTabs]);
-          const authFail = failedTabs.find((f) => isAuthError(f.error));
-          if (authFail) void offerLogin(authFail.name);
-          failedTabs.length = 0;
-        }
-        setTabs(opened);
-        const act =
-          saved.active && opened.includes(saved.active)
-            ? saved.active
-            : opened[0];
-        if (act) activate(act);
-        // Bring back the split exactly as it was left, as long as pane 2's
-        // cluster reconnected. Focus stays on the primary pane.
-        const sp = saved.split;
-        if (sp && sp.ctx && opened.includes(sp.ctx) && tabCache.has(sp.ctx)) {
-          const st = tabCache.get(sp.ctx)!;
-          setSCtx(sp.ctx);
-          setSTypes(st.types);
-          setSNamespaces(st.namespaces);
-          setSNs(sp.ns || "");
-          if (sp.width) setSecWidth(sp.width);
-          setSplit(true);
-          const kind = sp.kind
-            ? (st.types.find((t) => typeKey(t) === sp.kind) ?? null)
-            : null;
-          if (kind) void sSelect(kind);
-        }
-      })
-      .finally(() => {
-        wanted.forEach(endConnect);
-        setRestoring(false);
-      });
+
+    // Each cluster lands on its own. Waiting for all of them meant one
+    // stale SSO session held the splash — and with it the whole app —
+    // until the client's own timeout, with nothing on screen to cancel.
+    // Now the UI is live immediately and anything still trying is a
+    // pending tab you can close.
+    const wantActive =
+      saved.active && wanted.includes(saved.active) ? saved.active : null;
+    // Which tab we chose on the user's behalf. If they have since picked
+    // another one, a late arrival must not yank them away from it.
+    let autoActive: string | null = null;
+    const claim = (name: string) => {
+      if (!active()) {
+        activate(name);
+        autoActive = name;
+        return;
+      }
+      if (name === wantActive && active() === autoActive) {
+        activate(name);
+        autoActive = name;
+      }
+    };
+
+    // Tabs go back where they were. They arrive in whatever order they
+    // finish now, and appending would quietly reorder the strip on every
+    // restart — the slowest cluster drifting to the end.
+    const order = new Map(wanted.map((n, i) => [n, i]));
+    const addTab = (name: string) => {
+      const cur = tabs();
+      if (cur.includes(name)) return;
+      const at = cur.findIndex(
+        (t) => (order.get(t) ?? -1) > (order.get(name) ?? 0),
+      );
+      setTabs(
+        at < 0 ? [...cur, name] : [...cur.slice(0, at), name, ...cur.slice(at)],
+      );
+    };
+
+    let splitDone = false;
+    const restoreSplit = () => {
+      // Bring back the split exactly as it was left, once pane 2's cluster
+      // is in. Focus stays on the primary pane.
+      const sp = saved.split;
+      if (splitDone || !sp?.ctx || !tabCache.has(sp.ctx)) return;
+      splitDone = true;
+      const st = tabCache.get(sp.ctx)!;
+      setSCtx(sp.ctx);
+      setSTypes(st.types);
+      setSNamespaces(st.namespaces);
+      setSNs(sp.ns || "");
+      if (sp.width) setSecWidth(sp.width);
+      setSplit(true);
+      const kind = sp.kind
+        ? (st.types.find((t) => typeKey(t) === sp.kind) ?? null)
+        : null;
+      if (kind) void sSelect(kind);
+    };
+
+    for (const name of wanted) {
+      void setupContext(name)
+        .then(() => {
+          // Closed while it was still connecting: honour that rather than
+          // opening a tab the user just dismissed.
+          if (abandoned.has(name)) return;
+          addTab(name);
+          claim(name);
+          restoreSplit();
+          // The first cluster in is enough to leave the splash — the rest
+          // keep arriving as tabs behind it.
+          setRestoring(false);
+        })
+        .catch((e) => {
+          const msg = String(e);
+          if (abandoned.delete(name)) return;
+          setError(`could not connect to ${name}: ${msg}`);
+          setFailed([
+            ...failed().filter((f) => f.name !== name),
+            { name, error: msg },
+          ]);
+          if (isAuthError(msg)) void offerLogin(name);
+        })
+        .finally(() => {
+          endConnect(name);
+          // Nothing left being waited on and nothing opened: the splash has
+          // no reason to hold the screen.
+          if (!connecting().length && !tabs().length) setRestoring(false);
+        });
+    }
   }
 
   // On launch, reconnect every cluster tab from last session (the
@@ -4282,9 +4379,10 @@ function App() {
   /// Metrics join the table asynchronously: the first fetch lands as
   /// soon as metrics.k8s.io answers, then retries pick up the
   /// requests/limits once the background indexer has them.
-  async function loadPodStats(ctx: string, ns: string | null) {
-    // Stats belong to pane #0 (the primary machinery), never P().
-    const s0 = panes[0];
+  async function loadPodStats(ctx: string, ns: string | null, pane = panes[0]) {
+    // Whichever pane asked — never P(), which moves with focus while this
+    // is in flight.
+    const s0 = pane;
     const stillPod = () =>
       s0.active() === ctx &&
       s0.selected()?.group === "" &&
@@ -7702,21 +7800,53 @@ function App() {
 
   // Shown at launch while last session's tabs reconnect — a calm splash so
   // the launcher's context picker never flashes before the tabs appear.
+  // The splash is not a progress bar to sit through. A cluster whose SSO
+  // session went stale takes the client's whole timeout to fail, and this
+  // used to be a screen with nothing on it to press — so every cluster
+  // here can be given up on, individually or all at once.
   const restoreSplash = () => (
     <div class="launcher">
       <img class="mascot" src={flyingUrl} alt="" />
       <h1>PigeonEye</h1>
       <p class="dim">reconnecting your clusters…</p>
       <div class="restore-ctxs">
-        <For each={lastSession}>
+        <For each={connecting().length ? connecting() : lastSession}>
           {(name) => (
-            <span class="restore-ctx" style={{ "--ctx-hue": ctxHue(name) }}>
-              <span class="ctx-dot" />
-              {name}
-            </span>
+            // The whole chip is the target. A cluster that has gone stale
+            // is the thing you want gone, so clicking it is the gesture —
+            // not hunting a small ✕ inside it.
+            <button
+              class="restore-ctx"
+              classList={{ droppable: isConnecting(name) }}
+              style={{ "--ctx-hue": ctxHue(name) }}
+              disabled={!isConnecting(name)}
+              title={
+                isConnecting(name)
+                  ? `stop waiting for ${name}`
+                  : `${name} — waiting to start`
+              }
+              onClick={() => cancelConnect(name)}
+            >
+              <Show
+                when={isConnecting(name)}
+                fallback={<span class="ctx-dot" />}
+              >
+                <span class="tab-spin" />
+              </Show>
+              <span class="restore-ctx-name">{name}</span>
+              <span class="restore-x">✕</span>
+            </button>
           )}
         </For>
       </div>
+      <Show when={connecting().length}>
+        <button
+          class="btn"
+          onClick={() => connecting().forEach(cancelConnect)}
+        >
+          skip and pick a cluster
+        </button>
+      </Show>
     </div>
   );
 
@@ -7915,10 +8045,23 @@ function App() {
                   style={{ "--ctx-hue": ctxHue(name) }}
                   onClick={() => active() !== name && activate(name)}
                 >
-                  <span class="ctx-dot" />
+                  <Show
+                    when={isConnecting(name)}
+                    fallback={<span class="ctx-dot" />}
+                  >
+                    <span class="tab-spin" />
+                  </Show>
                   <span class="tab-name">{name}</span>
+                  <Show when={isConnecting(name)}>
+                    <span class="tab-connecting">connecting…</span>
+                  </Show>
                   <button
                     class="tab-close"
+                    title={
+                      isConnecting(name)
+                        ? "stop trying and close"
+                        : "close this cluster"
+                    }
                     onClick={(e) => {
                       e.stopPropagation();
                       closeTab(name);
