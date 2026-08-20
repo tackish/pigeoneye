@@ -197,6 +197,16 @@ async fn watch_stop(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     k8s::watch_stop(&state, id).await
 }
 
+/// Which of a detail's named references actually exist.
+#[tauri::command]
+async fn refs_exist(
+    state: State<'_, AppState>,
+    context: String,
+    refs: Vec<k8s::RefCheck>,
+) -> Result<Vec<bool>, String> {
+    k8s::refs_exist(&state, context, refs).await
+}
+
 #[tauri::command]
 async fn get_resource(
     state: State<'_, AppState>,
@@ -771,6 +781,7 @@ pub fn run() {
             search_contexts,
             aggregate_issues,
             watch_stop,
+            refs_exist,
             get_resource,
             apply_resource,
             dry_run_apply,

@@ -2746,6 +2746,13 @@ kbd.key {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* The keyboard cursor inside "pods on this node" — the list is a level of
+   its own, so it needs a mark of its own. */
+.np tbody tr.np-cur {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .np-wrap {
   max-height: 260px;
   overflow: auto;

@@ -2653,10 +2653,243 @@ fn related_links(v: &serde_json::Value, kind: &str) -> Vec<InvolvedRef> {
         );
     }
 
+    // Everything above is one kind's rules, written by hand. That does not
+    // scale to a cluster's CRDs — a Certificate points at a Secret and an
+    // Issuer, a HelmRelease at a HelmRepository, and none of them are known
+    // here. So finish with a pass that finds references by *shape* instead:
+    // Kubernetes has a strong convention for them, and the UI drops any
+    // candidate whose kind the cluster does not actually serve, which is
+    // what makes guessing safe.
+    scan_refs(v, "", &ns, &mut out);
+
     // de-duplicate while keeping order
     let mut seen = std::collections::HashSet::new();
     out.retain(|l| seen.insert((l.kind.clone(), l.name.clone())));
+    out.truncate(RELATED_MAX);
     out
+}
+
+#[derive(Deserialize)]
+pub struct RefCheck {
+    pub resource: ResourceType,
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+/// Which of these references actually exist.
+///
+/// The link scan guesses by shape, so it can name something that is not
+/// there — and a manifest can outlive what it points at. Rather than
+/// showing dead links, the UI asks. Three things keep this from costing
+/// anything the user would feel:
+///
+///   * the name index answers for free when it already holds the kind, so
+///     a cluster you have browsed needs no requests at all;
+///   * a miss costs one metadata-only GET — the smallest reply the API
+///     server can send — and they run together;
+///   * only a definite "not found" counts as missing. A forbidden or
+///     unreachable answer leaves the link alone, because hiding it would
+///     be claiming something we do not know.
+pub async fn refs_exist(
+    state: &AppState,
+    context: String,
+    refs: Vec<RefCheck>,
+) -> Result<Vec<bool>, String> {
+    use futures::StreamExt;
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = client(state, &context).await?;
+    let known = state.names.read().await;
+    let cached: Vec<Option<bool>> = refs
+        .iter()
+        .map(|r| {
+            known
+                .get(&name_key(&context, &r.resource))
+                .map(|idx| idx.rows.iter().any(|(_, n)| n == &r.name))
+                // Only a hit is trusted: the index can lag behind something
+                // created a moment ago, and a stale miss would hide a link
+                // that is really there.
+                .filter(|hit| *hit)
+        })
+        .collect();
+    drop(known);
+
+    let total = refs.len();
+    // Each future owns what it needs: borrowing from `refs` here makes the
+    // closure too specific for the executor to accept.
+    let checks = refs
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let client = client.clone();
+            let cached = cached[i];
+            async move {
+                if let Some(hit) = cached {
+                    return (i, hit);
+                }
+                let ar = api_resource(&r.resource);
+                let api: Api<DynamicObject> = match (&r.namespace, r.resource.namespaced) {
+                    (Some(ns), true) if !ns.is_empty() => {
+                        Api::namespaced_with(client, ns, &ar)
+                    }
+                    _ => Api::all_with(client, &ar),
+                };
+                match api.get_metadata(&r.name).await {
+                    Ok(_) => (i, true),
+                    Err(kube::Error::Api(e)) if e.code == 404 => (i, false),
+                    Err(_) => (i, true),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut out = vec![true; total];
+    let mut stream = futures::stream::iter(checks).buffer_unordered(8);
+    while let Some((i, ok)) = stream.next().await {
+        out[i] = ok;
+    }
+    Ok(out)
+}
+
+/// How many links one object may offer. A runaway manifest should not turn
+/// the detail panel into a wall of guesses.
+const RELATED_MAX: usize = 24;
+
+/// Field names whose kind the convention does not spell out.
+///
+/// This is the whole vocabulary the scan trusts by name. An earlier version
+/// also derived a kind from any key holding a `name` — which turned
+/// `spec.containers`, `env` and `metadata` into "Containers", "Env" and
+/// "Metadata". Those are dropped later for not being served, but they were
+/// filling the link budget first and crowding out the real ones.
+fn alias_kind(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "secret" | "secretRef" | "secretKeyRef" | "secretName" | "tlsSecretName" => "Secret",
+        "configMap" | "configMapRef" | "configMapKeyRef" | "configMapName" => "ConfigMap",
+        "persistentVolumeClaim" | "claimName" | "persistentVolumeClaimName" => {
+            "PersistentVolumeClaim"
+        }
+        "volumeName" | "persistentVolumeName" => "PersistentVolume",
+        "serviceAccount" | "serviceAccountName" => "ServiceAccount",
+        "service" | "serviceName" | "backendService" => "Service",
+        "nodeName" => "Node",
+        "priorityClassName" => "PriorityClass",
+        "runtimeClassName" => "RuntimeClass",
+        "ingressClassName" => "IngressClass",
+        "storageClassName" => "StorageClass",
+        "className" => "IngressClass",
+        _ => return None,
+    })
+}
+
+/// "secretRef" → Secret, "issuerRef" → Issuer, "configMap" → ConfigMap.
+/// camelCase to PascalCase, with the reference suffix removed.
+fn kind_from_key(key: &str) -> Option<String> {
+    let base = key
+        .strip_suffix("Reference")
+        .or_else(|| key.strip_suffix("Ref"))
+        .unwrap_or(key);
+    if base.is_empty() || !base.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let mut cs = base.chars();
+    let first = cs.next()?.to_ascii_uppercase();
+    let derived: String = std::iter::once(first).chain(cs).collect();
+    // A qualified name still points at the plain kind: cert-manager's
+    // `passwordSecretRef` is a Secret, not a "PasswordSecret".
+    for k in [
+        "ServiceAccount",
+        "ConfigMap",
+        "Secret",
+        "Service",
+        "Namespace",
+        "Node",
+    ] {
+        if derived.len() > k.len() && derived.ends_with(k) {
+            return Some(k.to_string());
+        }
+    }
+    Some(derived)
+}
+
+/// Walk a manifest for reference-shaped fields.
+///
+/// Two shapes carry almost every reference in the ecosystem:
+///   * an object holding `name` (often with `kind`/`namespace`), reached
+///     through a key that names what it points at — `secretRef`,
+///     `issuerRef`, `configMap`, `scaleTargetRef`;
+///   * a string field ending in `Name` — `secretName`, `serviceAccountName`.
+///
+/// Guessing wide is deliberate: an unserved kind is dropped by the caller,
+/// so the cost of a wrong guess is nothing, while the cost of a missing
+/// rule is a CRD nobody can navigate.
+fn scan_refs(
+    v: &serde_json::Value,
+    key: &str,
+    ns: &Option<String>,
+    out: &mut Vec<InvolvedRef>,
+) {
+    if out.len() >= RELATED_MAX {
+        return;
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            // Bookkeeping, not references — and managedFields is enormous.
+            if matches!(key, "managedFields" | "labels" | "annotations" | "matchLabels") {
+                return;
+            }
+            if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
+                // A reference either says what it points at, or is named
+                // like one. Anything else holding a `name` is just an
+                // object with a name.
+                let kind = map
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .filter(|k| !k.is_empty())
+                    .map(String::from)
+                    .or_else(|| alias_kind(key).map(String::from))
+                    .or_else(|| {
+                        (key.ends_with("Ref") || key.ends_with("Reference"))
+                            .then(|| kind_from_key(key))
+                            .flatten()
+                    });
+                if let Some(kind) = kind {
+                    if !name.is_empty() && !kind.is_empty() {
+                        out.push(InvolvedRef {
+                            kind,
+                            name: name.to_string(),
+                            namespace: map
+                                .get("namespace")
+                                .and_then(|n| n.as_str())
+                                .map(String::from)
+                                .or_else(|| ns.clone()),
+                        });
+                    }
+                }
+            }
+            for (k, child) in map {
+                scan_refs(child, k, ns, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scan_refs(item, key, ns, out);
+            }
+        }
+        serde_json::Value::String(name) if !name.is_empty() => {
+            // Only the known `*Name` fields. Deriving a kind from any of
+            // them turns `generateName` into "Generate" and `hostName`
+            // into "Host".
+            if let Some(kind) = alias_kind(key).map(String::from) {
+                out.push(InvolvedRef {
+                    kind,
+                    name: name.clone(),
+                    namespace: ns.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Server-side apply of an edited manifest.

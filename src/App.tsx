@@ -3255,6 +3255,64 @@ function App() {
   // focused (Enter toggles / opens), 0+ = one of its aux buttons (copy) is
   // focused via →, so those buttons are keyboard-reachable too.
   const [secBtn, setSecBtn] = createSignal(-1);
+  // Row cursor inside "pods on this node". -1 means the section is focused
+  // as a whole; ≥0 means the keyboard has descended into the list, where
+  // ↑/↓ walk pods and Enter opens one. A table nested in a panel needs its
+  // own level, or its rows are only reachable with the mouse.
+  const [npIdx, setNpIdx] = createSignal(-1);
+
+  // Named references the cluster says are not there. The link scan guesses
+  // by shape, and a manifest can outlive what it points at, so the drawer
+  // asks — after it has painted, never before. Keyed kind/ns/name.
+  const [deadRefs, setDeadRefs] = createSignal<Set<string>>(new Set());
+  const refKey = (
+    ctx: string,
+    kind: string,
+    ns: string | null | undefined,
+    name: string,
+  ) => `${ctx}|${kind}/${ns ?? ""}/${name}`;
+
+  /// Prune links that point at nothing. Costs no request for a kind the
+  /// name index already holds, and one metadata-only GET for the rest —
+  /// issued after the detail is on screen, and dropped if the user moves on.
+  async function pruneDeadRefs(key: string, ctx: string, links: RefLink[]) {
+    const checks = links
+      .map((l) => ({
+        link: l,
+        resource: types().find((t) => t.kind === l.kind),
+      }))
+      .filter((c) => c.resource);
+    if (!checks.length) return;
+    try {
+      const ok = await invoke<boolean[]>("refs_exist", {
+        context: ctx,
+        refs: checks.map((c) => ({
+          resource: c.resource,
+          namespace: c.link.namespace ?? null,
+          name: c.link.name,
+        })),
+      });
+      if (detailKey() !== key || active() !== ctx) return; // moved on
+      const gone = new Set(deadRefs());
+      checks.forEach((c, i) => {
+        if (ok[i] === false)
+          gone.add(refKey(ctx, c.link.kind, c.link.namespace, c.link.name));
+      });
+      setDeadRefs(gone);
+    } catch {
+      /* asking failed — leave every link alone rather than hiding one */
+    }
+  }
+  const npRows = () => nodePods()?.rows ?? [];
+  function moveNodePod(delta: number) {
+    const rows = npRows();
+    if (!rows.length) return;
+    const next = Math.min(Math.max(npIdx() + delta, 0), rows.length - 1);
+    setNpIdx(next);
+    document
+      .querySelector(`.np tbody tr[data-npi="${next}"]`)
+      ?.scrollIntoView?.({ block: "nearest" });
+  }
 
   /// Forwards belonging to the resource in the open panel.
 
@@ -3283,7 +3341,10 @@ function App() {
       });
     // Owner / backing references (named).
     for (const l of d.links)
-      if (served(l.kind))
+      if (
+        served(l.kind) &&
+        !deadRefs().has(refKey(active() ?? "", l.kind, l.namespace, l.name))
+      )
         out.push({ kind: l.kind, name: l.name, run: () => void jumpToRef(l) });
     // A workload / service → the pods it selects.
     if (d.has_pod_selector && !isPod() && served("Pod"))
@@ -3293,7 +3354,9 @@ function App() {
         run: () => void jumpToSelectedPods(),
       });
     // Reverse "used by" references (a filtered list, no single name).
-    for (const u of USED_BY[selected()!.kind] ?? [])
+    // Same guard as the pane-level copy: a drawer can outlive its kind for
+    // an instant when a jump switches context first.
+    for (const u of USED_BY[selected()?.kind ?? ""] ?? [])
       if (served(u.kind))
         out.push({
           kind: u.kind,
@@ -3460,6 +3523,7 @@ function App() {
     const sec = secs[next];
     setPanelSec(sec);
     setSecBtn(-1); // new section → land on its header, not an aux button
+    setNpIdx(-1); // and out of the node's pod list, if we were in it
     // Always bring the section into view first — Apply/Reset are
     // disabled until the manifest changes, so a cursor-only scroll
     // would leave the row off-screen.
@@ -3499,6 +3563,10 @@ function App() {
     else if (sec === "status" && statusFoldRef)
       statusFoldRef.open = !statusFoldRef.open;
     else if (sec === "yaml") void openYaml();
+    else if (sec === "nodepods" && npRows().length) {
+      setNpIdx(0);
+      moveNodePod(0); // scrolls the first row into view
+    }
   }
   let yamlFind: { next: () => void; focus: () => void } | undefined;
   const findMatches = (text: string) => {
@@ -4436,10 +4504,22 @@ function App() {
     if (t) await select(t);
   }
   // The kinds offered on a Namespace's detail, most-wanted first.
+  // Anything not served by the cluster is filtered out where this is used,
+  // so listing the full set costs nothing on a cluster that lacks one.
   const NS_KINDS: { kind: string; group: string }[] = [
     { kind: "Pod", group: "" },
     { kind: "Deployment", group: "apps" },
+    { kind: "StatefulSet", group: "apps" },
+    { kind: "DaemonSet", group: "apps" },
+    { kind: "Rollout", group: "argoproj.io" },
+    { kind: "Job", group: "batch" },
+    { kind: "CronJob", group: "batch" },
     { kind: "Service", group: "" },
+    { kind: "Ingress", group: "networking.k8s.io" },
+    { kind: "ConfigMap", group: "" },
+    { kind: "Secret", group: "" },
+    { kind: "ServiceAccount", group: "" },
+    { kind: "PersistentVolumeClaim", group: "" },
     { kind: "Event", group: "" },
   ];
 
@@ -4502,8 +4582,23 @@ function App() {
         field: (n) => `spec.serviceAccountName=${n}`,
       },
     ],
-    ConfigMap: [{ kind: "Pod", label: "pods →" }],
-    Secret: [{ kind: "Pod", label: "pods →" }],
+    // Config objects are mounted by more than pods: the workload that owns
+    // the template refers to them by name too, and that is usually the
+    // thing you want to reach.
+    ConfigMap: [
+      { kind: "Pod", label: "pods →" },
+      { kind: "Deployment", label: "deployments →" },
+      { kind: "StatefulSet", label: "statefulsets →" },
+      { kind: "DaemonSet", label: "daemonsets →" },
+    ],
+    Secret: [
+      { kind: "Pod", label: "pods →" },
+      { kind: "Deployment", label: "deployments →" },
+      { kind: "StatefulSet", label: "statefulsets →" },
+      { kind: "DaemonSet", label: "daemonsets →" },
+      { kind: "Ingress", label: "ingresses →" },
+      { kind: "ServiceAccount", label: "service accounts →" },
+    ],
     PersistentVolumeClaim: [{ kind: "Pod", label: "pods →" }],
     PriorityClass: [{ kind: "Pod", label: "pods →" }],
     StorageClass: [
@@ -4512,9 +4607,22 @@ function App() {
     ],
     IngressClass: [{ kind: "Ingress", label: "ingresses →" }],
     RuntimeClass: [{ kind: "Pod", label: "pods →" }],
+    // A node's pods are already inline in its detail, but RELATED is where
+    // you look for "what else does this touch" — and the inline table is a
+    // read, not a way into the pod view with the node filter applied.
+    Node: [
+      { kind: "Pod", label: "pods →", field: (n) => `spec.nodeName=${n}` },
+    ],
     Role: [{ kind: "RoleBinding", label: "bindings →" }],
     ClusterRole: [{ kind: "ClusterRoleBinding", label: "bindings →" }],
-    Service: [{ kind: "EndpointSlice", label: "endpoints →" }],
+    Service: [
+      { kind: "EndpointSlice", label: "endpoints →" },
+      { kind: "Ingress", label: "ingresses →" },
+    ],
+    // Owner chains the other way round. A workload's pods come from its
+    // selector; these two have none, so they need naming.
+    Deployment: [{ kind: "ReplicaSet", label: "replicasets →" }],
+    CronJob: [{ kind: "Job", label: "jobs →" }],
   };
 
   /// Open another kind filtered to whatever references `term`.
@@ -4741,6 +4849,7 @@ function App() {
     const key = `${namespace ?? ""}/${name}`;
     setDetailKey(key);
     setDetail(null);
+    setNpIdx(-1); // a new detail starts at section level, not inside a list
     setSecretShown(false); // secrets start hidden on every open
     setForceApply(false); // force is opt-in per resource, never sticky
     setEvents([]);
@@ -4778,13 +4887,45 @@ function App() {
       if (d) {
         setDetail(d);
         setYamlText(d.yaml);
+        // After the paint, never before: the links are already on screen
+        // and the dead ones drop out as the answers arrive.
+        setDeadRefs(new Set<string>());
+        const ctx = active();
+        if (ctx && d.links.length)
+          queueMicrotask(() => void pruneDeadRefs(key, ctx, d.links));
       }
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      // Opening it proved it is gone. A node that went NotReady and then
+      // away can sit in the list if its DELETE never reached us — the watch
+      // dropped, or it was removed while this view was not watching. Take
+      // the row out rather than leaving something to click that answers
+      // "not found" every time.
+      if (/not\s*found|NotFound|404/i.test(msg)) dropRow(namespace, name);
+      setError(msg);
       closeDetail();
     } finally {
       if (detailKey() === key) setDetailLoading(false);
     }
+  }
+
+  /// Remove one row from the focused pane's table — for when the server has
+  /// told us, by any route, that it no longer exists.
+  function dropRow(namespace: string | null, name: string) {
+    const p = P();
+    const t = p.table();
+    if (!t) return;
+    const rows = t.rows.filter(
+      (r) => !(r.name === name && (r.namespace ?? null) === (namespace ?? null)),
+    );
+    if (rows.length !== t.rows.length) p.setTable({ ...t, rows });
+    // The issues sweep is a separate list and would keep offering it.
+    setIssues(
+      issues().filter(
+        (i) =>
+          !(i.name === name && (i.namespace ?? null) === (namespace ?? null)),
+      ),
+    );
   }
 
   const openDetail = (row: TableRow) => showDetail(row.namespace, row.name);
@@ -6409,7 +6550,17 @@ function App() {
     }
     // The Issues view is a list, not a table — give it real keyboard nav
     // (j/k or ↑/↓ to move, Enter to jump to the resource). Mouse-free.
-    if (customView() === "issues" && !typing && !cmdOpen() && !helpOpen()) {
+    //
+    // Scoped to pane() === "table": ← hands the arrows to the sidebar the
+    // way leaving a table does, and the sidebar branch below only gets a
+    // look in if this one stops claiming them.
+    if (
+      customView() === "issues" &&
+      pane() === "table" &&
+      !typing &&
+      !cmdOpen() &&
+      !helpOpen()
+    ) {
       if (e.key === "ArrowDown" || e.key === "j") {
         e.preventDefault();
         moveIssueCursor(1);
@@ -6418,6 +6569,25 @@ function App() {
       if (e.key === "ArrowUp" || e.key === "k") {
         e.preventDefault();
         moveIssueCursor(-1);
+        return;
+      }
+      if (pageDir(e)) {
+        e.preventDefault();
+        moveIssueCursor(pageDir(e) * pageOf(".iss-body", ".iss-row"));
+        return;
+      }
+      // ←/→ behave as they do in a table: out to the sidebar on the left,
+      // across to the other pane when the split is open. The table's own
+      // version pans columns first, which a list has none of.
+      if (e.key === "ArrowLeft" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        if (split() && focusedPane() === "secondary") setFocusedPane("primary");
+        else setPane("sidebar");
+        return;
+      }
+      if (e.key === "ArrowRight" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        if (split() && focusedPane() === "primary") setFocusedPane("secondary");
         return;
       }
       if (e.key === "Enter") {
@@ -6806,6 +6976,39 @@ function App() {
       const d = detail()!;
       const body = drawerBodyRef;
       const scroll = (dy: number) => body?.scrollBy({ top: dy, behavior: "auto" });
+      // Inside "pods on this node": the list has its own level, so the
+      // arrows walk pods instead of sections until you step back out.
+      if (panelSec() === "nodepods" && npIdx() >= 0) {
+        if (e.key === "ArrowDown" || e.key === "j") {
+          e.preventDefault();
+          moveNodePod(1);
+          return;
+        }
+        if (e.key === "ArrowUp" || e.key === "k") {
+          e.preventDefault();
+          // Past the top row, step back out to the section itself rather
+          // than sticking — same shape as leaving a table upward.
+          if (npIdx() <= 0) setNpIdx(-1);
+          else moveNodePod(-1);
+          return;
+        }
+        if (pageDir(e)) {
+          e.preventDefault();
+          moveNodePod(pageDir(e) * pageOf(".np-wrap", ".np tbody tr"));
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const r = npRows()[npIdx()];
+          if (r) void openPodFromNode(d.name, r.namespace, r.name);
+          return;
+        }
+        if (e.key === "Escape" || e.key === "ArrowLeft" || e.key === "h") {
+          e.preventDefault();
+          setNpIdx(-1);
+          return;
+        }
+      }
       if (!e.shiftKey && (e.key === "j" || e.key === "ArrowDown")) {
         e.preventDefault();
         // The related list is stacked vertically, so ↓/↑ walks its items
@@ -9246,7 +9449,10 @@ function App() {
           });
         // Owner / backing references (named).
         for (const l of d.links)
-          if (served(l.kind))
+          if (
+            served(l.kind) &&
+            !deadRefs().has(refKey(active() ?? "", l.kind, l.namespace, l.name))
+          )
             out.push({ kind: l.kind, name: l.name, run: () => void jumpToRef(l) });
         // A workload / service → the pods it selects.
         if (d.has_pod_selector && !isPod() && served("Pod"))
@@ -9256,7 +9462,11 @@ function App() {
             run: () => void jumpToSelectedPods(),
           });
         // Reverse "used by" references (a filtered list, no single name).
-        for (const u of USED_BY[selected()!.kind] ?? [])
+        // The kind is read defensively: this memo lives on `detail()`, and
+        // a detail can outlive the kind that opened it for an instant —
+        // jumping from the issues list switches context first, which nulls
+        // the pane's selection while the drawer is still up.
+        for (const u of USED_BY[selected()?.kind ?? ""] ?? [])
           if (served(u.kind))
             out.push({
               kind: u.kind,
@@ -10441,8 +10651,14 @@ function App() {
                                 </thead>
                                 <tbody>
                                   <For each={nodePods()!.rows}>
-                                    {(r) => (
+                                    {(r, ri) => (
                                       <tr
+                                        data-npi={ri()}
+                                        classList={{
+                                          "np-cur":
+                                            panelSec() === "nodepods" &&
+                                            npIdx() === ri(),
+                                        }}
                                         onClick={() =>
                                           void openPodFromNode(
                                             detail()!.name,
