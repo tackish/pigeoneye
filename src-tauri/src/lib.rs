@@ -184,6 +184,15 @@ async fn search_contexts(
 }
 
 #[tauri::command]
+async fn aggregate_issues(
+    state: State<'_, AppState>,
+    contexts: Vec<String>,
+    channel: Channel<k8s::IssueBatch>,
+) -> Result<(), String> {
+    k8s::aggregate_issues(&state, contexts, channel).await
+}
+
+#[tauri::command]
 async fn watch_stop(state: State<'_, AppState>, id: u32) -> Result<(), String> {
     k8s::watch_stop(&state, id).await
 }
@@ -760,6 +769,7 @@ pub fn run() {
             list_snapshot,
             watch_start,
             search_contexts,
+            aggregate_issues,
             watch_stop,
             get_resource,
             apply_resource,

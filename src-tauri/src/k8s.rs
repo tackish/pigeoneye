@@ -1393,6 +1393,153 @@ pub async fn search_contexts(
     Ok(())
 }
 
+#[derive(Serialize, Clone)]
+pub struct Issue {
+    pub context: String,
+    pub kind: String,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub status: String,
+}
+#[derive(Serialize)]
+pub struct IssueBatch {
+    pub context: String,
+    pub issues: Vec<Issue>,
+    pub error: Option<String>,
+}
+
+/// A pod's server-computed status (the kubectl STATUS column) that means it
+/// needs attention — everything but the healthy/transient-normal states.
+fn is_pod_issue(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    const OK: &[&str] = &[
+        "Running",
+        "Completed",
+        "Succeeded",
+        "ContainerCreating",
+        "Terminating",
+        "PodInitializing",
+    ];
+    if OK.contains(&s) {
+        return false;
+    }
+    // "Init:0/3" is normal init progress; "Init:Error"/"Init:CrashLoop…" is not.
+    if s.starts_with("Init:")
+        && !s.contains("Error")
+        && !s.contains("CrashLoop")
+        && !s.contains("BackOff")
+    {
+        return false;
+    }
+    true
+}
+fn is_node_issue(s: &str) -> bool {
+    s.contains("NotReady") || s == "Unknown"
+}
+
+/// Index of the "Status" printer column, so we can read the computed status
+/// cell without re-deriving it.
+fn status_col_index(table: &serde_json::Value) -> Option<usize> {
+    table["columnDefinitions"].as_array().and_then(|a| {
+        a.iter().position(|c| {
+            c["name"]
+                .as_str()
+                .map(|n| n.eq_ignore_ascii_case("status"))
+                .unwrap_or(false)
+        })
+    })
+}
+
+async fn issues_for_context(state: &AppState, ctx: &str) -> Result<Vec<Issue>, String> {
+    let client = client(state, ctx).await?;
+    let mut out = vec![];
+    let core = |kind: &str, plural: &str, namespaced: bool| ResourceType {
+        group: String::new(),
+        version: "v1".into(),
+        kind: kind.into(),
+        plural: plural.into(),
+        namespaced,
+        deletable: true,
+        editable: true,
+    };
+    // Pods across every namespace, filtered to problem statuses.
+    let pod_rt = core("Pod", "pods", true);
+    if let Ok(table) =
+        fetch_table_page(&client, &pod_rt, None, "Metadata", None, None, None).await
+    {
+        if let Some(si) = status_col_index(&table) {
+            for r in rows_from_page(&table, None) {
+                let s = r.cells.get(si).and_then(|c| c.as_str()).unwrap_or("");
+                if is_pod_issue(s) {
+                    out.push(Issue {
+                        context: ctx.into(),
+                        kind: "Pod".into(),
+                        namespace: r.namespace.clone(),
+                        name: r.name.clone(),
+                        status: s.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    // Nodes that aren't Ready.
+    let node_rt = core("Node", "nodes", false);
+    if let Ok(table) =
+        fetch_table_page(&client, &node_rt, None, "Metadata", None, None, None).await
+    {
+        if let Some(si) = status_col_index(&table) {
+            for r in rows_from_page(&table, None) {
+                let s = r.cells.get(si).and_then(|c| c.as_str()).unwrap_or("");
+                if is_node_issue(s) {
+                    out.push(Issue {
+                        context: ctx.into(),
+                        kind: "Node".into(),
+                        namespace: None,
+                        name: r.name.clone(),
+                        status: s.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Fan out across every open cluster and stream back the problem resources
+/// (failing/pending pods, NotReady nodes) per cluster as each lands — the
+/// "what needs attention right now" glance. Modeled on `search_contexts`.
+pub async fn aggregate_issues(
+    state: &AppState,
+    contexts: Vec<String>,
+    channel: Channel<IssueBatch>,
+) -> Result<(), String> {
+    use futures::StreamExt;
+    futures::stream::iter(contexts.into_iter().map(|ctx| {
+        let channel = channel.clone();
+        async move {
+            let batch = match issues_for_context(state, &ctx).await {
+                Ok(issues) => IssueBatch {
+                    context: ctx,
+                    issues,
+                    error: None,
+                },
+                Err(e) => IssueBatch {
+                    context: ctx,
+                    issues: vec![],
+                    error: Some(e),
+                },
+            };
+            let _ = channel.send(batch);
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<()>>()
+    .await;
+    Ok(())
+}
+
 /// Fold a list the user already loaded into the name index — the rows are
 /// in hand, so the contexts they visit index themselves for free.
 /// Kinds worth remembering names for. Events are the exception that

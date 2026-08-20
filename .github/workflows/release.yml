@@ -174,9 +174,9 @@ jobs:
           # the release notes plainly list what changed (commit subjects).
           PREV=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -n "$PREV" ]; then
-            NOTES=$(git log --no-merges --pretty='- %s' "${PREV}..HEAD")
+            NOTES=$(git log --no-merges --pretty='- %s%n%b' "${PREV}..HEAD")
           else
-            NOTES=$(git log --no-merges --pretty='- %s')
+            NOTES=$(git log --no-merges --pretty='- %s%n%b')
           fi
           [ -z "$NOTES" ] && NOTES="- ${TAG}"
           git tag -d $TAG 2>/dev/null || true

@@ -25,6 +25,7 @@ import flyingUrl from "./assets/svg/pigeon-flying.svg";
 import rocketUrl from "./assets/svg/pigeon-rocket.svg";
 // "my permissions" mark — pigeon guarding a padlocked shield = access rights.
 import shieldUrl from "./assets/svg/pigeon-shield.svg";
+import splitUrl from "./assets/svg/pigeon-split.svg";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -151,6 +152,14 @@ interface NodeStat {
   mem: number;
   cpu_pct: number;
   mem_pct: number;
+}
+
+interface Issue {
+  context: string;
+  kind: string;
+  namespace?: string | null;
+  name: string;
+  status: string;
 }
 
 interface Revision {
@@ -1267,7 +1276,8 @@ function App() {
   const [nsOpen, setNsOpen] = createSignal(false);
   const [nsQuery, setNsQuery] = createSignal("");
   const [tabs, setTabs] = createSignal<string[]>([]);
-  const [active, setActive] = createSignal<string | null>(null);
+  const active = () => P().active();
+  const setActive: Pane["setActive"] = (v) => P().setActive(v as never);
   /// The open tabs, grouped the same way for the topbar ▾ overflow menu:
   /// one header per custom group, then the ungrouped tabs. (Declared here,
   /// after `tabs`, so the eager memo doesn't read it in its TDZ.)
@@ -1336,14 +1346,160 @@ function App() {
   // (context picker) doesn't flash before the restored tabs appear. We know
   // synchronously whether there's anything to restore from the saved tabs.
   const [restoring, setRestoring] = createSignal(lastSession.length > 0);
-  const [error, setError] = createSignal<string | null>(null);
-  const [types, setTypes] = createSignal<ResourceType[]>([]);
-  const [namespaces, setNamespaces] = createSignal<string[]>([]);
-  const [namespace, setNamespace] = createSignal<string>("");
-  const [selected, setSelected] = createSignal<ResourceType | null>(null);
-  const [table, setTable] = createSignal<ResourceTable | null>(null);
-  const [streaming, setStreaming] = createSignal(false);
-  const [live, setLive] = createSignal(false);
+  // ── Per-pane view store (split view refactor, stage 1) ──────────
+  // Each pane owns its own view state; the split can run two fully
+  // independent live panes. During the migration the top-level names below
+  // (error, selected, table, …) are redirected to the *focused* pane's
+  // store, so the ~10k lines of render/keyboard/actions keep compiling and a
+  // single pane behaves exactly as before. Watch `let`s and per-pane memos
+  // move into the store in later stages.
+  function createPaneStore() {
+    const [error, setError] = createSignal<string | null>(null);
+    const [types, setTypes] = createSignal<ResourceType[]>([]);
+    const [namespaces, setNamespaces] = createSignal<string[]>([]);
+    const [namespace, setNamespace] = createSignal<string>("");
+    const [selected, setSelected] = createSignal<ResourceType | null>(null);
+    const [table, setTable] = createSignal<ResourceTable | null>(null);
+    const [streaming, setStreaming] = createSignal(false);
+    const [live, setLive] = createSignal(false);
+    const [fieldSel, setFieldSel] = createSignal<{
+      key: string;
+      selector: string;
+    } | null>(null);
+    const [loading, setLoading] = createSignal(false);
+    const [filter, setFilter] = createSignal("");
+    const [rowFilter, setRowFilter] = createSignal("");
+    const [matched, setMatched] = createSignal<Set<string> | null>(null);
+    const [sortCol, setSortCol] = createSignal<number | null>(null);
+    const [sortDir, setSortDir] = createSignal<1 | -1>(1);
+    const [cursor, setCursor] = createSignal(0);
+    const [marked, setMarked] = createSignal<Set<string>>(new Set());
+    const [detail, setDetail] = createSignal<ResourceDetail | null>(null);
+    const [detailKey, setDetailKey] = createSignal<string | null>(null);
+    const [detailLoading, setDetailLoading] = createSignal(false);
+    const [yamlText, setYamlText] = createSignal("");
+    const [scrollTop, setScrollTop] = createSignal(0);
+    const [viewH, setViewH] = createSignal(600);
+    const [active, setActive] = createSignal<string | null>(null);
+    const [podStats, setPodStats] = createSignal<Map<string, PodStat> | null>(
+      null,
+    );
+    const [nodeStats, setNodeStats] = createSignal<Map<
+      string,
+      NodeStat
+    > | null>(null);
+    const [pane, setPane] = createSignal<"sidebar" | "table">("sidebar");
+    const [customView, setCustomView] = createSignal<"issues" | null>(null);
+    const [indexing, setIndexing] = createSignal(false);
+    const [deepReady, setDeepReady] = createSignal(false);
+    const [sideIdx, setSideIdx] = createSignal(0);
+    const [openGroups, setOpenGroups] = createSignal<Set<string>>(new Set());
+    const [events, setEvents] = createSignal<EventInfo[]>([]);
+    const [nodePods, setNodePods] = createSignal<ResourceTable | null>(null);
+    const [nodePodsLoading, setNodePodsLoading] = createSignal(false);
+    const [nodePodsErr, setNodePodsErr] = createSignal("");
+    const [colFilters, setColFilters] = createSignal<
+      Record<string, Set<string>>
+    >({});
+    const [colNumFilters, setColNumFilters] = createSignal<
+      Record<string, { op: NumOp; val: number }>
+    >({});
+    return {
+      active,
+      setActive,
+      podStats,
+      setPodStats,
+      nodeStats,
+      setNodeStats,
+      pane,
+      setPane,
+      customView,
+      setCustomView,
+      indexing,
+      setIndexing,
+      deepReady,
+      setDeepReady,
+      sideIdx,
+      setSideIdx,
+      openGroups,
+      setOpenGroups,
+      events,
+      setEvents,
+      nodePods,
+      setNodePods,
+      nodePodsLoading,
+      setNodePodsLoading,
+      nodePodsErr,
+      setNodePodsErr,
+      colFilters,
+      setColFilters,
+      colNumFilters,
+      setColNumFilters,
+      error,
+      setError,
+      types,
+      setTypes,
+      namespaces,
+      setNamespaces,
+      namespace,
+      setNamespace,
+      selected,
+      setSelected,
+      table,
+      setTable,
+      streaming,
+      setStreaming,
+      live,
+      setLive,
+      fieldSel,
+      setFieldSel,
+      loading,
+      setLoading,
+      filter,
+      setFilter,
+      rowFilter,
+      setRowFilter,
+      matched,
+      setMatched,
+      sortCol,
+      setSortCol,
+      sortDir,
+      setSortDir,
+      cursor,
+      setCursor,
+      marked,
+      setMarked,
+      detail,
+      setDetail,
+      detailKey,
+      setDetailKey,
+      detailLoading,
+      setDetailLoading,
+      yamlText,
+      setYamlText,
+      scrollTop,
+      setScrollTop,
+      viewH,
+      setViewH,
+    };
+  }
+  type Pane = ReturnType<typeof createPaneStore>;
+  const panes = [createPaneStore(), createPaneStore()];
+  const [focusedPaneIdx, setFocusedPaneIdx] = createSignal(0);
+  const P = () => panes[focusedPaneIdx()];
+  const error = () => P().error();
+  const setError: Pane["setError"] = (v) => P().setError(v as never);
+  const types = () => P().types();
+  const setTypes: Pane["setTypes"] = (v) => P().setTypes(v as never);
+  const namespaces = () => P().namespaces();
+  const setNamespaces: Pane["setNamespaces"] = (v) =>
+    P().setNamespaces(v as never);
+  const namespace = () => P().namespace();
+  const setNamespace: Pane["setNamespace"] = (v) => P().setNamespace(v as never);
+  const selected = () => P().selected();
+  const setSelected: Pane["setSelected"] = (v) => P().setSelected(v as never);
+  const table = () => P().table();
+  const setTable: Pane["setTable"] = (v) => P().setTable(v as never);
   let listSeq = 0;
   let watchId: number | null = null;
 
@@ -1363,7 +1519,9 @@ function App() {
     }
     const pending = new Map(watchBuf);
     watchBuf.clear();
-    setTable((prev) => {
+    // The primary machinery is pane #0's alone — write it directly, never
+    // through P(), or a background flush lands on whatever pane has focus.
+    panes[0].setTable((prev) => {
       if (!prev) return prev;
       // one index pass, then O(1) updates
       const idx = new Map<string, number>();
@@ -1414,7 +1572,7 @@ function App() {
     watchBuf.clear();
     if (watchId != null) void invoke("watch_stop", { id: watchId }).catch(() => {});
     watchId = null;
-    setLive(false);
+    panes[0].setLive(false);
   }
 
   /// Keep the open list current by receiving only what changed. The
@@ -1439,9 +1597,10 @@ function App() {
       if (seq !== listSeq) return;
       if (ev.type === "RESYNC") {
         // the watch expired or the server closed it: re-list, which
-        // starts a fresh watch from the new resourceVersion
-        const cur = selected();
-        if (cur === rt && active() === ctx) void refreshList();
+        // starts a fresh watch from the new resourceVersion. Bound to
+        // pane #0 — the pane this watch belongs to, not whoever's focused.
+        if (panes[0].selected() === rt && panes[0].active() === ctx)
+          void refreshList();
         return;
       }
       const incoming = ev.rows ?? [];
@@ -1468,20 +1627,17 @@ function App() {
         return true; // superseded, not failed
       }
       watchId = id;
-      setLive(true);
+      panes[0].setLive(true);
       return true;
     } catch {
-      setLive(false); // watch permission missing: the list still works
+      panes[0].setLive(false); // watch permission missing: the list still works
       return false;
     }
   }
   // A server-side narrowing (e.g. pods of one node). Field selectors
   // are per-kind — "spec.nodeName" is a 400 on anything but pods — so
   // the owning kind travels with it.
-  const [fieldSel, setFieldSel] = createSignal<{
-    key: string;
-    selector: string;
-  } | null>(null);
+  const fieldSel = () => P().fieldSel();
 
   /// The selector, but only if it belongs to the kind on screen.
   const activeFieldSel = () => {
@@ -1489,12 +1645,15 @@ function App() {
     const s = selected();
     return f && s && f.key === typeKey(s) ? f.selector : null;
   };
-  const [loading, setLoading] = createSignal(false);
-  const [filter, setFilter] = createSignal("");
-  const [rowFilter, setRowFilter] = createSignal("");
+  const filter = () => P().filter();
+  const setFilter: Pane["setFilter"] = (v) => P().setFilter(v as never);
+  const rowFilter = () => P().rowFilter();
+  const setRowFilter: Pane["setRowFilter"] = (v) =>
+    P().setRowFilter(v as never);
   // Backend full-text hits, as row keys (namespace/name). Keys survive
   // the watch informer reordering the list; positional indices would not.
-  const [matched, setMatched] = createSignal<Set<string> | null>(null);
+  const matched = () => P().matched();
+  const setMatched: Pane["setMatched"] = (v) => P().setMatched(v as never);
   const [confirm, setConfirm] = createSignal<ConfirmState | null>(null);
   // 0 = Cancel, 1 = the action. Confirm dialogs open on the action so
   // Enter still means "yes", but ← makes backing out one keypress.
@@ -1994,21 +2153,22 @@ function App() {
   void invoke<PfInfo[]>("pf_list")
     .then(setForwards)
     .catch(() => {});
-  const [podStats, setPodStats] = createSignal<Map<string, PodStat> | null>(null);
-  const [nodeStats, setNodeStats] = createSignal<Map<string, NodeStat> | null>(
-    null,
-  );
+  const podStats = () => P().podStats();
+  const nodeStats = () => P().nodeStats();
   async function loadNodeStats(ctx: string) {
+    const s0 = panes[0];
     try {
       const stats = await invoke<NodeStat[]>("node_stats", { context: ctx });
-      if (active() === ctx && kindIs("", "Node")) {
-        setNodeStats(new Map(stats.map((s) => [s.name, s])));
+      const sel = s0.selected();
+      if (s0.active() === ctx && sel?.group === "" && sel?.kind === "Node") {
+        s0.setNodeStats(new Map(stats.map((s) => [s.name, s])));
       }
     } catch {
       /* metrics API not installed — columns just show "-" */
     }
   }
-  const [sortCol, setSortCol] = createSignal<number | null>(null);
+  const sortCol = () => P().sortCol();
+  const setSortCol: Pane["setSortCol"] = (v) => P().setSortCol(v as never);
   // Pod-stat columns (CPU/%…/MEM/%…) splice into the MIDDLE of the column
   // list when metrics load, which would shift a positional sort onto the
   // wrong column. Reset the sort on that one layout change (a rare click
@@ -2099,12 +2259,6 @@ function App() {
 
   /// Columns the API server marks as wide-only (priority > 0) — the
   /// ones `kubectl` hides unless you ask for -o wide.
-  const widePriority = createMemo(() => {
-    const t = table();
-    const m = new Set<string>();
-    for (const c of t?.columns ?? []) if (c.priority > 0) m.add(c.name);
-    return m;
-  });
 
   /// Columns hidden for this kind: the user's choice if they made one,
   /// otherwise the server's own "wide only" marking (priority > 0).
@@ -2243,15 +2397,6 @@ function App() {
   const [labelQuery, setLabelQuery] = createSignal("");
   // label key → a representative (first non-empty) value across the rows,
   // so the picker can preview a value and skip labels that are all-empty.
-  const labelEntries = createMemo(() => {
-    const m = new Map<string, string>();
-    for (const r of table()?.rows ?? []) {
-      for (const [k, v] of Object.entries(r.labels ?? {})) {
-        if (v && !m.has(k)) m.set(k, v);
-      }
-    }
-    return m;
-  });
   const labelShort = (key: string) => (key.split("/").pop() ?? key).toUpperCase();
   // [path, sample value] from real objects (backend) — the non-label side
   // of the picker. Lazily fetched when the columns menu opens, cached per
@@ -2311,28 +2456,6 @@ function App() {
   // Everything you can click to add: labels (client-side) + sampled
   // fields (backend), each with a suggested name, its JSONPath, and a
   // sample value. Only non-empty ones — an all-blank column is pointless.
-  const pickables = createMemo<
-    { name: string; path: string; kind: "label" | "field"; val: string }[]
-  >(() => {
-    const out: {
-      name: string;
-      path: string;
-      kind: "label" | "field";
-      val: string;
-    }[] = [];
-    for (const [k, v] of [...labelEntries()].sort((a, z) =>
-      a[0].localeCompare(z[0]),
-    ))
-      out.push({
-        name: labelShort(k),
-        path: `.metadata.labels['${k}']`,
-        kind: "label",
-        val: v,
-      });
-    for (const [p, v] of fieldEntries())
-      out.push({ name: pathShort(p), path: p, kind: "field", val: v });
-    return out;
-  });
 
   // Re-evaluate whenever the kind, its custom columns, the namespace or
   // the cluster change. Not tied to the row stream, so a watch flush
@@ -2377,12 +2500,13 @@ function App() {
         setCustomData(new Map());
       });
   });
-  const [sortDir, setSortDir] = createSignal<1 | -1>(1);
+  const sortDir = () => P().sortDir();
+  const setSortDir: Pane["setSortDir"] = (v) => P().setSortDir(v as never);
   // Per-column value filters (spreadsheet-style), keyed by column name so
   // they survive re-sorting. colMenu is the column whose value list is open.
-  const [colFilters, setColFilters] = createSignal<Record<string, Set<string>>>(
-    {},
-  );
+  const colFilters = () => P().colFilters();
+  const setColFilters: Pane["setColFilters"] = (v) =>
+    P().setColFilters(v as never);
   const [colMenu, setColMenu] = createSignal<string | null>(null);
   const [colMenuQ, setColMenuQ] = createSignal("");
   const [colMenuAt, setColMenuAt] = createSignal<{ x: number; y: number } | null>(
@@ -2440,9 +2564,9 @@ function App() {
   // Numeric column filters: a comparison instead of a value list, since
   // listing every distinct number (cpu, mem, %, restarts) is useless.
   type NumOp = ">" | ">=" | "<" | "<=" | "=";
-  const [colNumFilters, setColNumFilters] = createSignal<
-    Record<string, { op: NumOp; val: number }>
-  >({});
+  const colNumFilters = () => P().colNumFilters();
+  const setColNumFilters: Pane["setColNumFilters"] = (v) =>
+    P().setColNumFilters(v as never);
   /// Leading number in a cell ("91%"→91, "9 (27d ago)"→9, "n/a"→null).
   const cellNum = (v: string): number | null => {
     const m = v.match(/-?\d+(?:\.\d+)?/);
@@ -2488,9 +2612,11 @@ function App() {
   const [cmdOpen, setCmdOpen] = createSignal(false);
   const [cmdText, setCmdText] = createSignal("");
   const [cmdIdx, setCmdIdx] = createSignal(0);
-  const [cursor, setCursor] = createSignal(0);
+  const cursor = () => P().cursor();
+  const setCursor: Pane["setCursor"] = (v) => P().setCursor(v as never);
   // Space-marked rows, keyed ns/name so they survive re-sorting.
-  const [marked, setMarked] = createSignal<Set<string>>(new Set());
+  const marked = () => P().marked();
+  const setMarked: Pane["setMarked"] = (v) => P().setMarked(v as never);
   const rowKeyOf = (r: TableRow) => `${r.namespace ?? ""}/${r.name}`;
 
   // True while space is down. Nothing reports a held key on later events,
@@ -2530,18 +2656,360 @@ function App() {
   });
   /// Focus hierarchy: the sidebar is the top level, the table sits
   /// under it, and the detail panel under that. Esc walks back up.
-  const [pane, setPane] = createSignal<"sidebar" | "table">("sidebar");
-  // Which level the keyboard is driving right now, so it can be outlined —
-  // a keyboard user always sees where they are (sidebar → table → detail →
-  // terminal). Terminal focus and an open detail take precedence over pane.
+  const pane = () => P().pane();
+  const setPane: Pane["setPane"] = (v) => P().setPane(v as never);
+  // A non-kind panel (cross-cluster Issues) that takes over the main content
+  // area instead of a resource table. Picking a real kind clears it.
+  const customView = () => P().customView();
+  const setCustomView: Pane["setCustomView"] = (v) =>
+    P().setCustomView(v as never);
+
+  // Cross-cluster Issues: problem resources aggregated over every open tab,
+  // streamed per cluster as each answers.
+  // Cross-cluster issue aggregate is GLOBAL (not per-pane): one background
+  // sweep feeds the sidebar badge and either pane's Issues view.
+  const [issues, setIssues] = createSignal<Issue[]>([]);
+  const [issuesLoading, setIssuesLoading] = createSignal(false);
+  const [issuePending, setIssuePending] = createSignal<string[]>([]);
+  const [issueErrors, setIssueErrors] = createSignal<Record<string, string>>(
+    {},
+  );
+  // Keyboard cursor over the flat issue list (issues() is already sorted the
+  // same way the grouped view renders), so the Issues view is fully navigable.
+  const [issueIdx, setIssueIdx] = createSignal(0);
+  // A background reload replaces issues() — keep the cursor in range so Enter
+  // never targets a stale/removed row.
+  createEffect(() => {
+    const n = issues().length;
+    if (issueIdx() > Math.max(0, n - 1)) setIssueIdx(Math.max(0, n - 1));
+  });
+  function moveIssueCursor(delta: number) {
+    const n = issues().length;
+    if (!n) return;
+    const next = Math.min(Math.max(issueIdx() + delta, 0), n - 1);
+    setIssueIdx(next);
+    focusedPaneRoot()
+      .querySelector(`.iss-row[data-ii="${next}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }
+  // Hard failures get the strong red badge; softer "not ready yet" states
+  // (pending, creating, init) get amber.
+  const isCritIssue = (s: string) =>
+    /crashloop|err|unknown|terminat|oomkill|failed|evict|invalid|notready|backoff|imagepull/i.test(
+      s,
+    );
+  let issueSweepSeq = 0;
+  function loadIssues() {
+    const targets = tabs();
+    if (!targets.length) return;
+    // Each sweep is stamped; a late message from a superseded sweep (e.g. a
+    // warm re-aggregate started while the previous one is still streaming)
+    // is ignored, so rows never double up and the spinner tracks one sweep.
+    const gen = ++issueSweepSeq;
+    setIssues([]);
+    setIssueErrors({});
+    setIssuePending(targets);
+    setIssuesLoading(true);
+    const chan = new Channel<{
+      context: string;
+      issues: Issue[];
+      error: string | null;
+    }>();
+    chan.onmessage = (b) => {
+      if (gen !== issueSweepSeq) return;
+      setIssuePending(issuePending().filter((c) => c !== b.context));
+      if (b.error) setIssueErrors({ ...issueErrors(), [b.context]: b.error });
+      else if (b.issues.length) {
+        const order = new Map(targets.map((t, i) => [t, i]));
+        setIssues(
+          [...issues(), ...b.issues].sort(
+            (a, z) =>
+              (order.get(a.context) ?? 0) - (order.get(z.context) ?? 0) ||
+              a.name.localeCompare(z.name),
+          ),
+        );
+      }
+      if (!issuePending().length) setIssuesLoading(false);
+    };
+    void invoke("aggregate_issues", { contexts: targets, channel: chan })
+      .then(() => {
+        // The command resolved: the sweep is done even if some cluster never
+        // emitted (hung/dropped), so clear the spinner instead of latching.
+        if (gen === issueSweepSeq) {
+          setIssuePending([]);
+          setIssuesLoading(false);
+        }
+      })
+      .catch((e) => {
+        if (gen !== issueSweepSeq) return;
+        setIssueErrors({ ...issueErrors(), all: String(e) });
+        setIssuesLoading(false);
+      });
+  }
+  function openIssues() {
+    setCustomView("issues");
+    setSelected(null);
+    setPane("table");
+    setIssueIdx(0);
+    // Data is kept warm in the background (below); only kick a fresh sweep if
+    // nothing's loaded yet or one isn't already running.
+    if (!issuesLoading() && !issues().length) loadIssues();
+  }
+  // Keep the cross-cluster issue sweep warm like the pod list: re-aggregate
+  // shortly after the set of connected clusters settles, and refresh on a
+  // slow timer so the sidebar badge + Issues view stay current with no manual
+  // refresh button.
+  let issuesWarmTimer: number | undefined;
+  createEffect(() => {
+    const t = tabs();
+    clearTimeout(issuesWarmTimer);
+    if (!t.length) {
+      setIssues([]);
+      setIssuePending([]);
+      setIssueErrors({});
+      return;
+    }
+    issuesWarmTimer = window.setTimeout(() => loadIssues(), 500);
+  });
+  onMount(() => {
+    const id = window.setInterval(() => {
+      if (tabs().length && !issuesLoading()) loadIssues();
+    }, 60000);
+    onCleanup(() => clearInterval(id));
+  });
+  /// Land on a problem resource in its own cluster.
+  async function gotoIssue(i: Issue) {
+    setCustomView(null);
+    if (active() !== i.context) activate(i.context);
+    const t = types().find((x) => x.group === "" && x.kind === i.kind);
+    if (!t) {
+      setError(`${i.kind} is not served by ${i.context}`);
+      return;
+    }
+    if (i.namespace) {
+      setNamespace(i.namespace);
+      const st = tabCache.get(i.context);
+      if (st) st.namespace = i.namespace;
+    }
+    await select(t);
+    await showDetail(i.namespace ?? null, i.name);
+  }
+
+  // ── Split view: a second, self-contained LIVE pane ─────────────────
+  // Its own copies of the view state + watch, so it lists / watches /
+  // opens detail independently of the primary. Backend commands are
+  // stateless per call and watches are id-keyed, so the two never collide.
+  const [split, setSplit] = createSignal(false);
+  // Which panes are live in the layout: just the primary, or both when split.
+  const activePanes = createMemo(() => (split() ? panes : [panes[0]]));
+  // Width (%) of the second pane; split opens 50/50 (equal panes), the
+  // drag handle between them re-sizes from there.
+  const [secWidth, setSecWidth] = createSignal(50);
+  // Focus lives in focusedPaneIdx (0/1); this keeps the old string-based
+  // callers working against that single source of truth.
+  const focusedPane = () => (focusedPaneIdx() === 1 ? "secondary" : "primary");
+  const setFocusedPane = (p: "primary" | "secondary") =>
+    setFocusedPaneIdx(p === "secondary" ? 1 : 0);
+  // The secondary machinery writes straight into pane #2's store, so the
+  // <For> render (bound to panes[1]) shows exactly what this loads/watches.
+  const S1 = panes[1];
+  const sCtx = () => S1.active();
+  const setSCtx: Pane["setActive"] = (v) => S1.setActive(v as never);
+  const sSel = () => S1.selected();
+  const setSSel: Pane["setSelected"] = (v) => S1.setSelected(v as never);
+  const sNs = () => S1.namespace();
+  const setSNs: Pane["setNamespace"] = (v) => S1.setNamespace(v as never);
+  const sTypes = () => S1.types();
+  const setSTypes: Pane["setTypes"] = (v) => S1.setTypes(v as never);
+  const setSNamespaces: Pane["setNamespaces"] = (v) =>
+    S1.setNamespaces(v as never);
+  const setSTable: Pane["setTable"] = (v) => S1.setTable(v as never);
+  const setSLoading: Pane["setLoading"] = (v) => S1.setLoading(v as never);
+  const setSCursor: Pane["setCursor"] = (v) => S1.setCursor(v as never);
+  const setSDetail: Pane["setDetail"] = (v) => S1.setDetail(v as never);
+  const setSDetailKey: Pane["setDetailKey"] = (v) =>
+    S1.setDetailKey(v as never);
+  const setSScrollTop: Pane["setScrollTop"] = (v) =>
+    S1.setScrollTop(v as never);
+  let sListSeq = 0;
+  let sWatchId: number | null = null;
+  const sWatchBuf = new Map<string, { del: boolean; row: TableRow }>();
+  let sWatchTimer: number | undefined;
+
+  function sFlush(seq: number) {
+    if (sWatchTimer != null) {
+      window.clearTimeout(sWatchTimer);
+      sWatchTimer = undefined;
+    }
+    if (seq !== sListSeq || !sWatchBuf.size) {
+      sWatchBuf.clear();
+      return;
+    }
+    const pending = new Map(sWatchBuf);
+    sWatchBuf.clear();
+    setSTable((prev) => {
+      if (!prev) return prev;
+      const idx = new Map<string, number>();
+      for (let i = 0; i < prev.rows.length; i++)
+        idx.set(rowKeyOf(prev.rows[i]), i);
+      const rows = prev.rows.slice();
+      const dels: number[] = [];
+      for (const [k, ch] of pending) {
+        const i = idx.get(k);
+        if (ch.del) {
+          if (i !== undefined) dels.push(i);
+        } else if (i !== undefined) rows[i] = ch.row;
+        else rows.push(ch.row);
+      }
+      dels.sort((a, b) => b - a).forEach((i) => rows.splice(i, 1));
+      return { ...prev, rows };
+    });
+  }
+  function sSchedule(seq: number) {
+    if (sWatchTimer == null)
+      sWatchTimer = window.setTimeout(() => {
+        sWatchTimer = undefined;
+        sFlush(seq);
+      }, 700);
+  }
+  function sStopWatch() {
+    if (sWatchTimer != null) {
+      window.clearTimeout(sWatchTimer);
+      sWatchTimer = undefined;
+    }
+    sWatchBuf.clear();
+    if (sWatchId != null)
+      void invoke("watch_stop", { id: sWatchId }).catch(() => {});
+    sWatchId = null;
+  }
+  async function sStartWatch(
+    ctx: string,
+    rt: ResourceType,
+    ns: string | null,
+    rv: string | null,
+    include: string,
+  ) {
+    sStopWatch();
+    if (!rv) return;
+    const seq = sListSeq;
+    const chan = new Channel<{ type: string; rows?: TableRow[] }>();
+    chan.onmessage = (ev) => {
+      if (seq !== sListSeq) return;
+      if (ev.type === "RESYNC") {
+        if (sSel() === rt && sCtx() === ctx) void sSelect(rt);
+        return;
+      }
+      const del = ev.type === "DELETED";
+      for (const r of ev.rows ?? []) sWatchBuf.set(rowKeyOf(r), { del, row: r });
+      if (del) sFlush(seq);
+      else sSchedule(seq);
+    };
+    try {
+      const id = await invoke<number>("watch_start", {
+        context: ctx,
+        resource: rt,
+        namespace: ns,
+        fieldSelector: null,
+        resourceVersion: rv,
+        include,
+        channel: chan,
+      });
+      if (seq !== sListSeq) void invoke("watch_stop", { id }).catch(() => {});
+      else sWatchId = id;
+    } catch {
+      /* watch refused — the list still shows */
+    }
+  }
+  async function sSelect(rt: ResourceType) {
+    const ctx = sCtx();
+    if (!ctx) return;
+    sStopWatch();
+    setSSel(rt);
+    // Pane 2 has no sidebar of its own — showing a kind puts it in "table"
+    // mode, which the ←/→ pane-cross keys (and other table keys) check.
+    S1.setPane("table");
+    setSCursor(0);
+    setSScrollTop(0);
+    setSDetail(null);
+    setSDetailKey(null);
+    const ns = rt.namespaced && sNs() ? sNs() : null;
+    const seq = ++sListSeq;
+    setSLoading(true);
+    try {
+      const cached = await invoke<ResourceTable | null>("cached_list", {
+        context: ctx,
+        resource: rt,
+        namespace: ns,
+        fieldSelector: null,
+      });
+      if (seq === sListSeq && cached) setSTable(cached);
+    } catch {
+      /* no cache */
+    }
+    try {
+      const t = await invoke<ResourceTable>("list_resources", {
+        context: ctx,
+        resource: rt,
+        namespace: ns,
+        fieldSelector: null,
+        channel: new Channel(),
+      });
+      if (seq !== sListSeq) return;
+      setSTable(t);
+      setSLoading(false);
+      persist(); // remember pane 2's kind for session restore
+      await sStartWatch(ctx, rt, ns, t.resource_version, t.include);
+    } catch (e) {
+      if (seq === sListSeq) {
+        setSLoading(false);
+        S1.setError(String(e)); // pane 1's error, never the focused pane's
+      }
+    }
+  }
+  function pinCurrent() {
+    // Snapshot the focused pane BEFORE switching focus — otherwise the
+    // accessors below would read pane #2 (the target) mid-clone.
+    const src = P();
+    const ctx = src.active();
+    const cached = ctx ? tabCache.get(ctx) : undefined;
+    const cur = src.selected();
+    setSCtx(ctx);
+    setSTypes(cached?.types ?? src.types());
+    setSNamespaces(cached?.namespaces ?? src.namespaces());
+    setSNs(src.namespace());
+    setSplit(true);
+    setFocusedPane("secondary");
+    if (cur) void sSelect(cur);
+    else {
+      // Opening the split with no selected kind: stop any old watch and
+      // clear the table so a stale stream can't feed the new header.
+      sStopWatch();
+      S1.setTable(null);
+      S1.setSelected(null);
+    }
+    persist();
+  }
+  function closeSplit() {
+    sStopWatch();
+    setSplit(false);
+    setFocusedPane("primary");
+    persist();
+  }
+  function toggleSplit() {
+    if (split()) closeSplit();
+    else pinCurrent();
+  }
   const activePane = (): "sidebar" | "table" | "detail" | "terminal" =>
     termDockFocused() && shells().length > 0 && !termMin()
       ? "terminal"
       : detailKey()
         ? "detail"
         : pane();
-  const [sideIdx, setSideIdx] = createSignal(0);
-  const [openGroups, setOpenGroups] = createSignal<Set<string>>(new Set());
+  const sideIdx = () => P().sideIdx();
+  const setSideIdx: Pane["setSideIdx"] = (v) => P().setSideIdx(v as never);
+  const openGroups = () => P().openGroups();
+  const setOpenGroups: Pane["setOpenGroups"] = (v) =>
+    P().setOpenGroups(v as never);
 
   const groupOpen = (g: string) => openGroups().has(g);
 
@@ -2554,17 +3022,46 @@ function App() {
   let rowSearchRef: HTMLInputElement | undefined;
   let findInputRef: HTMLInputElement | undefined;
   let tableFocusRef: HTMLDivElement | undefined;
-  let tableRO: ResizeObserver | undefined;
   let drawerBodyRef: HTMLDivElement | undefined;
   let kindFilterRef: HTMLInputElement | undefined;
   let annoFoldRef: HTMLDetailsElement | undefined;
   let statusFoldRef: HTMLDetailsElement | undefined;
   let eventFoldRef: HTMLDetailsElement | undefined;
 
-  const [detail, setDetail] = createSignal<ResourceDetail | null>(null);
-  const [detailKey, setDetailKey] = createSignal<string | null>(null);
-  const [detailLoading, setDetailLoading] = createSignal(false);
-  const [yamlText, setYamlText] = createSignal("");
+  // Per-pane DOM elements. The content subtree renders once per pane, so a
+  // single App-scope `let X = el` ref would be clobbered to the last-mounted
+  // pane. Instead each pane stores its elements here; the App-scope refs
+  // above (used by the keyboard, which drives the FOCUSED pane) are synced to
+  // the focused pane's elements by the effect below. `regEl`/`onCleanup` live
+  // in the per-pane prelude.
+  const paneEls: Record<string, HTMLElement | undefined>[] = [{}, {}];
+  const paneROs: (ResizeObserver | undefined)[] = [undefined, undefined];
+  const [refGen, setRefGen] = createSignal(0);
+  createEffect(() => {
+    refGen(); // re-run when any pane (re)mounts an element
+    const e = paneEls[focusedPaneIdx()] ?? {};
+    rowSearchRef = e.search as HTMLInputElement | undefined;
+    findInputRef = e.find as HTMLInputElement | undefined;
+    tableFocusRef = e.table as HTMLDivElement | undefined;
+    drawerBodyRef = e.drawerBody as HTMLDivElement | undefined;
+    annoFoldRef = e.anno as HTMLDetailsElement | undefined;
+    statusFoldRef = e.status as HTMLDetailsElement | undefined;
+    eventFoldRef = e.event as HTMLDetailsElement | undefined;
+  });
+  // Root element of the focused pane, so document-wide DOM queries for
+  // per-pane chrome (.drawer buttons, table headers) don't match the OTHER
+  // pane's duplicate nodes. Falls back to document before the first mount.
+  const focusedPaneRoot = (): ParentNode =>
+    paneEls[focusedPaneIdx()]?.pane ?? document;
+
+  const detail = () => P().detail();
+  const setDetail: Pane["setDetail"] = (v) => P().setDetail(v as never);
+  const detailKey = () => P().detailKey();
+  const setDetailKey: Pane["setDetailKey"] = (v) => P().setDetailKey(v as never);
+  const setDetailLoading: Pane["setDetailLoading"] = (v) =>
+    P().setDetailLoading(v as never);
+  const yamlText = () => P().yamlText();
+  const setYamlText: Pane["setYamlText"] = (v) => P().setYamlText(v as never);
   // "New" (create) dialog state.
   const [newOpen, setNewOpen] = createSignal(false);
   const [newYaml, setNewYaml] = createSignal("");
@@ -2638,7 +3135,8 @@ function App() {
       setActionErr(`could not copy: ${String(e)}`);
     }
   }
-  const [events, setEvents] = createSignal<EventInfo[]>([]);
+  const events = () => P().events();
+  const setEvents: Pane["setEvents"] = (v) => P().setEvents(v as never);
   // Per-event copy feedback (which event just showed "✓").
   const [copiedEv, setCopiedEv] = createSignal<EventInfo | null>(null);
   // "copy all" (events) and per-secret-value copy feedback.
@@ -2646,18 +3144,14 @@ function App() {
   const [copiedSecret, setCopiedSecret] = createSignal<string | null>(null);
   // Pods running on the open node, shown inline so you don't have to
   // navigate away to see what a node is carrying.
-  const [nodePods, setNodePods] = createSignal<ResourceTable | null>(null);
-  const [nodePodsLoading, setNodePodsLoading] = createSignal(false);
-  const [nodePodsErr, setNodePodsErr] = createSignal("");
+  const nodePods = () => P().nodePods();
+  const setNodePods: Pane["setNodePods"] = (v) => P().setNodePods(v as never);
+  const setNodePodsLoading: Pane["setNodePodsLoading"] = (v) =>
+    P().setNodePodsLoading(v as never);
+  const setNodePodsErr: Pane["setNodePodsErr"] = (v) =>
+    P().setNodePodsErr(v as never);
   // The default (priority 0) printer columns, paired with their cell
   // index — same set the main list shows, minus the wide extras.
-  const nodePodCols = createMemo(() => {
-    const t = nodePods();
-    if (!t) return [] as { c: ColumnDef; i: number }[];
-    return t.columns
-      .map((c, i) => ({ c, i }))
-      .filter(({ c }) => c.priority === 0);
-  });
 
   /// One event as a self-contained block. Events don't name the object
   /// they belong to — a node's events read as bare "reason: message" —
@@ -2710,12 +3204,87 @@ function App() {
   const [secBtn, setSecBtn] = createSignal(-1);
 
   /// Forwards belonging to the resource in the open panel.
-  const podForwards = createMemo(() => {
+
+  type RelatedItem = {
+    kind: string;
+    name?: string;
+    note?: string;
+    run: () => void;
+  };
+  /// Everything the open resource points at (or is pointed at by) — the
+  /// drill-down list rendered in the panel's "related" section. Owner/backing
+  /// refs carry a name; reverse ("used by") refs are a filtered list, so they
+  /// carry a note instead. All the navigation the action bar used to scatter
+  /// as tiny buttons, gathered into one browsable list that shows names.
+  const relatedItems = createMemo<RelatedItem[]>(() => {
     const d = detail();
-    if (!d) return [] as PfInfo[];
-    return forwards().filter(
-      (f) => f.pod === d.name && f.namespace === (d.namespace ?? ""),
-    );
+    if (!d) return [];
+    const served = (kind: string) => types().some((t) => t.kind === kind);
+    const out: RelatedItem[] = [];
+    // Event → the object it is about.
+    if (isEvent() && d.involved && served(d.involved.kind))
+      out.push({
+        kind: d.involved.kind,
+        name: d.involved.name,
+        run: () => void jumpToInvolved(),
+      });
+    // Owner / backing references (named).
+    for (const l of d.links)
+      if (served(l.kind))
+        out.push({ kind: l.kind, name: l.name, run: () => void jumpToRef(l) });
+    // A workload / service → the pods it selects.
+    if (d.has_pod_selector && !isPod() && served("Pod"))
+      out.push({
+        kind: "Pod",
+        note: "selected by this",
+        run: () => void jumpToSelectedPods(),
+      });
+    // Reverse "used by" references (a filtered list, no single name).
+    for (const u of USED_BY[selected()!.kind] ?? [])
+      if (served(u.kind))
+        out.push({
+          kind: u.kind,
+          note: "referencing this",
+          run: () =>
+            void jumpToKindFiltered(
+              u.kind,
+              d.name,
+              d.namespace,
+              u.field?.(d.name),
+            ),
+        });
+    // A CRD → its served instances.
+    if (kindIs("apiextensions.k8s.io", "CustomResourceDefinition")) {
+      const [plural, ...rest] = d.name.split(".");
+      const t = types().find(
+        (x) => x.plural === plural && x.group === rest.join("."),
+      );
+      if (t)
+        out.push({ kind: t.kind, note: "instances", run: () => void select(t) });
+    }
+    // A Namespace → its own workloads; each link scopes the view to it.
+    if (kindIs("", "Namespace"))
+      for (const nk of NS_KINDS)
+        if (types().some((t) => t.kind === nk.kind && t.group === nk.group))
+          out.push({
+            kind: nk.kind,
+            note: "in this namespace",
+            run: () => void enterNamespaceKind(d.name, nk.kind, nk.group),
+          });
+    // Karpenter: a NodePool provisions Nodes (they carry its label);
+    // a NodeClaim maps to one Node (its status.nodeName).
+    if (kindIs("karpenter.sh", "NodePool") && served("Node"))
+      out.push({
+        kind: "Node",
+        note: "provisioned by this",
+        run: () => void jumpToNodesForPool(d.name),
+      });
+    if (kindIs("karpenter.sh", "NodeClaim") && served("Node")) {
+      const nn = (d.status as { nodeName?: string } | null)?.nodeName;
+      if (nn)
+        out.push({ kind: "Node", name: nn, run: () => void jumpToNode(nn) });
+    }
+    return out;
   });
 
   const panelSections = createMemo(() => {
@@ -2728,6 +3297,7 @@ function App() {
       "share",
       "actions",
       ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
+      ...(relatedItems().length ? ["related"] : []),
       ...(d.containers?.length ? ["containers"] : []),
       "meta",
       ...(Object.keys(d.labels).length ? ["labels"] : []),
@@ -2744,6 +3314,7 @@ function App() {
   const BUTTON_ROWS: Record<string, string> = {
     share: ".drawer-head .share-btn",
     actions: ".drawer .actions",
+    related: ".drawer .rel-list",
     containers: ".drawer .ctr-list",
     apply: ".drawer .yaml-actions",
   };
@@ -2758,10 +3329,10 @@ function App() {
   function sectionButtons(sec: string): HTMLElement[] {
     const sel = SECTION_BUTTONS[sec];
     if (!sel) return [];
-    return [...document.querySelectorAll<HTMLElement>(`${sel}:not(:disabled)`)];
+    return [...focusedPaneRoot().querySelectorAll<HTMLElement>(`${sel}:not(:disabled)`)];
   }
   function paintSecBtn(sec: string, idx: number) {
-    document
+    focusedPaneRoot()
       .querySelectorAll(".btn-cursor")
       .forEach((el) => el.classList.remove("btn-cursor"));
     const el = sectionButtons(sec)[idx];
@@ -2782,8 +3353,12 @@ function App() {
     const q = 'button, input[type="checkbox"]';
     return [
       ...new Set<HTMLElement>([
-        ...document.querySelectorAll<HTMLElement>(`${sel}:is(${q}):not(:disabled)`),
-        ...document.querySelectorAll<HTMLElement>(`${sel} :is(${q}):not(:disabled)`),
+        ...focusedPaneRoot().querySelectorAll<HTMLElement>(
+          `${sel}:is(${q}):not(:disabled)`,
+        ),
+        ...focusedPaneRoot().querySelectorAll<HTMLElement>(
+          `${sel} :is(${q}):not(:disabled)`,
+        ),
       ]),
     ];
   }
@@ -2791,7 +3366,7 @@ function App() {
   /// Highlight is ours, not the browser's: WebKit won't give buttons
   /// focus rings by default, so a class carries the cursor.
   function paintRowCursor(sec: string, idx: number) {
-    document
+    focusedPaneRoot()
       .querySelectorAll(".btn-cursor")
       .forEach((el) => el.classList.remove("btn-cursor"));
     const items = rowItems(sec);
@@ -2839,7 +3414,11 @@ function App() {
       .querySelector(`.psec[data-sec="${sec}"]`)
       ?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
     if (BUTTON_ROWS[sec]) {
-      requestAnimationFrame(() => focusRowButton(sec, 0));
+      // Entering the vertical related list while moving UP should land on its
+      // LAST item, so ↑ keeps stepping through it instead of skipping past.
+      const enterIdx =
+        delta < 0 && sec === "related" ? rowItems(sec).length : 0;
+      requestAnimationFrame(() => focusRowButton(sec, enterIdx));
       return;
     }
     document
@@ -3013,9 +3592,26 @@ function App() {
   }
 
   function persist() {
+    const p1 = panes[1];
+    const sel1 = p1.selected();
     localStorage.setItem(
       SESSION_KEY,
-      JSON.stringify({ tabs: tabs(), active: active() }),
+      JSON.stringify({
+        tabs: tabs(),
+        // The PRIMARY pane's context — not P()/focused, or focusing the
+        // second pane would restore the wrong cluster into the first one.
+        active: panes[0].active(),
+        // The split, if open: pane 2's cluster/kind/namespace + its width,
+        // so a split session comes back the way it was left.
+        split: split()
+          ? {
+              ctx: p1.active(),
+              kind: sel1 ? typeKey(sel1) : null,
+              ns: p1.namespace(),
+              width: secWidth(),
+            }
+          : null,
+      }),
     );
   }
 
@@ -3120,7 +3716,9 @@ function App() {
   // as a peye:// link. Opening it drives the same navigation on the other
   // side (as long as they have that context in their kubeconfig). No secrets
   // travel in the URL; each side authenticates with its own kubeconfig.
-  const [sharedCopied, setSharedCopied] = createSignal(false);
+  // Which pane just copied a share link (so only that pane's button shows
+  // the "copied ✓" flash — the buttons render once per pane).
+  const [sharedCopied, setSharedCopied] = createSignal<number | null>(null);
   const serverHost = (url: string) => {
     try {
       return new URL(url).host;
@@ -3159,8 +3757,8 @@ function App() {
     if (!link) return;
     try {
       await navigator.clipboard.writeText(link);
-      setSharedCopied(true);
-      setTimeout(() => setSharedCopied(false), 1400);
+      setSharedCopied(focusedPaneIdx());
+      setTimeout(() => setSharedCopied(null), 1400);
     } catch (e) {
       setError(`could not copy link: ${String(e)}`);
     }
@@ -3361,7 +3959,16 @@ function App() {
       setRestoring(false);
       return;
     }
-    const saved = JSON.parse(raw) as { tabs: string[]; active: string | null };
+    const saved = JSON.parse(raw) as {
+      tabs: string[];
+      active: string | null;
+      split?: {
+        ctx: string | null;
+        kind: string | null;
+        ns: string;
+        width: number;
+      } | null;
+    };
     const known = new Set(cs.map((c) => c.name));
     const wanted = (saved.tabs ?? []).filter((t) => known.has(t));
     if (!wanted.length) {
@@ -3398,6 +4005,22 @@ function App() {
             ? saved.active
             : opened[0];
         if (act) activate(act);
+        // Bring back the split exactly as it was left, as long as pane 2's
+        // cluster reconnected. Focus stays on the primary pane.
+        const sp = saved.split;
+        if (sp && sp.ctx && opened.includes(sp.ctx) && tabCache.has(sp.ctx)) {
+          const st = tabCache.get(sp.ctx)!;
+          setSCtx(sp.ctx);
+          setSTypes(st.types);
+          setSNamespaces(st.namespaces);
+          setSNs(sp.ns || "");
+          if (sp.width) setSecWidth(sp.width);
+          setSplit(true);
+          const kind = sp.kind
+            ? (st.types.find((t) => typeKey(t) === sp.kind) ?? null)
+            : null;
+          if (kind) void sSelect(kind);
+        }
       })
       .finally(() => {
         wanted.forEach(endConnect);
@@ -3419,12 +4042,13 @@ function App() {
   let filterSeq = 0;
   let indexed = false;
   let indexPromise: Promise<unknown> | null = null;
-  const [indexing, setIndexing] = createSignal(false);
+  const setIndexing: Pane["setIndexing"] = (v) => P().setIndexing(v as never);
   // Reactive mirror of `indexed`: false until the current list's full-text
   // index is built. While a filter is active and this is false, the count
   // is provisional (deep-field matches haven't been scanned yet), so the
   // badge shows "searching…" instead of a misleading "0".
-  const [deepReady, setDeepReady] = createSignal(false);
+  const setDeepReady: Pane["setDeepReady"] = (v) =>
+    P().setDeepReady(v as never);
 
   function onRowFilterInput(value: string) {
     setRowFilter(value);
@@ -3480,44 +4104,57 @@ function App() {
     }, 80);
   }
 
+  // Navigation routes to whichever pane is focused: pane #2 drives the
+  // secondary machinery (its own watch), pane #1 the primary one. Every
+  // select() caller (sidebar, keyboard, drill-downs) picks up the routing.
   async function select(
     rt: ResourceType,
     fieldSelector?: string,
     keepFilter = false,
   ) {
-    const ctx = active();
+    if (focusedPaneIdx() === 1) return void sSelect(rt);
+    return selectPrimary(rt, fieldSelector, keepFilter);
+  }
+  async function selectPrimary(
+    rt: ResourceType,
+    fieldSelector?: string,
+    keepFilter = false,
+  ) {
+    const s0 = panes[0];
+    const ctx = s0.active();
     if (!ctx) return;
-    setPane("table");
-    setFieldSel(
+    s0.setCustomView(null);
+    s0.setPane("table");
+    s0.setFieldSel(
       fieldSelector ? { key: typeKey(rt), selector: fieldSelector } : null,
     );
-    if (!navigating && selected() && selected() !== rt) pushHistory();
+    if (!navigating && s0.selected() && s0.selected() !== rt) pushHistory();
     const st = tabCache.get(ctx);
     if (st) st.selectedKey = typeKey(rt);
-    setSelected(rt);
+    s0.setSelected(rt);
     // Changing kind drops the filter (it's column/kind-specific); a tab
     // restore passes keepFilter so the caller's restored filter survives.
-    if (!keepFilter) setRowFilter("");
-    setMatched(null);
+    if (!keepFilter) s0.setRowFilter("");
+    s0.setMatched(null);
     stopWatch();
-    setPodStats(null);
-    setNodeStats(null);
-    setSortCol(null);
+    s0.setPodStats(null);
+    s0.setNodeStats(null);
+    s0.setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
-    setColFilters({});
-    setColNumFilters({});
+    s0.setColFilters({});
+    s0.setColNumFilters({});
     setColMenu(null);
-    setCursor(0);
-    setMarked(new Set<string>());
+    s0.setCursor(0);
+    s0.setMarked(new Set<string>());
     if (tableFocusRef) tableFocusRef.scrollTop = 0;
-    setScrollTop(0);
+    s0.setScrollTop(0);
     indexed = false;
-    setDeepReady(false);
+    s0.setDeepReady(false);
     indexPromise = null;
     filterSeq++;
     closeDetail();
-    setError(null);
-    const ns = rt.namespaced && namespace() ? namespace() : null;
+    s0.setError(null);
+    const ns = rt.namespaced && s0.namespace() ? s0.namespace() : null;
     // Coming back to a view should not refetch 20k rows. Paint the cached
     // rows, then — instead of re-listing everything — resume the watch
     // from the cached snapshot's resourceVersion so only what changed
@@ -3536,12 +4173,12 @@ function App() {
     if (
       cached &&
       cached.resource_version &&
-      active() === ctx &&
-      selected() === rt
+      s0.active() === ctx &&
+      s0.selected() === rt
     ) {
-      setTable(cached);
-      setLoading(false);
-      setStreaming(false);
+      s0.setTable(cached);
+      s0.setLoading(false);
+      s0.setStreaming(false);
       // Bump the sequence so any prior stream is ignored, then resume the
       // watch. If the version is too old the server RESYNCs and the watch
       // handler does a full refreshList().
@@ -3554,17 +4191,17 @@ function App() {
         // without needing a search.
         if (!indexed && !indexPromise) {
           const buildSeq = listSeq;
-          setIndexing(true);
+          s0.setIndexing(true);
           indexPromise = invoke("ensure_index")
             .then(() => {
-              if (active() === ctx && selected() === rt) void loadPodStats(ctx, ns);
+              if (s0.active() === ctx && s0.selected() === rt) void loadPodStats(ctx, ns);
             })
             .finally(() => {
               if (buildSeq !== listSeq) return; // superseded by a switch
               indexed = true;
-              setDeepReady(true);
+              s0.setDeepReady(true);
               indexPromise = null;
-              setIndexing(false);
+              s0.setIndexing(false);
             });
         }
       }
@@ -3579,14 +4216,19 @@ function App() {
       );
       // No watch (server refused it): cached rows would never revalidate,
       // so fall back to a full fetch.
-      if (!started && active() === ctx && selected() === rt) void refreshList();
+      if (!started && s0.active() === ctx && s0.selected() === rt) void refreshList();
       // Re-apply a restored filter against the cached rows (the full-fetch
       // path does the same once its first page lands).
-      else if (active() === ctx && selected() === rt && rowFilter().trim())
-        onRowFilterInput(rowFilter());
+      else if (
+        focusedPaneIdx() === 0 &&
+        s0.active() === ctx &&
+        s0.selected() === rt &&
+        s0.rowFilter().trim()
+      )
+        onRowFilterInput(s0.rowFilter());
       return;
     }
-    setLoading(true);
+    s0.setLoading(true);
     try {
       // Big clusters do not fit in one page: the first page renders
       // immediately and the rest arrives on this channel, so search
@@ -3595,10 +4237,10 @@ function App() {
       const chan = new Channel<{ rows: TableRow[]; done: boolean }>();
       chan.onmessage = (page) => {
         if (seq !== listSeq) return;
-        setTable((prev) =>
+        s0.setTable((prev) =>
           prev ? { ...prev, rows: [...prev.rows, ...page.rows] } : prev,
         );
-        setStreaming(!page.done);
+        s0.setStreaming(!page.done);
       };
       const t = await invoke<ResourceTable>("list_resources", {
         context: ctx,
@@ -3607,9 +4249,9 @@ function App() {
         fieldSelector: fieldSelector ?? null,
         channel: chan,
       });
-      if (active() === ctx && selected() === rt) {
-        setStreaming(t.truncated);
-        setTable(t);
+      if (s0.active() === ctx && s0.selected() === rt) {
+        s0.setStreaming(t.truncated);
+        s0.setTable(t);
         if (rt.group === "" && rt.kind === "Pod") void loadPodStats(ctx, ns);
         if (rt.group === "" && rt.kind === "Node") void loadNodeStats(ctx);
         void startWatch(
@@ -3622,18 +4264,18 @@ function App() {
         );
       }
     } catch (e) {
-      if (active() === ctx) {
+      if (s0.active() === ctx) {
         const msg = String(e);
-        setError(`${rt.kind}: ${msg}`);
+        s0.setError(`${rt.kind}: ${msg}`);
         // An expired token invalidates the whole tab, not just this list.
         if (isAuthError(msg)) {
           setFailed([{ name: ctx, error: msg }]);
           void offerLogin(ctx);
         }
-        setTable(null);
+        s0.setTable(null);
       }
     } finally {
-      if (active() === ctx) setLoading(false);
+      if (s0.active() === ctx) s0.setLoading(false);
     }
   }
 
@@ -3641,26 +4283,32 @@ function App() {
   /// soon as metrics.k8s.io answers, then retries pick up the
   /// requests/limits once the background indexer has them.
   async function loadPodStats(ctx: string, ns: string | null) {
+    // Stats belong to pane #0 (the primary machinery), never P().
+    const s0 = panes[0];
+    const stillPod = () =>
+      s0.active() === ctx &&
+      s0.selected()?.group === "" &&
+      s0.selected()?.kind === "Pod";
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
         const stats = await invoke<PodStat[]>("pod_stats", {
           context: ctx,
           namespace: ns,
         });
-        if (active() !== ctx || !isPod()) return;
+        if (!stillPod()) return;
         const hasReq = stats.some((s) => s.cpu_r || s.cpu_l || s.mem_r || s.mem_l);
         // Set on the first pass (live CPU/MEM) and once requests/limits
         // land; skip the noisy intermediate re-sets that would rebuild all
         // 24k display rows just for jittering live values.
         if (attempt === 0 || hasReq) {
-          setPodStats(new Map(stats.map((s) => [s.key, s])));
+          s0.setPodStats(new Map(stats.map((s) => [s.key, s])));
         }
         if (hasReq) return;
       } catch {
         return; // metrics-server not installed — columns just stay off
       }
       await new Promise((r) => setTimeout(r, 800));
-      if (active() !== ctx || !isPod()) return;
+      if (!stillPod()) return;
     }
   }
 
@@ -3670,16 +4318,32 @@ function App() {
     await select(t);
     await showDetail(null, node);
   }
+  /// Karpenter: the nodes a NodePool has provisioned all carry its label.
+  async function jumpToNodesForPool(pool: string) {
+    const t = types().find((x) => x.group === "" && x.kind === "Node");
+    if (!t) return;
+    await select(t, `label:karpenter.sh/nodepool=${pool}`);
+  }
 
   /// Enter on a namespace scopes the app to it and shows its pods —
   /// the manifest is still one `e`/`y` away.
-  async function enterNamespace(name: string) {
+  // Scope the view to a namespace and open one of its kinds. Reachable from a
+  // Namespace's detail "related" list, so entering a namespace is a choice
+  // (Pods / Deployments / …), not the only thing a namespace can do.
+  async function enterNamespaceKind(ns: string, kind: string, group = "") {
     const st = tabCache.get(active()!);
-    if (st) st.namespace = name;
-    setNamespace(name);
-    const pod = types().find((t) => t.group === "" && t.kind === "Pod");
-    if (pod) await select(pod);
+    if (st) st.namespace = ns;
+    setNamespace(ns);
+    const t = types().find((x) => x.group === group && x.kind === kind);
+    if (t) await select(t);
   }
+  // The kinds offered on a Namespace's detail, most-wanted first.
+  const NS_KINDS: { kind: string; group: string }[] = [
+    { kind: "Pod", group: "" },
+    { kind: "Deployment", group: "apps" },
+    { kind: "Service", group: "" },
+    { kind: "Event", group: "" },
+  ];
 
   async function jumpToRef(inv: RefLink) {
     const t = types().find((x) => x.kind === inv.kind);
@@ -3909,44 +4573,45 @@ function App() {
   }
 
   async function refreshList() {
-    const rt = selected();
-    const ctx = active();
+    // Pane #0's list refresh — bound to panes[0], not P(), so a background
+    // RESYNC while the other pane is focused can't overwrite it.
+    const s0 = panes[0];
+    const rt = s0.selected();
+    const ctx = s0.active();
     if (!rt || !ctx) return;
+    const fsel = () => {
+      const f = s0.fieldSel();
+      return f && f.key === typeKey(rt) ? f.selector : null;
+    };
     try {
-      const ns = rt.namespaced && namespace() ? namespace() : null;
+      const ns = rt.namespaced && s0.namespace() ? s0.namespace() : null;
       const seq = ++listSeq;
       const chan = new Channel<{ rows: TableRow[]; done: boolean }>();
       chan.onmessage = (page) => {
         if (seq !== listSeq) return;
-        setTable((prev) =>
+        s0.setTable((prev) =>
           prev ? { ...prev, rows: [...prev.rows, ...page.rows] } : prev,
         );
-        setStreaming(!page.done);
+        s0.setStreaming(!page.done);
       };
       const t = await invoke<ResourceTable>("list_resources", {
         context: ctx,
         resource: rt,
         namespace: ns,
-        fieldSelector: activeFieldSel(),
+        fieldSelector: fsel(),
         channel: chan,
       });
-      setStreaming(t.truncated);
-      if (active() === ctx && selected() === rt) {
-        setTable(t);
-        void startWatch(
-          ctx,
-          rt,
-          ns,
-          activeFieldSel(),
-          t.resource_version,
-          t.include,
-        );
+      s0.setStreaming(t.truncated);
+      if (s0.active() === ctx && s0.selected() === rt) {
+        s0.setTable(t);
+        void startWatch(ctx, rt, ns, fsel(), t.resource_version, t.include);
         // indices into the old rows are meaningless now
-        setMatched(null);
-        if (rowFilter().trim()) onRowFilterInput(rowFilter());
+        s0.setMatched(null);
+        if (focusedPaneIdx() === 0 && s0.rowFilter().trim())
+          onRowFilterInput(s0.rowFilter());
       }
     } catch (e) {
-      setError(String(e));
+      s0.setError(String(e));
     }
   }
 
@@ -4593,20 +5258,6 @@ function App() {
   // columns menu lists so you can reorder by dragging its rows.
   const allColsOrdered = createMemo(() => applyColOrder(baseRows().cols));
 
-  const colWidths = createMemo(() => {
-    const b = baseRows();
-    const idxOf = new Map(b.cols.map((c, i) => [c, i] as const));
-    const sample = b.rows.slice(0, 600);
-    return displayCols().map((c) => {
-      const bi = idxOf.get(c) ?? -1;
-      let max = c.length + 2;
-      for (const r of sample) {
-        const len = bi >= 0 ? (r.cells[bi]?.length ?? 0) : 0;
-        if (len > max) max = len;
-      }
-      return Math.min(Math.max(max * 7.4 + 28, 76), 460);
-    });
-  });
 
   /// Filter, then sort, then drop hidden columns. Only this part runs
   /// per keystroke, and it works on already-built rows.
@@ -4736,15 +5387,8 @@ function App() {
   });
 
   /// Row count for the header badge — the filtered set lives in view().
-  const rowCount = createMemo(() => view().rows.length);
   // DaemonSet pods in an all-namespaces pod list — shown in the badge so
   // it's clear why the count is huge and where those rows went (bottom).
-  const dsCount = createMemo(() => {
-    if (!isPod() || namespace()) return 0;
-    let n = 0;
-    for (const r of view().rows) if (r.row.owner_kind === "DaemonSet") n++;
-    return n;
-  });
 
   /// Final display model: server columns + injected Namespace, live
   /// metric columns for pods, AZ for nodes — then column sorting.
@@ -4772,20 +5416,9 @@ function App() {
     setRowH(Math.min(ROW_H_MAX, Math.max(ROW_H_MIN, rowH() + d)));
   const HEADER_H = 30;
   const OVERSCAN = 8;
-  const [scrollTop, setScrollTop] = createSignal(0);
-  const [viewH, setViewH] = createSignal(600);
+  const viewH = () => P().viewH();
 
-  const windowRange = createMemo(() => {
-    const total = view().rows.length;
-    const first = Math.max(0, Math.floor(scrollTop() / rowH()) - OVERSCAN);
-    const visible = Math.ceil(viewH() / rowH()) + OVERSCAN * 2;
-    return { first, last: Math.min(total, first + visible), total };
-  });
 
-  const windowRows = createMemo(() => {
-    const { first, last } = windowRange();
-    return view().rows.slice(first, last);
-  });
 
   /// Keep the cursor row inside the viewport without needing it to be
   /// in the DOM.
@@ -4800,7 +5433,7 @@ function App() {
   }
 
   function scrollColIntoView(i: number) {
-    document
+    focusedPaneRoot()
       .querySelector(`th[data-col="${i}"]`)
       ?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
   }
@@ -5618,6 +6251,84 @@ function App() {
       toggleSidebar();
       return;
     }
+    // Split view (tmux-style): ⌘\ toggles, ⌘←/→ move focus between panes.
+    if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
+      e.preventDefault();
+      toggleSplit();
+      return;
+    }
+    if (split() && (e.metaKey || e.ctrlKey) && e.key === "ArrowRight") {
+      e.preventDefault();
+      setFocusedPane("secondary");
+      return;
+    }
+    if (split() && (e.metaKey || e.ctrlKey) && e.key === "ArrowLeft") {
+      e.preventDefault();
+      setFocusedPane("primary");
+      return;
+    }
+    // Run off the edge, tmux-style: → from the primary pans its columns
+    // right and, only once fully scrolled, crosses into the secondary; ← from
+    // the secondary pans left (revealing the name column) and crosses back at
+    // the left edge. ⌘←/⌘→ jump across instantly without this. The scroll
+    // element is the focused pane's table (tableFocusRef is kept in sync).
+    if (
+      split() &&
+      focusedPane() === "primary" &&
+      e.key === "ArrowRight" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !e.shiftKey &&
+      pane() === "table" &&
+      !customView() &&
+      !detailKey()
+    ) {
+      e.preventDefault();
+      const el = tableFocusRef;
+      if (!el || el.scrollLeft + el.clientWidth >= el.scrollWidth - 2)
+        setFocusedPane("secondary");
+      else el.scrollBy({ left: 260, behavior: "auto" });
+      return;
+    }
+    if (
+      split() &&
+      focusedPane() === "secondary" &&
+      e.key === "ArrowLeft" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !e.shiftKey &&
+      pane() === "table" &&
+      !customView() &&
+      !detailKey()
+    ) {
+      e.preventDefault();
+      const el = tableFocusRef;
+      if (!el || el.scrollLeft <= 0) setFocusedPane("primary");
+      else el.scrollBy({ left: -260, behavior: "auto" });
+      return;
+    }
+    // The Issues view is a list, not a table — give it real keyboard nav
+    // (j/k or ↑/↓ to move, Enter to jump to the resource). Mouse-free.
+    if (customView() === "issues" && !typing && !cmdOpen() && !helpOpen()) {
+      if (e.key === "ArrowDown" || e.key === "j") {
+        e.preventDefault();
+        moveIssueCursor(1);
+        return;
+      }
+      if (e.key === "ArrowUp" || e.key === "k") {
+        e.preventDefault();
+        moveIssueCursor(-1);
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const it = issues()[issueIdx()];
+        if (it) void gotoIssue(it);
+        return;
+      }
+    }
     // Same escapes as inside xterm, for when focus sits elsewhere.
     if ((e.ctrlKey && e.key === "]") || (e.metaKey && e.key === "ArrowUp")) {
       e.preventDefault();
@@ -5934,14 +6645,20 @@ function App() {
     // The sidebar is the top of the hierarchy: when it has focus the
     // arrows walk kinds and Enter drops into the table.
     if (pane() === "sidebar" && !detailKey()) {
+      // sideIdx === -1 parks the cursor on the Issues button that sits above
+      // the kind list, so ↑ off the first kind reaches it (and ↓ / Enter
+      // behave from there). It only exists when there are open clusters.
+      const hasIssuesBtn = tabs().length > 0;
       if (e.key === "j" || e.key === "ArrowDown") {
         e.preventDefault();
-        moveSidebar(1);
+        if (sideIdx() === -1) setSideIdx(0);
+        else moveSidebar(1);
         return;
       }
       if (e.key === "k" || e.key === "ArrowUp") {
         e.preventDefault();
-        moveSidebar(-1);
+        if (sideIdx() === 0 && hasIssuesBtn) setSideIdx(-1);
+        else if (sideIdx() > 0) moveSidebar(-1);
         return;
       }
       if (e.key === "g") {
@@ -5961,7 +6678,8 @@ function App() {
       }
       if (e.key === "Enter" || e.key === "ArrowRight" || e.key === "l") {
         e.preventDefault();
-        enterSidebarItem();
+        if (sideIdx() === -1) openIssues();
+        else enterSidebarItem();
         return;
       }
       // typing a kind name is the fastest way through a long sidebar
@@ -5992,12 +6710,21 @@ function App() {
       const scroll = (dy: number) => body?.scrollBy({ top: dy, behavior: "auto" });
       if (!e.shiftKey && (e.key === "j" || e.key === "ArrowDown")) {
         e.preventDefault();
-        movePanel(1);
+        // The related list is stacked vertically, so ↓/↑ walks its items
+        // (then falls through to the next section at the end) — → / ← still
+        // work too, but ↓ is what you reach for on a vertical list.
+        if (
+          panelSec() === "related" &&
+          actionIdx() < rowItems("related").length - 1
+        )
+          moveWithinRow(1);
+        else movePanel(1);
         return;
       }
       if (!e.shiftKey && (e.key === "k" || e.key === "ArrowUp")) {
         e.preventDefault();
-        movePanel(-1);
+        if (panelSec() === "related" && actionIdx() > 0) moveWithinRow(-1);
+        else movePanel(-1);
         return;
       }
       if (e.key === "Enter") {
@@ -6179,7 +6906,12 @@ function App() {
       }
     }
     // Shift+←/→ walks the column cursor, Shift+↑/↓ sets the direction.
-    if (e.shiftKey && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
+    if (
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      (e.key === "ArrowRight" || e.key === "ArrowLeft")
+    ) {
       const n = view().cols.length;
       if (n) {
         e.preventDefault();
@@ -6191,7 +6923,12 @@ function App() {
       }
       return;
     }
-    if (e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+    if (
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      (e.key === "ArrowUp" || e.key === "ArrowDown")
+    ) {
       if (sortCol() === null && view().cols.length) setSortCol(0);
       if (sortCol() !== null) {
         e.preventDefault();
@@ -6340,8 +7077,7 @@ function App() {
       const vr = view().rows[cursor()];
       if (vr) {
         e.preventDefault();
-        if (kindIs("", "Namespace")) void enterNamespace(vr.row.name);
-        else void openDetail(vr.row);
+        void openDetail(vr.row);
       }
     } else if (e.key === "l") {
       const vr = view().rows[cursor()];
@@ -6488,8 +7224,15 @@ function App() {
         fav: isFav(t),
       }}
       onClick={() => {
-        setPane("table");
         setSideIdx(Math.max(sidebarItems().indexOf(t), 0));
+        // With the split open, the sidebar drives whichever pane has focus.
+        if (split() && focusedPane() === "secondary") {
+          const st =
+            sTypes().find((x) => x.kind === t.kind && x.group === t.group) ?? t;
+          void sSelect(st);
+          return;
+        }
+        setPane("table");
         select(t);
       }}
     >
@@ -6932,6 +7675,30 @@ function App() {
       <Show when={settingsOpen()}>{settingsPanel()}</Show>
     </div>
   );
+
+  /// The cross-cluster Issues panel — problem resources grouped by cluster.
+
+  function startPaneResize(e: MouseEvent) {
+    e.preventDefault();
+    const main = (e.currentTarget as HTMLElement).closest(
+      ".content",
+    ) as HTMLElement | null;
+    if (!main) return;
+    const onMove = (m: MouseEvent) => {
+      const rect = main.getBoundingClientRect();
+      const pct = ((rect.right - m.clientX) / rect.width) * 100;
+      setSecWidth(Math.min(75, Math.max(20, pct)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      persist(); // remember the pane split ratio
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  /// The second live pane — its own context/kind/namespace/table/detail.
 
   // Shown at launch while last session's tabs reconnect — a calm splash so
   // the launcher's context picker never flashes before the tabs appear.
@@ -7459,6 +8226,22 @@ function App() {
         <span class="badge">
           <Show when={active()}>{types().length} kinds</Show>
         </span>
+        {/* Global split toggle — split is two fully independent panes now,
+            so it lives here, not gated behind picking a kind on the left. */}
+        <Show when={active()}>
+          <button
+            class="icon-btn split-toggle"
+            classList={{ on: split() }}
+            title={
+              split()
+                ? "close split view (⌘\\)"
+                : "split into two independent panes (⌘\\)"
+            }
+            onClick={() => toggleSplit()}
+          >
+            <img class="split-ico" src={splitUrl} alt="" />
+          </button>
+        </Show>
         {/* Always here, not only on an error banner: the moment you need
             it most is while a connection is still hanging on a stale
             credential, and that moment has no banner yet. */}
@@ -7616,6 +8399,24 @@ function App() {
             </Show>
           </div>
           <div class="tree">
+            <Show when={tabs().length > 0}>
+              <div class="group views-group">
+                <button
+                  class="kind view-kind"
+                  classList={{
+                    cur: customView() === "issues",
+                    "kbd-cur": pane() === "sidebar" && sideIdx() === -1,
+                  }}
+                  title="problem resources (failing/pending pods, NotReady nodes) across every open cluster"
+                  onClick={openIssues}
+                >
+                  ⚠ Issues
+                  <Show when={issues().length}>
+                    <span class="view-count">{issues().length}</span>
+                  </Show>
+                </button>
+              </div>
+            </Show>
             <Show when={forwards().length > 0}>
               <div class="group pf-group">
                 <div class="group-name section pf-head">
@@ -7804,11 +8605,703 @@ function App() {
 
         <main
           class="content"
+          classList={{ split: split() }}
           onClick={() => detailKey() && closeDetail()}
         >
+          <For each={activePanes()}>
+            {(paneStore, paneI) => {
+      // ── per-pane rebind prelude: bind bare names to THIS pane's store S
+      const S = paneStore;
+      // Register a DOM element for THIS pane; bumping refGen re-syncs the
+      // App-scope refs when the focused pane's element (re)mounts.
+      const pi = paneI();
+      const regEl = (key: string) => (el: HTMLElement | undefined) => {
+        paneEls[pi][key] = el;
+        setRefGen((n) => n + 1);
+      };
+      onCleanup(() => {
+        paneROs[pi]?.disconnect();
+        paneROs[pi] = undefined;
+        paneEls[pi] = {};
+        setRefGen((n) => n + 1);
+      });
+      const active = () => S.active();
+      const podStats = () => S.podStats();
+      const nodeStats = () => S.nodeStats();
+      const customView = () => S.customView();
+      const indexing = () => S.indexing();
+      const deepReady = () => S.deepReady();
+      const events = () => S.events();
+      const nodePods = () => S.nodePods();
+      const nodePodsLoading = () => S.nodePodsLoading();
+      const nodePodsErr = () => S.nodePodsErr();
+      const colFilters = () => S.colFilters();
+      const colNumFilters = () => S.colNumFilters();
+      const error = () => S.error();
+      const types = () => S.types();
+      const namespace = () => S.namespace();
+      const selected = () => S.selected();
+      const table = () => S.table();
+      const streaming = () => S.streaming();
+      const live = () => S.live();
+      const loading = () => S.loading();
+      const rowFilter = () => S.rowFilter();
+      const matched = () => S.matched();
+      const sortCol = () => S.sortCol();
+      const sortDir = () => S.sortDir();
+      const cursor = () => S.cursor();
+      const setCursor = S.setCursor;
+      const marked = () => S.marked();
+      const setMarked = S.setMarked;
+      const detail = () => S.detail();
+      const detailKey = () => S.detailKey();
+      // Bound so this pane's activePane()/activeFieldSel() read ITS OWN
+      // sidebar/table state and field selector, not the focused pane's.
+      const pane = () => S.pane();
+      const fieldSel = () => S.fieldSel();
+      const detailLoading = () => S.detailLoading();
+      const yamlText = () => S.yamlText();
+      const setYamlText = S.setYamlText;
+      const scrollTop = () => S.scrollTop();
+      const setScrollTop = S.setScrollTop;
+      const viewH = () => S.viewH();
+      const setViewH = S.setViewH;
+      // per-pane caches (shadow module-level)
+      let dispCache = new Map<TableRow, DisplayRow>();
+      let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
+      let dispCacheCustom: Map<string, Record<string, string>> | null = null;
+      let dispCacheCcols: { name: string; path: string }[] | null = null;
+      // Per-pane kind/field/region predicates. These derive from this
+      // pane's selected()/fieldSel()/pane()/detailKey() (rebound above), so
+      // each pane's row ordering, Related links, action buttons and chips
+      // reflect ITS OWN resource — not the focused pane's.
+      const kindIs = (group: string, kind: string) => {
+        const s = selected();
+        return s?.group === group && s?.kind === kind;
+      };
+      const isNode = () => kindIs("", "Node");
+      const isPod = () => kindIs("", "Pod");
+      const isEvent = () => kindIs("", "Event");
+      const canEdit = () => !isEvent() && !!selected()?.editable;
+      const scalable = () =>
+        kindIs("apps", "Deployment") ||
+        kindIs("apps", "StatefulSet") ||
+        kindIs("apps", "ReplicaSet") ||
+        kindIs("argoproj.io", "Rollout");
+      const restartable = () =>
+        kindIs("apps", "Deployment") ||
+        kindIs("apps", "StatefulSet") ||
+        kindIs("apps", "DaemonSet");
+      const hasWorkloadLogs = () =>
+        kindIs("apps", "Deployment") ||
+        kindIs("apps", "StatefulSet") ||
+        kindIs("apps", "DaemonSet") ||
+        kindIs("apps", "ReplicaSet") ||
+        kindIs("batch", "Job") ||
+        kindIs("argoproj.io", "Rollout") ||
+        kindIs("", "Service");
+      const activeFieldSel = () => {
+        const f = fieldSel();
+        const s = selected();
+        return f && s && f.key === typeKey(s) ? f.selector : null;
+      };
+      const activePane = (): "sidebar" | "table" | "detail" | "terminal" =>
+        termDockFocused() && shells().length > 0 && !termMin()
+          ? "terminal"
+          : detailKey()
+            ? "detail"
+            : pane();
+      // per-pane derived (copied; bare refs resolve to the rebinds above)
+      const colKey = () => (selected() ? typeKey(selected()!) : "");
+      const applyColOrder = (shown: string[]): string[] => {
+        const ord = colOrder()[colKey()];
+        if (!ord || !ord.length) return shown;
+        const set = new Set(shown);
+        const front = ord.filter((c) => set.has(c));
+        const seen = new Set(front);
+        return [...front, ...shown.filter((c) => !seen.has(c))];
+      };
+      const myCustomCols = () => customCols()[colKey()] ?? NO_CUSTOM_COLS;
+      const widePriority = createMemo(() => {
+        const t = table();
+        const m = new Set<string>();
+        for (const c of t?.columns ?? []) if (c.priority > 0) m.add(c.name);
+        return m;
+      });
+      const hiddenFor = createMemo(() => {
+        const saved = hiddenCols()[colKey()];
+        if (saved) return new Set(saved);
+        const t = table();
+        if (!t) return new Set<string>();
+        return new Set(t.columns.filter((c) => c.priority > 0).map((c) => c.name));
+      });
+      const baseRows = createMemo(() => {
+        const t = table();
+        const rt = selected();
+        if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
+        let cols = t.columns.map((c) => c.name);
+        if (rt.namespaced) cols = [cols[0], "Namespace", ...cols.slice(1)];
+        const stats = rt.group === "" && rt.kind === "Pod" ? podStats() : null;
+        let statAt = -1;
+        if (stats) {
+          const ri = cols.findIndex((c) => /^restarts$/i.test(c));
+          statAt = ri >= 0 ? ri + 1 : cols.length;
+          cols = [...cols.slice(0, statAt), ...POD_STAT_COLS, ...cols.slice(statAt)];
+        }
+        const nodeView = rt.group === "" && rt.kind === "Node";
+        const nstats = nodeView ? nodeStats() : null;
+        if (nstats) cols = [...cols, ...NODE_STAT_COLS];
+        if (nodeView) cols = [...cols, "AZ"];
+        // User-defined columns, appended last. Label columns read straight
+        // from the row's labels; other paths come from the backend eval.
+        const ccols = myCustomCols();
+        if (ccols.length) cols = [...cols, ...ccols.map((c) => c.name)];
+        const ccolKeys = ccols.map((c) => labelPathKey(c.path));
+        const needBackend = ccolKeys.some((k) => k === null);
+        const cdata = needBackend ? customData() : null;
+        // One object identifies "the stats in play" for the row cache.
+        const activeStats = stats ?? nstats;
+
+        // Reuse the display row for any TableRow object that hasn't
+        // changed identity — a watch flush replaces only touched rows, so
+        // this rebuilds a handful instead of all 24k.
+        const prev =
+          dispCacheStats === activeStats &&
+          dispCacheCustom === cdata &&
+          dispCacheCcols === ccols
+            ? dispCache
+            : null;
+        const rows: DisplayRow[] = t.rows.map((r) => {
+          const hit = prev?.get(r);
+          if (hit) return hit;
+          let cells = r.cells.map((c) => String(c ?? ""));
+          if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+          if (stats) {
+            const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
+            const six = st
+              ? [
+                  fmtCpu(st.cpu),
+                  pct(st.cpu, st.cpu_r),
+                  pct(st.cpu, st.cpu_l),
+                  fmtMem(st.mem),
+                  pct(st.mem, st.mem_r),
+                  pct(st.mem, st.mem_l),
+                ]
+              : ["-", "-", "-", "-", "-", "-"];
+            cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
+          }
+          if (nstats) {
+            const ns = nstats.get(r.name);
+            cells = [
+              ...cells,
+              ns ? fmtCpu(ns.cpu) : "-",
+              ns ? `${ns.cpu_pct}%` : "-",
+              ns ? fmtMem(ns.mem) : "-",
+              ns ? `${ns.mem_pct}%` : "-",
+            ];
+          }
+          if (nodeView) cells = [...cells, zoneOf(r.labels)];
+          if (ccols.length) {
+            const rec = needBackend
+              ? cdata?.get(`${r.namespace ?? ""}/${r.name}`)
+              : undefined;
+            cells = [
+              ...cells,
+              ...ccols.map((c, i) => {
+                const lk = ccolKeys[i];
+                if (lk !== null) return r.labels?.[lk] ?? "";
+                return rec?.[c.path] ?? "";
+              }),
+            ];
+          }
+          const hay = (
+            cells.join(" ") +
+            " " +
+            Object.entries(r.labels)
+              .map(([k, v]) => `${k}=${v}`)
+              .join(" ")
+          ).toLowerCase();
+          return { row: r, cells, hay };
+        });
+        const next = new Map<TableRow, DisplayRow>();
+        for (const d of rows) next.set(d.row, d);
+        dispCache = next;
+        dispCacheStats = activeStats;
+        dispCacheCustom = cdata;
+        dispCacheCcols = ccols;
+        return { cols, rows };
+      });
+      const displayCols = createMemo(() => {
+        const b = baseRows();
+        const hide = hiddenFor();
+        return applyColOrder(
+          hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols,
+        );
+      });
+      const allColsOrdered = createMemo(() => applyColOrder(baseRows().cols));
+      const colWidths = createMemo(() => {
+        const b = baseRows();
+        const idxOf = new Map(b.cols.map((c, i) => [c, i] as const));
+        const sample = b.rows.slice(0, 600);
+        return displayCols().map((c) => {
+          const bi = idxOf.get(c) ?? -1;
+          let max = c.length + 2;
+          for (const r of sample) {
+            const len = bi >= 0 ? (r.cells[bi]?.length ?? 0) : 0;
+            if (len > max) max = len;
+          }
+          return Math.min(Math.max(max * 7.4 + 28, 76), 460);
+        });
+      });
+      const view = createMemo(() => {
+        const b = baseRows();
+        if (!b.rows.length && !b.cols.length)
+          return {
+            cols: [] as string[],
+            allCols: [] as string[],
+            rows: [] as DisplayRow[],
+          };
+
+        const raw = rowFilter().trim();
+        let out: DisplayRow[];
+        if (!raw) {
+          out = b.rows;
+        } else {
+          // Query supports plain substrings, /regex/ tokens, and !negation.
+          // A row survives if it matches on visible fields (name/namespace/
+          // cells/labels) OR the backend full-text index (deep fields), then
+          // must satisfy every regex and no negation. Backend hits arrive
+          // keyed by namespace/name so they stay aligned through reordering.
+          const { poss, res, negs } = parseQuery(raw);
+          const extra = matched();
+          const passExtra = (h: string) =>
+            res.every((re) => re.test(h)) && !negs.some((n) => h.includes(n));
+          const nameHit = (r: DisplayRow) =>
+            poss.every((x) => r.row.name.toLowerCase().includes(x));
+          const visibleHit = (r: DisplayRow) =>
+            poss.every((x) => r.hay.includes(x)) && passExtra(r.hay);
+          const deepHit = (r: DisplayRow) =>
+            (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r.hay);
+          out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
+          // Rank by why it matched: name first, then other visible fields,
+          // then deep-field-only hits (which the user can't see, so they'd
+          // otherwise look like noise flooding out the real matches).
+          const sc0 = sortCol();
+          if (sc0 === null) {
+            const rankOf = (r: DisplayRow) =>
+              nameHit(r) ? 0 : visibleHit(r) ? 1 : 2;
+            out = out
+              .map((r, i) => [r, rankOf(r), i] as const)
+              .sort((a, z) => a[1] - z[1] || a[2] - z[2])
+              .map(([r]) => r);
+          }
+        }
+
+        // Per-column value filters (AND across columns). Keyed by column
+        // name; map to the cell index in the full (pre-hide) column list.
+        const cfs = colFilters();
+        const activeCF = Object.entries(cfs)
+          .filter(([, s]) => s.size > 0)
+          .map(([name, set]) => [b.cols.indexOf(name), set] as const)
+          .filter(([ci]) => ci >= 0);
+        if (activeCF.length) {
+          out = out.filter((r) =>
+            activeCF.every(([ci, set]) => set.has(r.cells[ci] ?? "")),
+          );
+        }
+        // Numeric comparison filters (>, ≥, <, ≤, =). A cell with no number
+        // (n/a, -) never satisfies a numeric filter.
+        const activeNF = Object.entries(colNumFilters())
+          .map(([name, f]) => [b.cols.indexOf(name), f] as const)
+          .filter(([ci]) => ci >= 0);
+        if (activeNF.length) {
+          out = out.filter((r) =>
+            activeNF.every(([ci, f]) => {
+              const n = cellNum(r.cells[ci] ?? "");
+              if (n === null) return false;
+              return f.op === ">"
+                ? n > f.val
+                : f.op === ">="
+                  ? n >= f.val
+                  : f.op === "<"
+                    ? n < f.val
+                    : f.op === "<="
+                      ? n <= f.val
+                      : n === f.val;
+            }),
+          );
+        }
+
+        // The sort index comes from the DISPLAYED columns (thead iterates
+        // view().cols), but cells here are still the full base set — map the
+        // displayed index back to the base-cells index by column name, or
+        // hiding/reordering a column would sort a different one.
+        const shownCols = displayCols();
+        const sc = sortCol();
+        const sortIdx =
+          sc !== null && sc >= 0 && sc < shownCols.length
+            ? b.cols.indexOf(shownCols[sc])
+            : -1;
+        if (sortIdx >= 0) {
+          const dir = sortDir();
+          out = [...out].sort((x, y) => {
+            const av = x.cells[sortIdx] ?? "";
+            const bv = y.cells[sortIdx] ?? "";
+            // Blanks (n/a, -, <none>, empty) always sink, so a descending
+            // sort doesn't float the not-yet-loaded / metric-less rows to top.
+            const ab = isBlankCell(av);
+            const bb = isBlankCell(bv);
+            if (ab || bb) return ab && bb ? 0 : ab ? 1 : -1;
+            return cmpCells(av, bv) * dir;
+          });
+        } else if (isPod() && !namespace()) {
+          // Default order for an all-namespaces pod list: sink DaemonSet pods
+          // (ebs-csi-node, kube-proxy, log/metrics agents — one per node, so
+          // thousands of them) to the bottom so the workloads you actually
+          // care about sit on top. A real column sort overrides this.
+          out = out
+            .map((r, i) => [r, r.row.owner_kind === "DaemonSet" ? 1 : 0, i] as const)
+            .sort((a, z) => a[1] - z[1] || a[2] - z[2])
+            .map(([r]) => r);
+        }
+
+        // Fast path: nothing hidden and order unchanged → ship base cells.
+        const identity =
+          shownCols.length === b.cols.length &&
+          shownCols.every((c, i) => c === b.cols[i]);
+        if (identity) return { cols: b.cols, allCols: b.cols, rows: out };
+        const keepIdx = shownCols.map((c) => b.cols.indexOf(c));
+        return {
+          cols: shownCols,
+          allCols: b.cols,
+          rows: out.map((r) => ({ ...r, cells: keepIdx.map((i) => r.cells[i]) })),
+        };
+      });
+      const rowCount = createMemo(() => view().rows.length);
+      const dsCount = createMemo(() => {
+        if (!isPod() || namespace()) return 0;
+        let n = 0;
+        for (const r of view().rows) if (r.row.owner_kind === "DaemonSet") n++;
+        return n;
+      });
+      const windowRange = createMemo(() => {
+        const total = view().rows.length;
+        const first = Math.max(0, Math.floor(scrollTop() / rowH()) - OVERSCAN);
+        const visible = Math.ceil(viewH() / rowH()) + OVERSCAN * 2;
+        return { first, last: Math.min(total, first + visible), total };
+      });
+      const windowRows = createMemo(() => {
+        const { first, last } = windowRange();
+        return view().rows.slice(first, last);
+      });
+      const labelEntries = createMemo(() => {
+        const m = new Map<string, string>();
+        for (const r of table()?.rows ?? []) {
+          for (const [k, v] of Object.entries(r.labels ?? {})) {
+            if (v && !m.has(k)) m.set(k, v);
+          }
+        }
+        return m;
+      });
+      const pickables = createMemo<
+        { name: string; path: string; kind: "label" | "field"; val: string }[]
+      >(() => {
+        const out: {
+          name: string;
+          path: string;
+          kind: "label" | "field";
+          val: string;
+        }[] = [];
+        for (const [k, v] of [...labelEntries()].sort((a, z) =>
+          a[0].localeCompare(z[0]),
+        ))
+          out.push({
+            name: labelShort(k),
+            path: `.metadata.labels['${k}']`,
+            kind: "label",
+            val: v,
+          });
+        for (const [p, v] of fieldEntries())
+          out.push({ name: pathShort(p), path: p, kind: "field", val: v });
+        return out;
+      });
+      const colMenuData = createMemo<{
+        values: [string, number][];
+        overflow: boolean;
+      }>(() => {
+        const name = colMenu();
+        if (!name) return { values: [], overflow: false };
+        const b = baseRows();
+        const ci = b.cols.indexOf(name);
+        if (ci < 0) return { values: [], overflow: false };
+        const counts = new Map<string, number>();
+        let overflow = false;
+        for (const r of b.rows) {
+          const v = r.cells[ci] ?? "";
+          const cur = counts.get(v);
+          if (cur === undefined) {
+            if (counts.size >= COL_VALUE_CAP) {
+              overflow = true;
+              break; // too many distinct — bail before it freezes
+            }
+            counts.set(v, 1);
+          } else counts.set(v, cur + 1);
+        }
+        if (overflow) return { values: [], overflow: true };
+        const q = colMenuQ().toLowerCase().trim();
+        return {
+          values: [...counts.entries()]
+            .filter(([v]) => !q || v.toLowerCase().includes(q))
+            .sort((a, z) => cmpCells(a[0], z[0])),
+          overflow: false,
+        };
+      });
+      const markedTargets = createMemo<Target[]>(() => {
+        const keys = marked();
+        if (!keys.size) return [];
+        return view()
+          .rows.map((vr) => vr.row)
+          .filter((r) => keys.has(rowKeyOf(r)))
+          .map((r) => ({ namespace: r.namespace, name: r.name }));
+      });
+      const issueClusters = createMemo(() => {
+        const by = new Map<string, Issue[]>();
+        for (const i of issues()) {
+          if (!by.has(i.context)) by.set(i.context, []);
+          by.get(i.context)!.push(i);
+        }
+        const order = new Map(tabs().map((t, i) => [t, i]));
+        return [...by.entries()]
+          .sort((a, z) => (order.get(a[0]) ?? 0) - (order.get(z[0]) ?? 0))
+          .map(([context, items]) => ({ context, items }));
+      });
+      const nodePodCols = createMemo(() => {
+        const t = nodePods();
+        if (!t) return [] as { c: ColumnDef; i: number }[];
+        return t.columns
+          .map((c, i) => ({ c, i }))
+          .filter(({ c }) => c.priority === 0);
+      });
+      const podForwards = createMemo(() => {
+        const d = detail();
+        if (!d) return [] as PfInfo[];
+        return forwards().filter(
+          (f) => f.pod === d.name && f.namespace === (d.namespace ?? ""),
+        );
+      });
+      const relatedItems = createMemo<RelatedItem[]>(() => {
+        const d = detail();
+        if (!d) return [];
+        const served = (kind: string) => types().some((t) => t.kind === kind);
+        const out: RelatedItem[] = [];
+        // Event → the object it is about.
+        if (isEvent() && d.involved && served(d.involved.kind))
+          out.push({
+            kind: d.involved.kind,
+            name: d.involved.name,
+            run: () => void jumpToInvolved(),
+          });
+        // Owner / backing references (named).
+        for (const l of d.links)
+          if (served(l.kind))
+            out.push({ kind: l.kind, name: l.name, run: () => void jumpToRef(l) });
+        // A workload / service → the pods it selects.
+        if (d.has_pod_selector && !isPod() && served("Pod"))
+          out.push({
+            kind: "Pod",
+            note: "selected by this",
+            run: () => void jumpToSelectedPods(),
+          });
+        // Reverse "used by" references (a filtered list, no single name).
+        for (const u of USED_BY[selected()!.kind] ?? [])
+          if (served(u.kind))
+            out.push({
+              kind: u.kind,
+              note: "referencing this",
+              run: () =>
+                void jumpToKindFiltered(
+                  u.kind,
+                  d.name,
+                  d.namespace,
+                  u.field?.(d.name),
+                ),
+            });
+        // A CRD → its served instances.
+        if (kindIs("apiextensions.k8s.io", "CustomResourceDefinition")) {
+          const [plural, ...rest] = d.name.split(".");
+          const t = types().find(
+            (x) => x.plural === plural && x.group === rest.join("."),
+          );
+          if (t)
+            out.push({ kind: t.kind, note: "instances", run: () => void select(t) });
+        }
+        // A Namespace → its own workloads; each link scopes the view to it.
+        if (kindIs("", "Namespace"))
+          for (const nk of NS_KINDS)
+            if (types().some((t) => t.kind === nk.kind && t.group === nk.group))
+              out.push({
+                kind: nk.kind,
+                note: "in this namespace",
+                run: () => void enterNamespaceKind(d.name, nk.kind, nk.group),
+              });
+        // Karpenter: a NodePool provisions Nodes (they carry its label);
+        // a NodeClaim maps to one Node (its status.nodeName).
+        if (kindIs("karpenter.sh", "NodePool") && served("Node"))
+          out.push({
+            kind: "Node",
+            note: "provisioned by this",
+            run: () => void jumpToNodesForPool(d.name),
+          });
+        if (kindIs("karpenter.sh", "NodeClaim") && served("Node")) {
+          const nn = (d.status as { nodeName?: string } | null)?.nodeName;
+          if (nn)
+            out.push({ kind: "Node", name: nn, run: () => void jumpToNode(nn) });
+        }
+        return out;
+      });
+      const drainRemaining = createMemo(() => {
+        const t = nodePods();
+        if (!t) return null;
+        // Evictable = what drain won't skip. DaemonSet pods are skipped (the
+        // DaemonSet controller re-places them, so drain leaves them); mirror
+        // pods are rare and not distinguishable from a row, so this is a
+        // close-enough "still to go" count.
+        const evictable = t.rows.filter((r) => r.owner_kind !== "DaemonSet").length;
+        return { total: t.rows.length, evictable };
+      });
+      const issuesPanel = () => (
+        <Show when={customView() === "issues"}>
+          <div class="content-head">
+            <h2>
+              ⚠ Issues <span class="gv">{tabs().length} clusters</span>
+            </h2>
+            <span class="dim iss-summary">
+              {issues().length} across {issueClusters().length}
+            </span>
+            {/* No refresh button — the sweep runs in the background and this
+                just reports where it is. */}
+            <span class="iss-scan">
+              <Show
+                when={issuesLoading()}
+                fallback={
+                  <Show
+                    when={Object.keys(issueErrors()).length}
+                    fallback={
+                      <span
+                        class="iss-live"
+                        title="kept current in the background"
+                      >
+                        ● live
+                      </span>
+                    }
+                  >
+                    <span
+                      class="iss-warn"
+                      title={Object.entries(issueErrors())
+                        .map(([c, e]) => `${c}: ${e}`)
+                        .join("\n")}
+                    >
+                      ⚠ {Object.keys(issueErrors()).length} unreachable
+                    </span>
+                  </Show>
+                }
+              >
+                <span class="ring-spinner sm" />
+                scanning {tabs().length - issuePending().length}/{tabs().length}…
+              </Show>
+            </span>
+          </div>
+          <div class="iss-body">
+            <Show when={issuesLoading() && !issues().length}>
+              <div class="empty">
+                <span class="ring-spinner" />
+                <p>scanning {tabs().length} clusters…</p>
+              </div>
+            </Show>
+            <For each={issueClusters()}>
+              {(c) => (
+                <div class="iss-group">
+                  <div class="iss-group-head">
+                    <span class="ctx-dot" style={{ "--ctx-hue": ctxHue(c.context) }} />
+                    <span class="iss-group-name">{c.context}</span>
+                    <span class="dim iss-group-count">{c.items.length}</span>
+                  </div>
+                  <table class="iss-table">
+                    <tbody>
+                      <For each={c.items}>
+                        {(i) => (
+                          <tr
+                            class="iss-row"
+                            data-ii={issues().indexOf(i)}
+                            classList={{ cursor: issues()[issueIdx()] === i }}
+                            onClick={() => void gotoIssue(i)}
+                          >
+                            <td>
+                              <div class="iss-line">
+                                <span
+                                  class="iss-badge"
+                                  classList={{ crit: isCritIssue(i.status) }}
+                                >
+                                  {i.status}
+                                </span>
+                                <span class="iss-name">{i.name}</span>
+                                <span class="dim iss-meta">
+                                  {i.kind}
+                                  <Show when={i.namespace}>
+                                    {" · "}
+                                    {i.namespace}
+                                  </Show>
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </For>
+            <For each={Object.entries(issueErrors())}>
+              {([ctx, err]) => (
+                <p class="dim iss-empty">
+                  {ctx === "all" ? "" : `${ctx}: `}
+                  couldn't scan — {err}
+                </p>
+              )}
+            </For>
+            <Show when={!issuesLoading() && !issues().length && !Object.keys(issueErrors()).length}>
+              <p class="dim iss-empty">
+                ✓ no problem resources across {tabs().length} clusters.
+              </p>
+            </Show>
+          </div>
+        </Show>
+      );
+              return (
+                <>
+                  <Show when={paneI() > 0}>
+                    <div class="pane-resize" onMouseDown={startPaneResize} />
+                  </Show>
+                  <div
+                    class="primary-pane"
+                    classList={{
+                      "pane-focused":
+                        !split() || focusedPaneIdx() === paneI(),
+                    }}
+                    style={
+                      split() && paneI() === 1
+                        ? { flex: `0 0 ${secWidth()}%` }
+                        : undefined
+                    }
+                    ref={regEl("pane")}
+                    onMouseDown={() => setFocusedPaneIdx(paneI())}
+                  >
+          {issuesPanel()}
           <Show
-            when={selected()}
+            when={selected() && !customView()}
             fallback={
+              <Show when={!customView()}>
               <div class="empty">
                 <img class="mascot" src={lookUrl} alt="" />
                 <Show when={error() && !active()}>
@@ -7838,10 +9331,21 @@ function App() {
                   </p>
                 </Show>
               </div>
+              </Show>
             }
           >
             <div class="content-head">
               <h2>
+                <Show when={split() && active()}>
+                  <span
+                    class="pane-ctx"
+                    style={{ "--ctx-hue": ctxHue(active()!) }}
+                    title="this pane's context"
+                  >
+                    <span class="ctx-dot" />
+                    {active()}
+                  </span>
+                </Show>
                 {selected()!.kind}
                 <span class="gv">
                   {selected()!.group || "core"}/{selected()!.version}
@@ -7850,7 +9354,7 @@ function App() {
               <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
                 class="search wide"
                 placeholder="search name, labels, any field value…  ( / )"
-                ref={(el) => (rowSearchRef = el)}
+                ref={regEl("search")}
                 value={rowFilter()}
                 onClick={(e) => e.stopPropagation()}
                 onInput={(e) => onRowFilterInput(e.currentTarget.value)}
@@ -7911,7 +9415,7 @@ function App() {
                   title="copy a peye:// link to this exact view — anyone with this cluster opens the same place"
                   onClick={() => void copyShareLink()}
                 >
-                  {sharedCopied() ? (
+                  {sharedCopied() === paneI() ? (
                     "link copied ✓"
                   ) : (
                     <>
@@ -8326,10 +9830,10 @@ function App() {
                   class="table-wrap"
                   tabindex="-1"
                   ref={(el) => {
-                    tableFocusRef = el;
+                    paneEls[pi].table = el;
                     setViewH(el.clientHeight || 600);
-                    tableRO?.disconnect();
-                    tableRO = new ResizeObserver(() => {
+                    paneROs[pi]?.disconnect();
+                    const ro = new ResizeObserver(() => {
                       // Defer to the next frame: measuring + updating state
                       // synchronously inside the callback can re-trigger the
                       // observer in the same frame (the benign "ResizeObserver
@@ -8341,7 +9845,9 @@ function App() {
                         if (h > 0) setViewH(h);
                       });
                     });
-                    tableRO.observe(el);
+                    ro.observe(el);
+                    paneROs[pi] = ro;
+                    setRefGen((n) => n + 1);
                   }}
                   onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
                 >
@@ -8447,9 +9953,7 @@ function App() {
                             onClick={(e) => {
                               e.stopPropagation();
                               setCursor(windowRange().first + k());
-                              if (kindIs("", "Namespace"))
-                                void enterNamespace(vr.row.name);
-                              else void openDetail(vr.row);
+                              void openDetail(vr.row);
                             }}
                           >
                             <For each={vr.cells}>
@@ -8561,7 +10065,7 @@ function App() {
                   title="copy a peye:// link straight to this resource — opens the same place for anyone with the cluster"
                   onClick={() => void copyShareLink()}
                 >
-                  {sharedCopied() ? (
+                  {sharedCopied() === paneI() ? (
                     "link copied ✓"
                   ) : (
                     <>
@@ -8657,53 +10161,9 @@ function App() {
                     {actionBtn("suspend", () => setSuspend(true))}
                     {actionBtn("resume", () => setSuspend(false))}
                   </Show>
-                  <Show when={isEvent() && detail()!.involved}>
-                    {actionBtn(
-                      `${detail()!.involved!.kind.toLowerCase()} →`,
-                      () => void jumpToInvolved(),
-                    )}
-                  </Show>
-                  <span class="act-group links">
-                  <Show when={detail()!.has_pod_selector && !isPod()}>
-                    {actionBtn("pods →", () => void jumpToSelectedPods())}
-                  </Show>
-                  <For each={USED_BY[selected()!.kind] ?? []}>
-                    {(u) => (
-                      <Show when={types().some((t) => t.kind === u.kind)}>
-                        {actionBtn(u.label, () =>
-                          void jumpToKindFiltered(
-                            u.kind,
-                            detail()!.name,
-                            detail()!.namespace,
-                            u.field?.(detail()!.name),
-                          ),
-                        )}
-                      </Show>
-                    )}
-                  </For>
-                  </span>
+                  {/* Navigation (owner/related/used-by) moved to the "related"
+                      section below, which can show names, not just kinds. */}
                   <span class="act-group danger-group">
-                  <Show when={kindIs("apiextensions.k8s.io", "CustomResourceDefinition")}>
-                    {actionBtn("instances →", () => {
-                      // "widgets.example.com" → the Widget list
-                      const [plural, ...rest] = detail()!.name.split(".");
-                      const group = rest.join(".");
-                      const t = types().find(
-                        (x) => x.plural === plural && x.group === group,
-                      );
-                      if (t) void select(t);
-                      else setError(`no served resource for ${detail()!.name}`);
-                    })}
-                  </Show>
-                  <For each={detail()!.links}>
-                    {(l) => (
-                      <Show when={types().some((t) => t.kind === l.kind)}>
-                        {actionBtn(`${l.kind.toLowerCase()} →`, () =>
-                          void jumpToRef(l),
-                        )}
-                      </Show>
-                    )}
-                  </For>
                   <Show when={!isEvent() && selected()!.deletable}>
                   {actionBtn(
                     "delete",
@@ -8764,11 +10224,11 @@ function App() {
                 <Show when={actionErr()}>
                   <div class="apply-err">{actionErr()}</div>
                 </Show>
-                <div class="drawer-body" ref={(el) => (drawerBodyRef = el)}>
+                <div class="drawer-body" ref={regEl("drawerBody")}>
                   <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
                     class="search drawer-find"
                     placeholder="find…"
-                    ref={(el) => (findInputRef = el)}
+                    ref={regEl("find")}
                     value={findQ()}
                     onInput={(e) => setFindQ(e.currentTarget.value)}
                     onKeyDown={(e) => {
@@ -8892,6 +10352,31 @@ function App() {
                       </Show>
                     </div>
                   </Show>
+                  <Show when={relatedItems().length}>
+                    <div
+                      class="psec"
+                      data-sec="related"
+                      classList={{ cur: panelSec() === "related" }}
+                    >
+                      <div class="psec-title">
+                        related
+                        <span class="dim"> ({relatedItems().length})</span>
+                      </div>
+                      <div class="rel-list">
+                        <For each={relatedItems()}>
+                          {(r) => (
+                            <button class="rel-row" onClick={() => r.run()}>
+                              <span class="rel-kind">{r.kind}</span>
+                              <span class="rel-name" title={r.name ?? r.note}>
+                                {r.name ?? r.note ?? ""}
+                              </span>
+                              <span class="rel-arrow">→</span>
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
                   <Show when={detail()!.containers?.length}>
                     <div
                       class="psec"
@@ -8998,7 +10483,7 @@ function App() {
                     <div class="psec" data-sec="anno" classList={{ cur: panelSec() === "anno" }}>
                     <details
                       class="fold"
-                      ref={(el) => (annoFoldRef = el)}
+                      ref={regEl("anno")}
                       open={findMatches(
                         Object.entries(detail()!.annotations)
                           .map(([k, v]) => `${k}=${v}`)
@@ -9029,7 +10514,7 @@ function App() {
                     <div class="psec" data-sec="status" classList={{ cur: panelSec() === "status" }}>
                     <details
                       class="fold"
-                      ref={(el) => (statusFoldRef = el)}
+                      ref={regEl("status")}
                       open={
                         !!findQ().trim() &&
                         subtreeMatches(detail()!.status, findQ().toLowerCase().trim())
@@ -9055,7 +10540,7 @@ function App() {
                           the user can still collapse it with v / Enter / click. */}
                       <details
                         class="fold"
-                        ref={(el) => (eventFoldRef = el)}
+                        ref={regEl("event")}
                         open={true}
                       >
                         <summary class="section-title">
@@ -9323,6 +10808,140 @@ function App() {
             </div>
           </Show>
 
+          <Show when={colMenu()}>
+            <div class="col-menu-backdrop" onClick={() => setColMenu(null)} />
+            <div
+              class="col-menu"
+              style={{
+                left: `${colMenuAt()?.x ?? 0}px`,
+                top: `${colMenuAt()?.y ?? 0}px`,
+              }}
+            >
+              <div class="col-menu-head">
+                filter <b>{colMenu()}</b>
+              </div>
+              <Show
+                when={colIsNumeric(colMenu()!)}
+                fallback={
+                  <Show
+                    when={!colMenuData().overflow}
+                    fallback={
+                      <p class="dim col-num-hint">
+                        Too many distinct values to list ({COL_VALUE_CAP}+).
+                        Click the header to sort, or use the search box above
+                        to narrow the rows.
+                      </p>
+                    }
+                  >
+                    <input
+                      autocomplete="off"
+                      autocorrect="off"
+                      autocapitalize="off"
+                      spellcheck={false}
+                      class="search"
+                      placeholder="filter values…"
+                      ref={(el) => setTimeout(() => el.focus())}
+                      value={colMenuQ()}
+                      onInput={(e) => {
+                        setColMenuQ(e.currentTarget.value);
+                        setColMenuIdx(-1);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setColMenu(null);
+                      }}
+                    />
+                    <div class="col-menu-list">
+                      <For each={colMenuValues()}>
+                        {([val, count], vi) => (
+                          <button
+                            class="ns-item col-val"
+                            classList={{ "kb-cursor": colMenuIdx() === vi() }}
+                            onClick={() => toggleColValue(colMenu()!, val)}
+                          >
+                            <span
+                              class="mark-box"
+                              classList={{
+                                on:
+                                  colFilters()[colMenu()!]?.has(val) ?? false,
+                              }}
+                            />
+                            <span class="col-val-txt">{val || "∅ (empty)"}</span>
+                            <span class="dim col-val-n">{count}</span>
+                          </button>
+                        )}
+                      </For>
+                      <Show when={colMenuValues().length === 0}>
+                        <p class="dim" style={{ padding: "8px 12px" }}>
+                          no values
+                        </p>
+                      </Show>
+                    </div>
+                  </Show>
+                }
+              >
+                {/* Numeric column: compare instead of listing every number. */}
+                <div class="col-num">
+                  <select
+                    class="col-num-op"
+                    value={colNumFilters()[colMenu()!]?.op ?? ">"}
+                    onChange={(e) =>
+                      setColNum(
+                        colMenu()!,
+                        e.currentTarget.value as NumOp,
+                        String(colNumFilters()[colMenu()!]?.val ?? ""),
+                      )
+                    }
+                  >
+                    <option value=">">&gt;</option>
+                    <option value=">=">&ge;</option>
+                    <option value="<">&lt;</option>
+                    <option value="<=">&le;</option>
+                    <option value="=">=</option>
+                  </select>
+                  <input
+                    type="number"
+                    class="search col-num-val"
+                    placeholder="value"
+                    ref={(el) => setTimeout(() => el.focus())}
+                    value={String(colNumFilters()[colMenu()!]?.val ?? "")}
+                    onInput={(e) =>
+                      setColNum(
+                        colMenu()!,
+                        colNumFilters()[colMenu()!]?.op ?? ">",
+                        e.currentTarget.value,
+                      )
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape" || e.key === "Enter")
+                        setColMenu(null);
+                    }}
+                  />
+                </div>
+                <p class="dim col-num-hint">
+                  rows where {colMenu()}{" "}
+                  {colNumFilters()[colMenu()!]?.op ?? ">"} value
+                </p>
+              </Show>
+              <div class="col-menu-foot">
+                <Show when={colHasFilter(colMenu()!)}>
+                  <button
+                    class="btn sm"
+                    onClick={() => clearColFilter(colMenu()!)}
+                  >
+                    clear
+                  </button>
+                </Show>
+                <button class="btn sm" onClick={() => setColMenu(null)}>
+                  done
+                </button>
+              </div>
+            </div>
+          </Show>
+                  </div>
+                </>
+              );
+            }}
+          </For>
           <Show when={cmdOpen()}>
             <div
               class="modal-backdrop top"
@@ -9332,6 +10951,50 @@ function App() {
               }}
             >
               <div class="cmd" onClick={(e) => e.stopPropagation()}>
+                {/* With the split open, say which pane this search drives —
+                    the focused one — so it's never ambiguous. */}
+                <Show when={split()}>
+                  <div class="cmd-target">
+                    {/* A two-pane glyph whose FILLED half is the side you're
+                        on — position, not colour, tells left from right (the
+                        two can share a cluster, so the pane must disambiguate). */}
+                    <span class="cmd-pane">
+                      <svg
+                        class="pane-glyph"
+                        viewBox="0 0 22 14"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          class="pg-cell"
+                          classList={{ on: focusedPaneIdx() === 0 }}
+                          x="0.7"
+                          y="0.7"
+                          width="9.6"
+                          height="12.6"
+                          rx="2"
+                        />
+                        <rect
+                          class="pg-cell"
+                          classList={{ on: focusedPaneIdx() === 1 }}
+                          x="11.7"
+                          y="0.7"
+                          width="9.6"
+                          height="12.6"
+                          rx="2"
+                        />
+                      </svg>
+                      {focusedPaneIdx() === 0 ? "left pane" : "right pane"}
+                    </span>
+                    <span
+                      class="pane-ctx"
+                      style={{ "--ctx-hue": ctxHue(active() ?? "") }}
+                    >
+                      <span class="ctx-dot" />
+                      {active() || "—"}
+                    </span>
+                    <span class="dim">this search stays in this pane</span>
+                  </div>
+                </Show>
                 <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
                   class="cmd-input"
                   placeholder=":pods · deploy api · ns kube-system · ctx dev"
@@ -9705,6 +11368,14 @@ function App() {
                   <b>p</b><span>node ↔ its pods</span>
                   <b>⇧F</b><span>port-forward input (pods)</span>
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
+                  <b class="help-sec">split</b>
+                  <b>⌘\ · ⧉ toolbar</b><span>split into two fully independent live panes — toggle again to close</span>
+                  <b>⌘← · ⌘→</b><span>jump focus between the panes instantly</span>
+                  <b>→ · ←</b><span>pan the columns, then cross at the edge (→ off the left pane, ← off the right)</span>
+                  <b>(each pane)</b><span>search, detail, sort — every shortcut acts on the focused pane</span>
+                  <b class="help-sec">issues</b>
+                  <b>⚠ Issues</b><span>problem resources across every cluster, kept live in the background</span>
+                  <b>j k · ↑ ↓ · ↵</b><span>move between issues · jump to the resource</span>
                   <b class="help-sec">app</b>
                   <b>⌘B · ⌘K</b><span>sidebar collapse · focus kind filter</span>
                   <b>0</b><span>back to all namespaces</span>
@@ -10055,135 +11726,6 @@ function App() {
                   }
                 >
                   add
-                </button>
-              </div>
-            </div>
-          </Show>
-          <Show when={colMenu()}>
-            <div class="col-menu-backdrop" onClick={() => setColMenu(null)} />
-            <div
-              class="col-menu"
-              style={{
-                left: `${colMenuAt()?.x ?? 0}px`,
-                top: `${colMenuAt()?.y ?? 0}px`,
-              }}
-            >
-              <div class="col-menu-head">
-                filter <b>{colMenu()}</b>
-              </div>
-              <Show
-                when={colIsNumeric(colMenu()!)}
-                fallback={
-                  <Show
-                    when={!colMenuData().overflow}
-                    fallback={
-                      <p class="dim col-num-hint">
-                        Too many distinct values to list ({COL_VALUE_CAP}+).
-                        Click the header to sort, or use the search box above
-                        to narrow the rows.
-                      </p>
-                    }
-                  >
-                    <input
-                      autocomplete="off"
-                      autocorrect="off"
-                      autocapitalize="off"
-                      spellcheck={false}
-                      class="search"
-                      placeholder="filter values…"
-                      ref={(el) => setTimeout(() => el.focus())}
-                      value={colMenuQ()}
-                      onInput={(e) => {
-                        setColMenuQ(e.currentTarget.value);
-                        setColMenuIdx(-1);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Escape") setColMenu(null);
-                      }}
-                    />
-                    <div class="col-menu-list">
-                      <For each={colMenuValues()}>
-                        {([val, count], vi) => (
-                          <button
-                            class="ns-item col-val"
-                            classList={{ "kb-cursor": colMenuIdx() === vi() }}
-                            onClick={() => toggleColValue(colMenu()!, val)}
-                          >
-                            <span
-                              class="mark-box"
-                              classList={{
-                                on:
-                                  colFilters()[colMenu()!]?.has(val) ?? false,
-                              }}
-                            />
-                            <span class="col-val-txt">{val || "∅ (empty)"}</span>
-                            <span class="dim col-val-n">{count}</span>
-                          </button>
-                        )}
-                      </For>
-                      <Show when={colMenuValues().length === 0}>
-                        <p class="dim" style={{ padding: "8px 12px" }}>
-                          no values
-                        </p>
-                      </Show>
-                    </div>
-                  </Show>
-                }
-              >
-                {/* Numeric column: compare instead of listing every number. */}
-                <div class="col-num">
-                  <select
-                    class="col-num-op"
-                    value={colNumFilters()[colMenu()!]?.op ?? ">"}
-                    onChange={(e) =>
-                      setColNum(
-                        colMenu()!,
-                        e.currentTarget.value as NumOp,
-                        String(colNumFilters()[colMenu()!]?.val ?? ""),
-                      )
-                    }
-                  >
-                    <option value=">">&gt;</option>
-                    <option value=">=">&ge;</option>
-                    <option value="<">&lt;</option>
-                    <option value="<=">&le;</option>
-                    <option value="=">=</option>
-                  </select>
-                  <input
-                    type="number"
-                    class="search col-num-val"
-                    placeholder="value"
-                    ref={(el) => setTimeout(() => el.focus())}
-                    value={String(colNumFilters()[colMenu()!]?.val ?? "")}
-                    onInput={(e) =>
-                      setColNum(
-                        colMenu()!,
-                        colNumFilters()[colMenu()!]?.op ?? ">",
-                        e.currentTarget.value,
-                      )
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape" || e.key === "Enter")
-                        setColMenu(null);
-                    }}
-                  />
-                </div>
-                <p class="dim col-num-hint">
-                  rows where {colMenu()}{" "}
-                  {colNumFilters()[colMenu()!]?.op ?? ">"} value
-                </p>
-              </Show>
-              <div class="col-menu-foot">
-                <Show when={colHasFilter(colMenu()!)}>
-                  <button
-                    class="btn sm"
-                    onClick={() => clearColFilter(colMenu()!)}
-                  >
-                    clear
-                  </button>
-                </Show>
-                <button class="btn sm" onClick={() => setColMenu(null)}>
-                  done
                 </button>
               </div>
             </div>

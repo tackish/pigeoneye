@@ -9,7 +9,9 @@
     "build": "vite build",
     "serve": "vite preview",
     "tauri": "tauri",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:split": "node scripts/smoke-split.mjs",
+    "smoke:persist": "node scripts/smoke-persist.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
   "private": true,

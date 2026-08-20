@@ -2020,6 +2020,81 @@ th.sorted {
   border-radius: 5px;
 }
 
+/* Command-palette target line: which pane (cluster) the search will drive
+   when the split is open. */
+.cmd-target {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px 0;
+}
+.cmd-target .dim {
+  font-size: 11.5px;
+  margin-left: auto;
+}
+/* The pane badge: a two-cell glyph whose filled half is the side you're on,
+   so left vs right reads by POSITION, not colour, plus a text label. */
+.cmd-pane {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  padding: 4px 11px 4px 8px;
+  border-radius: 7px;
+  color: var(--fg);
+  background: var(--bg2);
+  border: 1px solid var(--accent, #5f64e0);
+}
+.pane-glyph {
+  width: 22px;
+  height: 14px;
+  display: block;
+  flex: none;
+}
+.pane-glyph .pg-cell {
+  fill: none;
+  stroke: var(--dim);
+  stroke-width: 1.4;
+}
+.pane-glyph .pg-cell.on {
+  fill: var(--accent, #5f64e0);
+  stroke: var(--accent, #5f64e0);
+}
+
+/* Per-pane context badge in the split header, so each side says which
+   cluster it's showing. */
+.pane-ctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-right: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+  color: hsl(var(--ctx-hue, 230), 45%, 65%);
+  background: hsl(var(--ctx-hue, 230), 45%, 55%, 0.14);
+  border: 1px solid hsl(var(--ctx-hue, 230), 45%, 55%, 0.35);
+}
+.pane-ctx .ctx-dot {
+  background: hsl(var(--ctx-hue, 230), 55%, 60%);
+}
+.split-toggle .split-ico {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+.split-toggle.on {
+  background: var(--accent, #5f64e0);
+  border-color: var(--accent, #5f64e0);
+}
+.split-toggle.on .split-ico {
+  filter: brightness(1.7);
+}
+
 kbd.key {
   display: inline-block;
   margin-left: 6px;
@@ -2168,6 +2243,462 @@ kbd.key {
   border-left-color: var(--accent);
   background: var(--accent-soft);
   border-radius: 0 4px 4px 0;
+}
+/* Related / containers select INDIVIDUAL rows, so the section itself keeps
+   only its accent edge — a full fill would read as "the whole chunk is
+   selected". The cursored row alone carries the filled selection. */
+.psec[data-sec="related"].cur,
+.psec[data-sec="containers"].cur {
+  background: none;
+}
+.rel-row.btn-cursor {
+  outline: none;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.rel-row.btn-cursor .rel-name {
+  color: var(--fg);
+}
+.rel-row.btn-cursor .rel-arrow {
+  opacity: 1;
+}
+
+/* Related drill-down — owner / backing / used-by resources, as a browsable
+   list that shows the target's name, not just its kind. */
+.rel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 10px;
+}
+.rel-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--fg);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  padding: 4px 8px;
+}
+.rel-row:hover {
+  background: var(--bg-hover);
+  border-color: var(--border);
+}
+.rel-kind {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent);
+  min-width: 88px;
+}
+.rel-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-family: var(--font-mono);
+}
+.rel-row:not(:hover) .rel-name {
+  color: var(--dim);
+}
+.rel-arrow {
+  flex: none;
+  color: var(--dim);
+  opacity: 0;
+}
+.rel-row:hover .rel-arrow {
+  opacity: 1;
+}
+
+/* ── custom-view panels (cross-cluster Issues) ──────── */
+.views-group {
+  margin: 4px 8px 10px;
+}
+/* Issues is an action, not a header — make it read as a selectable button:
+   its own border, hover, a "opens a view" chevron, and a filled selected
+   state. */
+.view-kind {
+  width: auto;
+  font-weight: 600;
+  gap: 6px;
+  padding: 5px 8px 5px 10px;
+  border: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg2);
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+.view-kind::after {
+  content: "›";
+  margin-left: auto;
+  opacity: 0.5;
+  font-size: 15px;
+  font-weight: 700;
+}
+.view-kind:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+.view-kind.cur {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* keyboard cursor parked on Issues (↑ off the first kind) */
+.view-kind.kbd-cur {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.view-kind.cur::after {
+  opacity: 0.9;
+}
+/* count sits just before the chevron, not pushed to the far edge */
+.view-kind .view-count {
+  margin-left: 0;
+}
+.iss-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+}
+.iss-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+.iss-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+.iss-group-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  font-family: var(--font-mono);
+}
+.iss-group-count {
+  margin-left: auto;
+  font-size: 11.5px;
+}
+.iss-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.iss-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.iss-row {
+  cursor: pointer;
+}
+.iss-row:hover {
+  background: var(--bg-hover);
+}
+.iss-row.cursor {
+  background: var(--accent-soft);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.iss-row td {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.iss-row:last-child td {
+  border-bottom: none;
+}
+.view-count {
+  margin-left: auto;
+  font-size: 10px;
+  background: var(--error-bg);
+  color: var(--error-fg);
+  border-radius: 8px;
+  padding: 0 6px;
+  min-width: 16px;
+  text-align: center;
+}
+.iss-summary {
+  font-size: 12px;
+  margin-right: auto;
+}
+/* background-sweep status in the Issues header (no manual refresh button) */
+.iss-scan {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.iss-scan .ring-spinner.sm {
+  width: 12px;
+  height: 12px;
+  border-width: 2px;
+}
+.iss-live {
+  color: var(--ok-fg, #4caf7d);
+  opacity: 0.85;
+}
+.iss-warn {
+  color: var(--warn-fg, #e0a53f);
+  cursor: help;
+}
+.iss-group-head .ctx-dot {
+  flex: none;
+}
+/* One issue row: a bold colored status badge (what's wrong) + name + dim
+   kind/namespace. */
+.iss-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.iss-badge {
+  flex: none;
+  font-weight: 700;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--warn-fg, #e0a53f);
+  background: color-mix(in srgb, var(--warn-fg, #e0a53f) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn-fg, #e0a53f) 40%, transparent);
+  white-space: nowrap;
+}
+.iss-badge.crit {
+  color: var(--error-fg);
+  background: color-mix(in srgb, var(--error-fg) 16%, transparent);
+  border-color: color-mix(in srgb, var(--error-fg) 42%, transparent);
+}
+.iss-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.iss-meta {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+}
+
+/* ── split view (tmux-style two live panes) ─────────── */
+.content.split {
+  flex-direction: row;
+}
+.primary-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+/* the focused pane gets a top accent bar, so a keyboard user always knows
+   which side owns the arrows */
+.content.split .primary-pane.pane-focused::before,
+.sec-pane.pane-focused::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+  z-index: 5;
+}
+.pane-resize {
+  flex: none;
+  width: 5px;
+  cursor: col-resize;
+  background: var(--border);
+}
+.pane-resize:hover {
+  background: var(--accent);
+}
+.sec-pane {
+  flex: 0 0 45%;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+}
+.sec-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.sec-pick {
+  background: var(--bg2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  padding: 3px 6px;
+  max-width: 160px;
+}
+.sec-filter {
+  flex: 1;
+  min-width: 40px;
+  margin: 0;
+}
+.sec-close {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+}
+.sec-close:hover {
+  color: var(--fg);
+}
+.sec-table-wrap {
+  flex: 1;
+  overflow: auto;
+}
+.sec-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.sec-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  background: var(--bg2);
+  color: var(--dim);
+  font-weight: 500;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.sec-row td {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+.sec-row {
+  cursor: pointer;
+}
+.sec-row:hover {
+  background: var(--bg-hover);
+}
+.sec-row.cursor {
+  background: var(--accent-soft);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.sec-row.selected {
+  background: var(--accent-soft);
+}
+.sec-row td.bad {
+  color: var(--error-fg);
+}
+.sec-note,
+.sec-empty {
+  padding: 10px;
+  font-size: 12px;
+}
+.sec-detail {
+  flex: none;
+  max-height: 48%;
+  display: flex;
+  flex-direction: column;
+  border-top: 2px solid var(--border);
+  background: var(--bg-drawer, var(--bg2));
+}
+.sec-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.sec-detail-body {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 10px;
+}
+.sec-dmeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.sec-dmeta b {
+  color: var(--dim);
+  font-weight: 500;
+  margin-right: 3px;
+}
+.sec-dsec {
+  margin-bottom: 8px;
+}
+.sec-dsec-t {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  margin-bottom: 3px;
+}
+.sec-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sec-chip {
+  font-size: 11px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sec-chip.mono {
+  font-family: var(--font-mono);
+}
+.sec-yaml {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-x: auto;
 }
 
 /* Pods on a node — inline mini-list inside the node detail panel, so you
