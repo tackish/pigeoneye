@@ -26,6 +26,7 @@ import rocketUrl from "./assets/svg/pigeon-rocket.svg";
 // "my permissions" mark — pigeon guarding a padlocked shield = access rights.
 import shieldUrl from "./assets/svg/pigeon-shield.svg";
 import splitUrl from "./assets/svg/pigeon-split.svg";
+import gearUrl from "./assets/svg/pigeon-gear.svg";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -5331,11 +5332,44 @@ function App() {
       ?.scrollIntoView?.({ block: "nearest" });
   }
 
-  function enterSidebarItem() {
+  // Enter on a kind LOADS it. With one view it loads straight in; with the
+  // split open it first asks which view (a book-glyph popup, ←/→ to pick).
+  // Plain → just moves focus from the menu into the view without loading.
+  const [kindChooser, setKindChooser] = createSignal<{
+    rt: ResourceType;
+    side: number;
+  } | null>(null);
+  function enterKind() {
     const t = sidebarItems()[sideIdx()];
     if (!t) return;
+    if (split()) setKindChooser({ rt: t, side: focusedPaneIdx() });
+    else {
+      setPane("table");
+      void select(t);
+    }
+  }
+  function confirmKindChooser() {
+    const c = kindChooser();
+    if (!c) return;
+    setKindChooser(null);
+    setFocusedPaneIdx(c.side);
     setPane("table");
-    void select(t);
+    // Remap to the TARGET view's own type registry — the chosen kind came
+    // from whichever view was focused, and the two can be on different
+    // clusters (mirrors the mouse-click path's sTypes() remap).
+    if (c.side === 1) {
+      const st =
+        sTypes().find(
+          (x) => x.kind === c.rt.kind && x.group === c.rt.group,
+        ) ?? c.rt;
+      void sSelect(st);
+    } else {
+      const t =
+        types().find(
+          (x) => x.kind === c.rt.kind && x.group === c.rt.group,
+        ) ?? c.rt;
+      void select(t);
+    }
   }
 
   /// Surface a kind in the sidebar: open the panel, clear any kind
@@ -6490,6 +6524,25 @@ function App() {
       toggleSidebar();
       return;
     }
+    // The "which view?" chooser owns the keyboard while open: ←/→ pick a
+    // side, Enter loads there, Esc cancels.
+    if (kindChooser()) {
+      const c = kindChooser()!;
+      if (e.key === "ArrowLeft" || e.key === "h") {
+        e.preventDefault();
+        setKindChooser({ ...c, side: 0 });
+      } else if (e.key === "ArrowRight" || e.key === "l") {
+        e.preventDefault();
+        setKindChooser({ ...c, side: 1 });
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        confirmKindChooser();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        setKindChooser(null);
+      }
+      return;
+    }
     // Split view (tmux-style): ⌘\ toggles, ⌘←/→ move focus between panes.
     if ((e.metaKey || e.ctrlKey) && e.key === "\\") {
       e.preventDefault();
@@ -6944,10 +6997,19 @@ function App() {
         moveSidebar(pageDir(e) * pageOf(".tree", ".kind"));
         return;
       }
-      if (e.key === "Enter" || e.key === "ArrowRight" || e.key === "l") {
+      // Enter LOADS the kind (asking which view when split). → / l just move
+      // focus into the view — no load — so arrowing off the menu never
+      // re-fetches the list.
+      if (e.key === "Enter") {
         e.preventDefault();
         if (sideIdx() === -1) openIssues();
-        else enterSidebarItem();
+        else enterKind();
+        return;
+      }
+      if (e.key === "ArrowRight" || e.key === "l") {
+        e.preventDefault();
+        if (sideIdx() === -1) openIssues();
+        else setPane("table");
         return;
       }
       // typing a kind name is the fastest way through a long sidebar
@@ -8121,7 +8183,7 @@ function App() {
       fallback={restoring() ? restoreSplash() : launcher()}
     >
     <div class="shell">
-      <header class="topbar">
+      <header class="topbar" data-tauri-drag-region>
         <img class="logo-img" src={logoUrl} alt="PigeonEye" />
         <span class="logo">PigeonEye</span>
         <Show when={appVersion()}>
@@ -8581,11 +8643,11 @@ function App() {
             title={
               split()
                 ? "close split view (⌘\\)"
-                : "split into two independent panes (⌘\\)"
+                : "split into two independent views (⌘\\)"
             }
             onClick={() => toggleSplit()}
           >
-            <img class="split-ico" src={splitUrl} alt="" />
+            <img class="tb-ico" src={splitUrl} alt="" /> split view
           </button>
         </Show>
         {/* Always here, not only on an error banner: the moment you need
@@ -9772,7 +9834,7 @@ function App() {
                     "link copied ✓"
                   ) : (
                     <>
-                      <img class="share-ico" src={rocketUrl} alt="" /> share view
+                      <img class="tb-ico" src={rocketUrl} alt="" /> share view
                     </>
                   )}
                 </button>
@@ -9789,11 +9851,11 @@ function App() {
                 </Show>
                 <div class="cols-picker">
                   <button
-                    class="btn sm"
+                    class="btn sm cols-btn"
                     title="show, hide, reorder and add columns"
                     onClick={() => setColsOpen(!colsOpen())}
                   >
-                    ⚙ Edit columns
+                    <img class="tb-ico" src={gearUrl} alt="" /> columns
                   </button>
                   <Show when={colsOpen()}>
                     <div class="ns-backdrop" onClick={() => setColsOpen(false)} />
@@ -9995,7 +10057,7 @@ function App() {
                     title="what you're allowed to do on this kind (kubectl auth can-i)"
                     onClick={openAccess}
                   >
-                    <img class="perm-ico" src={shieldUrl} alt="" /> permissions
+                    <img class="tb-ico" src={shieldUrl} alt="" /> permissions
                   </button>
                 </Show>
                 {/* Stable count first so its position never moves; the
@@ -10422,7 +10484,7 @@ function App() {
                     "link copied ✓"
                   ) : (
                     <>
-                      <img class="share-ico" src={rocketUrl} alt="" /> share view
+                      <img class="tb-ico" src={rocketUrl} alt="" /> share view
                     </>
                   )}
                 </button>
@@ -11301,6 +11363,56 @@ function App() {
               );
             }}
           </For>
+          <Show when={kindChooser()}>
+            <div
+              class="modal-backdrop top"
+              onClick={() => setKindChooser(null)}
+            >
+              <div class="kind-chooser" onClick={(e) => e.stopPropagation()}>
+                <div class="kc-eyebrow">split view</div>
+                <div class="kc-title">
+                  open <b>{kindChooser()!.rt.kind}</b> in…
+                </div>
+                <div class="kc-views">
+                  <For each={[0, 1]}>
+                    {(sd) => (
+                      <button
+                        class="kc-view"
+                        classList={{ on: kindChooser()!.side === sd }}
+                        onClick={() => {
+                          setKindChooser({ ...kindChooser()!, side: sd });
+                          confirmKindChooser();
+                        }}
+                      >
+                        <svg class="pane-glyph lg" viewBox="0 0 22 14">
+                          <rect
+                            class="pg-cell"
+                            classList={{ on: sd === 0 }}
+                            x="0.7"
+                            y="0.7"
+                            width="9.6"
+                            height="12.6"
+                            rx="2"
+                          />
+                          <rect
+                            class="pg-cell"
+                            classList={{ on: sd === 1 }}
+                            x="11.7"
+                            y="0.7"
+                            width="9.6"
+                            height="12.6"
+                            rx="2"
+                          />
+                        </svg>
+                        {sd === 0 ? "left" : "right"}
+                      </button>
+                    )}
+                  </For>
+                </div>
+                <div class="kc-hint">←/→ pick · ↵ open · esc cancel</div>
+              </div>
+            </div>
+          </Show>
           <Show when={cmdOpen()}>
             <div
               class="modal-backdrop top"
@@ -11342,7 +11454,7 @@ function App() {
                           rx="2"
                         />
                       </svg>
-                      {focusedPaneIdx() === 0 ? "left pane" : "right pane"}
+                      {focusedPaneIdx() === 0 ? "left view" : "right view"}
                     </span>
                     <span
                       class="pane-ctx"
@@ -11351,7 +11463,7 @@ function App() {
                       <span class="ctx-dot" />
                       {active() || "—"}
                     </span>
-                    <span class="dim">this search stays in this pane</span>
+                    <span class="dim">this search stays in this view</span>
                   </div>
                 </Show>
                 <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
@@ -11728,10 +11840,11 @@ function App() {
                   <b>⇧F</b><span>port-forward input (pods)</span>
                   <b>⇧X</b><span>force delete (pods / nodes)</span>
                   <b class="help-sec">split</b>
-                  <b>⌘\ · ⧉ toolbar</b><span>split into two fully independent live panes — toggle again to close</span>
-                  <b>⌘← · ⌘→</b><span>jump focus between the panes instantly</span>
-                  <b>→ · ←</b><span>pan the columns, then cross at the edge (→ off the left pane, ← off the right)</span>
-                  <b>(each pane)</b><span>search, detail, sort — every shortcut acts on the focused pane</span>
+                  <b>⌘\ · ⧉ toolbar</b><span>split into two fully independent live views — toggle again to close</span>
+                  <b>⌘← · ⌘→</b><span>jump focus between the views instantly</span>
+                  <b>→ · ←</b><span>pan the columns, then cross at the edge (→ off the left view, ← off the right)</span>
+                  <b>(each view)</b><span>search, detail, sort — every shortcut acts on the focused view</span>
+                  <b>menu: ↵ · →</b><span>↵ loads the kind (asks which view when split); → moves into the view without loading</span>
                   <b class="help-sec">issues</b>
                   <b>⚠ Issues</b><span>problem resources across every cluster, kept live in the background</span>
                   <b>j k · ↑ ↓ · ↵</b><span>move between issues · jump to the resource</span>

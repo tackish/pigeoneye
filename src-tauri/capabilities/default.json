@@ -9,6 +9,7 @@
     "core:default",
     "core:app:default",
     "core:webview:allow-set-webview-zoom",
+    "core:window:allow-start-dragging",
     "opener:default",
     "dialog:default",
     "opener:allow-open-url",

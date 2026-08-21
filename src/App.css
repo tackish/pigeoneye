@@ -122,7 +122,9 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 14px;
+  /* Left room for the macOS traffic lights (titleBarStyle: Overlay), which
+     now sit over this bar so it reads as the native title bar. */
+  padding: 8px 14px 8px 82px;
   background: var(--chrome);
   border-bottom: 1px solid var(--border);
 }
@@ -2053,6 +2055,68 @@ th.sorted {
   display: block;
   flex: none;
 }
+.pane-glyph.lg {
+  width: 46px;
+  height: 29px;
+}
+
+/* "Open in which view?" chooser (Enter on a kind while the split is open) */
+.kind-chooser {
+  background: var(--bg1, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.45);
+  min-width: 330px;
+}
+.kc-eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  text-align: center;
+  margin-bottom: 6px;
+}
+.kc-title {
+  font-size: 13px;
+  text-align: center;
+  margin-bottom: 14px;
+}
+.kc-title b {
+  color: var(--accent);
+}
+.kc-views {
+  display: flex;
+  gap: 12px;
+}
+.kc-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  padding: 15px 10px;
+  border: 1.5px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg2);
+  color: var(--fg);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+}
+.kc-view:hover {
+  border-color: var(--accent);
+}
+.kc-view.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.kc-hint {
+  margin-top: 13px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--dim);
+}
 .pane-glyph .pg-cell {
   fill: none;
   stroke: var(--dim);
@@ -2082,16 +2146,31 @@ th.sorted {
 .pane-ctx .ctx-dot {
   background: hsl(var(--ctx-hue, 230), 55%, 60%);
 }
-.split-toggle .split-ico {
-  width: 17px;
-  height: 17px;
+/* Shared toolbar icon: one size for every pigeon-marked button so share /
+   columns / permissions / split view line up. */
+.tb-ico {
+  width: 18px;
+  height: 18px;
+  flex: none;
   display: block;
+  margin: -3px 0;
+}
+/* split view sits in the topbar but reads as a labeled button like the
+   others (icon + "split view"), not a bare icon square. */
+.split-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
 }
 .split-toggle.on {
   background: var(--accent, #5f64e0);
   border-color: var(--accent, #5f64e0);
+  color: #fff;
 }
-.split-toggle.on .split-ico {
+.split-toggle.on .tb-ico {
   filter: brightness(1.7);
 }
 
@@ -4019,11 +4098,11 @@ details.fold[open] > summary::before {
   gap: 4px;
   font-size: 11px; /* icon + label runs a touch smaller than a plain button */
 }
-.share-ico {
-  width: 20px;
-  height: 20px;
-  flex: none;
-  margin: -3px 0; /* the illustration has its own padding; keep the button slim */
+.cols-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
 }
 
 /* my-permissions: icon-only in the right corner, but it must still read as a
@@ -4040,12 +4119,6 @@ details.fold[open] > summary::before {
 .btn.sm.perm-btn:hover:not(:disabled) {
   border-color: var(--accent);
   background: var(--bg-hover);
-}
-.perm-ico {
-  width: 18px;
-  height: 18px;
-  flex: none;
-  margin: -2px 0;
 }
 .btn.sm.share-btn:hover:not(:disabled) {
   border-color: var(--accent);
