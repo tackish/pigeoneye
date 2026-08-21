@@ -3229,6 +3229,17 @@ function App() {
       setActionErr(`could not copy: ${String(e)}`);
     }
   }
+  // ⌘C on a table row: copy just the name, with a small toast.
+  const [copiedName, setCopiedName] = createSignal<string | null>(null);
+  async function copyRowName(name: string) {
+    try {
+      await navigator.clipboard.writeText(name);
+      setCopiedName(name);
+      setTimeout(() => setCopiedName(null), 1300);
+    } catch {
+      /* clipboard blocked — nothing to show */
+    }
+  }
   const events = () => P().events();
   const setEvents: Pane["setEvents"] = (v) => P().setEvents(v as never);
   // Per-event copy feedback (which event just showed "✓").
@@ -6138,8 +6149,14 @@ function App() {
         ...moreRow(Math.min(list.length, CMD_LIST_MAX), list.length),
       ];
     }
-    if (q.startsWith("ctx")) {
-      const arg = q.slice(3).trim();
+    // Accept both the short "ctx" and the full "context" verb.
+    const ctxKw = q.startsWith("context")
+      ? "context"
+      : q.startsWith("ctx")
+        ? "ctx"
+        : "";
+    if (ctxKw) {
+      const arg = q.slice(ctxKw.length).trim();
       // Sorted, and open tabs first. The list arrives in kubeconfig order,
       // so a context added later sat at the bottom — and the cap below cut
       // it off, which read as "it isn't there" for a cluster that was.
@@ -6222,13 +6239,29 @@ function App() {
     O: ["NODE"],
   };
 
+  function cordonNow(name: string, on: boolean) {
+    void runAction(on ? "cordon" : "uncordon", () =>
+      invoke("cordon_node", { context: active(), name, on }),
+    );
+  }
   function doCordon(target?: Target, unschedulable?: boolean) {
     const d = target ?? currentTarget();
     if (!d || !isNode()) return;
     const on = !(unschedulable ?? detail()?.unschedulable ?? false);
-    void runAction(on ? "cordon" : "uncordon", () =>
-      invoke("cordon_node", { context: active(), name: d.name, on }),
-    );
+    // Uncordon is un-doing, so it goes straight through; cordon disrupts
+    // scheduling, so it asks first — same as drain/delete.
+    if (!on) {
+      cordonNow(d.name, false);
+      return;
+    }
+    setDlgIdx(1);
+    setConfirm({
+      title: `Cordon node ${d.name}?`,
+      body: "New pods won't be scheduled onto it; pods already running stay put. Reversible any time with uncordon.",
+      label: "Cordon node",
+      danger: true,
+      run: () => cordonNow(d.name, true),
+    });
   }
 
   function requestDrain(target?: Target) {
@@ -7223,7 +7256,7 @@ function App() {
         if (statusFoldRef) statusFoldRef.open = !statusFoldRef.open;
         return;
       }
-      if (e.key === "c" && isNode()) {
+      if (e.key === "c" && !e.metaKey && !e.ctrlKey && isNode()) {
         e.preventDefault();
         doCordon();
         return;
@@ -7279,7 +7312,7 @@ function App() {
         else openWorkloadLogs(d.namespace, d.name);
         return;
       }
-      if (e.key === "d" && !isEvent() && selected()!.deletable) {
+      if (e.key === "d" && !isEvent() && selected()?.deletable) {
         e.preventDefault();
         requestDelete(false);
         return;
@@ -7421,7 +7454,18 @@ function App() {
         e.preventDefault();
         requestRestart({ namespace: vr.row.namespace, name: vr.row.name });
       }
-    } else if (e.key === "c" && isNode()) {
+    } else if (
+      (e.ctrlKey || e.metaKey) &&
+      e.code === "KeyC" &&
+      !window.getSelection()?.toString()
+    ) {
+      // ⌘C copies the cursor row's NAME on every kind (never a node action).
+      const vr = view().rows[cursor()];
+      if (vr) {
+        e.preventDefault();
+        void copyRowName(vr.row.name);
+      }
+    } else if (e.key === "c" && !e.metaKey && !e.ctrlKey && isNode()) {
       const vr = view().rows[cursor()];
       if (vr) {
         e.preventDefault();
@@ -7434,6 +7478,32 @@ function App() {
       if (vr) {
         e.preventDefault();
         requestDrain({ namespace: null, name: vr.row.name });
+      }
+      // Same per-resource keys as the detail panel, so a key means the same
+      // thing whether you're on the list or inside a resource. All confirm.
+    } else if (
+      e.key === "d" &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !isEvent() &&
+      selected()?.deletable
+    ) {
+      const vr = view().rows[cursor()];
+      if (vr) {
+        e.preventDefault();
+        requestDelete(false, { namespace: vr.row.namespace, name: vr.row.name });
+      }
+    } else if (e.key === "X" && (isPod() || isNode())) {
+      const vr = view().rows[cursor()];
+      if (vr) {
+        e.preventDefault();
+        requestDelete(true, { namespace: vr.row.namespace, name: vr.row.name });
+      }
+    } else if (e.key === "r" && !e.metaKey && !e.ctrlKey && restartable()) {
+      const vr = view().rows[cursor()];
+      if (vr) {
+        e.preventDefault();
+        requestRestart({ namespace: vr.row.namespace, name: vr.row.name });
       }
     } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
       // wide tables get cut off; pan them without a mouse
@@ -8716,6 +8786,12 @@ function App() {
         </button>
       </header>
 
+      <Show when={copiedName()}>
+        <div class="copy-toast">
+          copied <b>{copiedName()}</b>
+        </div>
+      </Show>
+
       <Show when={settingsOpen()}>{settingsPanel()}</Show>
 
       <Show when={error()}>
@@ -9801,9 +9877,9 @@ function App() {
                     {active()}
                   </span>
                 </Show>
-                {selected()!.kind}
+                {selected()?.kind}
                 <span class="gv">
-                  {selected()!.group || "core"}/{selected()!.version}
+                  {selected()?.group || "core"}/{selected()?.version}
                 </span>
               </h2>
               <input autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck={false}
@@ -10148,7 +10224,7 @@ function App() {
                     <span class="dim"> ({marked().size} marked, rest filtered out)</span>
                   </Show>
                 </span>
-                <Show when={selected()!.deletable && !isEvent()}>
+                <Show when={selected()?.deletable && !isEvent()}>
                   <button
                     class="btn sm danger"
                     disabled={actionBusy() !== null}
@@ -10619,7 +10695,7 @@ function App() {
                   {/* Navigation (owner/related/used-by) moved to the "related"
                       section below, which can show names, not just kinds. */}
                   <span class="act-group danger-group">
-                  <Show when={!isEvent() && selected()!.deletable}>
+                  <Show when={!isEvent() && selected()?.deletable}>
                   {actionBtn(
                     "delete",
                     () =>
@@ -10645,7 +10721,7 @@ function App() {
                     { danger: true },
                   )}
                   </Show>
-                  <Show when={(isPod() || isNode()) && selected()!.deletable}>
+                  <Show when={(isPod() || isNode()) && selected()?.deletable}>
                     {actionBtn(
                       "force delete",
                       () =>
@@ -11853,13 +11929,12 @@ function App() {
                   <b>s</b><span>shell (pod / node)</span>
                   <b>l</b><span>logs (pod / workload aggregate)</span>
                   <b>e / y</b><span>edit manifest (YAML) of cursor row</span>
-                  <b>⌘C</b><span>copy the manifest (detail open, nothing selected)</span>
+                  <b>⌘C</b><span>copy the cursor row's name (or the manifest, in an open detail)</span>
                   <b>space</b><span>mark a row · ⌘A all · esc clears</span>
                   <b>space + ↑↓</b><span>hold space and move to sweep a range of rows</span>
-                  <b>⌘/ctrl D</b><span>delete marked rows, or the cursor row (⇧ adds force)</span>
-                  <b>⌘/ctrl R</b><span>rollout restart of cursor row</span>
-                  <b>c · ⇧D</b><span>cordon · drain the cursor node</span>
-                  <b>d</b><span>delete (detail open)</span>
+                  <b>d · ⇧X · r</b><span>delete · force-delete · rollout-restart the cursor row — each asks first</span>
+                  <b>c · ⇧D</b><span>cordon · drain the cursor node — each asks first</span>
+                  <b>⌘D</b><span>delete every marked row (⇧ adds force)</span>
                   <b>⇧← ⇧→</b><span>pick the sort column</span>
                   <b>⇧↑ ⇧↓</b><span>sort ascending / descending</span>
                   <b>Shift A/N/S/R/T/C/M/I/O</b>
@@ -11874,11 +11949,11 @@ function App() {
                   <b>fn ↑↓ (⇞⇟)</b><span>page through any list — table, sidebar, palette, pickers</span>
                   <b>⇧J ⇧K</b><span>previous / next resource, panel follows</span>
                   <b>a · t · v</b><span>toggle annotations · status · events</span>
-                  <b>c · ⇧D</b><span>cordon/uncordon · drain (nodes)</span>
+                  <b>c · ⇧D</b><span>cordon/uncordon · drain (nodes) — each asks first</span>
                   <b>r · n</b><span>rollout restart · scale input</span>
                   <b>p</b><span>node ↔ its pods</span>
                   <b>⇧F</b><span>port-forward input (pods)</span>
-                  <b>⇧X</b><span>force delete (pods / nodes)</span>
+                  <b>d · ⇧X</b><span>delete · force-delete — each asks first</span>
                   <b class="help-sec">split</b>
                   <b>⌘\ · ⧉ toolbar</b><span>split into two fully independent live views — toggle again to close</span>
                   <b>⌘← · ⌘→</b><span>jump focus between the views instantly</span>

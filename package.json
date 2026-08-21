@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "smoke": "node scripts/smoke.mjs",
     "smoke:split": "node scripts/smoke-split.mjs",
-    "smoke:persist": "node scripts/smoke-persist.mjs"
+    "smoke:persist": "node scripts/smoke-persist.mjs",
+    "smoke:issues": "node scripts/smoke-issues.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
   "private": true,

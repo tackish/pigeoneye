@@ -2117,6 +2117,27 @@ th.sorted {
   font-size: 11.5px;
   color: var(--dim);
 }
+
+/* transient "copied <name>" toast for ⌘C on a row */
+.copy-toast {
+  position: fixed;
+  bottom: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 100;
+  background: var(--bg1, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  color: var(--fg);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+.copy-toast b {
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
 .pane-glyph .pg-cell {
   fill: none;
   stroke: var(--dim);
