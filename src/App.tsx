@@ -2889,6 +2889,44 @@ function App() {
       void invoke("watch_stop", { id: sWatchId }).catch(() => {});
     sWatchId = null;
   }
+  // Pane 2's quiet re-list on a watch resync: keeps the rows/cursor/scroll,
+  // streams the fresh page, and restarts the watch — the loading spinner and
+  // the cursor reset that sSelect does are NOT wanted here (that flicker on
+  // every resync is exactly what this avoids).
+  async function sRefreshList() {
+    const rt = sSel();
+    const ctx = sCtx();
+    if (!rt || !ctx) return;
+    const ns = rt.namespaced && sNs() ? sNs() : null;
+    try {
+      const seq = ++sListSeq;
+      const chan = new Channel<{ rows: TableRow[]; done: boolean }>();
+      chan.onmessage = (page) => {
+        if (seq !== sListSeq) return;
+        setSTable((prev) =>
+          prev ? { ...prev, rows: [...prev.rows, ...page.rows] } : prev,
+        );
+        S1.setStreaming(!page.done);
+      };
+      const t = await invoke<ResourceTable>("list_resources", {
+        context: ctx,
+        resource: rt,
+        namespace: ns,
+        fieldSelector: null,
+        channel: chan,
+      });
+      S1.setStreaming(t.truncated);
+      if (sCtx() === ctx && sSel() === rt) {
+        setSTable(t);
+        S1.setMatched(null);
+        if (rt.group === "" && rt.kind === "Pod") void loadPodStats(ctx, ns, S1);
+        if (rt.group === "" && rt.kind === "Node") void loadNodeStats(ctx, S1);
+        await sStartWatch(ctx, rt, ns, t.resource_version, t.include);
+      }
+    } catch (e) {
+      S1.setError(String(e));
+    }
+  }
   async function sStartWatch(
     ctx: string,
     rt: ResourceType,
@@ -2905,7 +2943,9 @@ function App() {
     chan.onmessage = (ev) => {
       if (seq !== sListSeq) return;
       if (ev.type === "RESYNC") {
-        if (sSel() === rt && sCtx() === ctx) void sSelect(rt);
+        // Quiet re-list (like pane 1's refreshList) — NOT sSelect, which would
+        // flash the loading spinner and reset cursor/scroll on every resync.
+        if (sSel() === rt && sCtx() === ctx) void sRefreshList();
         return;
       }
       const del = ev.type === "DELETED";
