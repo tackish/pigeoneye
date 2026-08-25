@@ -2738,17 +2738,47 @@ function App() {
       s,
     );
   let issueSweepSeq = 0;
-  function loadIssues() {
+  /// `quiet` is the background refresh (the warm timer and the slow interval):
+  /// it leaves the visible list and the "● live" indicator exactly as they are
+  /// while it re-scans, then swaps in the fresh results in one shot when the
+  /// sweep completes. Only the FOREGROUND load (opening Issues with nothing
+  /// yet) blanks the list and shows the scanning spinner — so a tab left open
+  /// on Issues no longer flashes empty every 60s.
+  function loadIssues(quiet = false) {
     const targets = tabs();
     if (!targets.length) return;
     // Each sweep is stamped; a late message from a superseded sweep (e.g. a
     // warm re-aggregate started while the previous one is still streaming)
     // is ignored, so rows never double up and the spinner tracks one sweep.
     const gen = ++issueSweepSeq;
-    setIssues([]);
-    setIssueErrors({});
-    setIssuePending(targets);
-    setIssuesLoading(true);
+    const order = new Map(targets.map((t, i) => [t, i]));
+    const sortIss = (arr: Issue[]) =>
+      arr
+        .slice()
+        .sort(
+          (a, z) =>
+            (order.get(a.context) ?? 0) - (order.get(z.context) ?? 0) ||
+            a.name.localeCompare(z.name),
+        );
+    if (!quiet) {
+      setIssues([]);
+      setIssueErrors({});
+      setIssuePending(targets);
+      setIssuesLoading(true);
+    }
+    // Quiet sweeps accumulate off-screen and publish once, so no cluster ever
+    // vanishes mid-scan and the old list stays put until fresh data replaces
+    // it wholesale.
+    const acc: Issue[] = [];
+    const errAcc: Record<string, string> = {};
+    const seen = new Set<string>();
+    let published = false;
+    const publishQuiet = () => {
+      if (published || gen !== issueSweepSeq) return;
+      published = true;
+      setIssues(sortIss(acc));
+      setIssueErrors(errAcc);
+    };
     const chan = new Channel<{
       context: string;
       issues: Issue[];
@@ -2756,33 +2786,38 @@ function App() {
     }>();
     chan.onmessage = (b) => {
       if (gen !== issueSweepSeq) return;
+      if (quiet) {
+        seen.add(b.context);
+        if (b.error) errAcc[b.context] = b.error;
+        else acc.push(...b.issues);
+        if (seen.size >= targets.length) publishQuiet();
+        return;
+      }
       setIssuePending(issuePending().filter((c) => c !== b.context));
       if (b.error) setIssueErrors({ ...issueErrors(), [b.context]: b.error });
-      else if (b.issues.length) {
-        const order = new Map(targets.map((t, i) => [t, i]));
-        setIssues(
-          [...issues(), ...b.issues].sort(
-            (a, z) =>
-              (order.get(a.context) ?? 0) - (order.get(z.context) ?? 0) ||
-              a.name.localeCompare(z.name),
-          ),
-        );
-      }
+      else if (b.issues.length) setIssues(sortIss([...issues(), ...b.issues]));
       if (!issuePending().length) setIssuesLoading(false);
     };
     void invoke("aggregate_issues", { contexts: targets, channel: chan })
       .then(() => {
+        if (gen !== issueSweepSeq) return;
         // The command resolved: the sweep is done even if some cluster never
-        // emitted (hung/dropped), so clear the spinner instead of latching.
-        if (gen === issueSweepSeq) {
+        // emitted (hung/dropped). Quiet publishes what it gathered; foreground
+        // clears the spinner instead of latching.
+        if (quiet) publishQuiet();
+        else {
           setIssuePending([]);
           setIssuesLoading(false);
         }
       })
       .catch((e) => {
         if (gen !== issueSweepSeq) return;
-        setIssueErrors({ ...issueErrors(), all: String(e) });
-        setIssuesLoading(false);
+        // A whole-sweep failure shouldn't wipe a good list — quiet just keeps
+        // what's on screen and tries again next tick.
+        if (!quiet) {
+          setIssueErrors({ ...issueErrors(), all: String(e) });
+          setIssuesLoading(false);
+        }
       });
   }
   function openIssues() {
@@ -2808,11 +2843,11 @@ function App() {
       setIssueErrors({});
       return;
     }
-    issuesWarmTimer = window.setTimeout(() => loadIssues(), 500);
+    issuesWarmTimer = window.setTimeout(() => loadIssues(true), 500);
   });
   onMount(() => {
     const id = window.setInterval(() => {
-      if (tabs().length && !issuesLoading()) loadIssues();
+      if (tabs().length && !issuesLoading()) loadIssues(true);
     }, 60000);
     onCleanup(() => clearInterval(id));
   });
