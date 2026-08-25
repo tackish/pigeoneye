@@ -581,14 +581,22 @@ pub async fn local_shell_start(
         })
         .map_err(err)?;
     let mut builder = CommandBuilder::new(&shell);
-    // A login shell, so it reads the same profile the user's terminal does
-    // — the one that puts tsh, aws-vault and the rest on PATH. Given a
-    // command it runs that and exits, which is what makes its exit status
-    // worth something: the caller can connect on a zero and stay put on
-    // anything else.
+    // An INTERACTIVE login shell (-i), so it reads the same profile the
+    // user's terminal does — the one that puts tsh, aws-vault and the rest
+    // on PATH. The -i matters: zsh (the macOS default) only sources .zshrc
+    // when interactive, and that is where AWS_PROFILE / AWS_CONFIG_FILE, a
+    // version-managed `aws` (mise/asdf/brew), and granted/aws-vault shell
+    // functions usually live. A plain -lc login shell skips .zshrc, so
+    // `aws sso login` here would run in a DIFFERENT AWS context than the
+    // get-token exec (whose env is hydrated by the -ilc probe in lib.rs) —
+    // it would refresh the wrong sso_session and the reconnect would still
+    // report "SSO session expired". Keep these flags in step with that probe.
+    // Given a command it runs that and exits, which is what makes its exit
+    // status worth something: the caller can connect on a zero and stay put
+    // on anything else.
     match &command {
-        Some(c) => builder.args(["-lc", c]),
-        None => builder.args(["-l"]),
+        Some(c) => builder.args(["-ilc", c]),
+        None => builder.args(["-il"]),
     }
     // A GUI launch inherits no TERM, and a shell that cannot identify the
     // terminal drops to dumb output.

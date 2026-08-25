@@ -1971,7 +1971,24 @@ function App() {
     // closing it always retries — a failed retry just puts back the banner
     // that was already there.
     setAuthHint(null);
-    void reconnect(t.context);
+    // One `aws sso login` (or `tsh login`, gcloud, …) refreshes a whole
+    // session that several clusters usually ride on, but the login window
+    // only knew the one context it was opened for. Reconnect that one in the
+    // foreground as before; if it comes back the login worked, so quietly
+    // retry every OTHER context still in the failed list — they were almost
+    // certainly waiting on the same credential. Gating on the trigger's
+    // success avoids restacking reconnects when the login fixed nothing, and
+    // the background retries (focus:false) leave the foreground exactly where
+    // the user left it and only touch already-failed contexts.
+    const alsoRetry = failed()
+      .filter((f) => f.name !== t.context)
+      .map((f) => f.name);
+    void (async () => {
+      if (!(await reconnect(t.context))) return;
+      for (const name of alsoRetry) {
+        if (failed().some((f) => f.name === name)) void reconnect(name, false);
+      }
+    })();
   }
 
   /// Turn a raw kube/exec error into one readable line. The exec
@@ -2015,22 +2032,37 @@ function App() {
 
   /// Drop the cached client and reconnect — the fix for an expired SSO
   /// token, since kubeconfig exec credentials are re-run on connect.
-  async function reconnect(name: string) {
+  /// Returns whether the reconnect succeeded.
+  ///
+  /// `focus` (the default) is the foreground reconnect a user asked for: it
+  /// clears/sets the error and auth banners and switches to the tab, exactly
+  /// as before. Passing `false` runs a background retry that only clears the
+  /// context from the failed list on success — it never steals focus, opens
+  /// a login banner, or surfaces an error — which is what lets one login
+  /// quietly revive the other clusters that shared its credential without
+  /// disturbing the context the user is actually looking at.
+  async function reconnect(name: string, focus = true): Promise<boolean> {
     beginConnect(name);
-    setError(null);
+    if (focus) setError(null);
     try {
       await invoke("disconnect", { context: name });
       tabCache.delete(name);
       await setupContext(name);
       if (!tabs().includes(name)) setTabs([...tabs(), name]);
       setFailed(failed().filter((f) => f.name !== name));
-      setAuthHint(null);
-      activate(name);
+      if (focus) {
+        setAuthHint(null);
+        activate(name);
+      }
+      return true;
     } catch (e) {
       const msg = String(e);
-      if (abandoned.delete(name)) return;
-      setError(`could not connect to ${name}: ${msg}`);
-      if (isAuthError(msg)) void offerLogin(name);
+      if (abandoned.delete(name)) return false;
+      if (focus) {
+        setError(`could not connect to ${name}: ${msg}`);
+        if (isAuthError(msg)) void offerLogin(name);
+      }
+      return false;
     } finally {
       endConnect(name);
     }
@@ -5387,7 +5419,8 @@ function App() {
   // split open it first asks which view (a book-glyph popup, ←/→ to pick).
   // Plain → just moves focus from the menu into the view without loading.
   const [kindChooser, setKindChooser] = createSignal<{
-    rt: ResourceType;
+    rt?: ResourceType;
+    issues?: boolean;
     side: number;
   } | null>(null);
   function enterKind() {
@@ -5399,26 +5432,37 @@ function App() {
       void select(t);
     }
   }
+  /// Issues is a view like a kind, so when split it asks the same left/right
+  /// question the kinds do rather than silently opening in the focused pane.
+  function enterIssues() {
+    if (split()) setKindChooser({ issues: true, side: focusedPaneIdx() });
+    else openIssues();
+  }
   function confirmKindChooser() {
     const c = kindChooser();
     if (!c) return;
     setKindChooser(null);
     setFocusedPaneIdx(c.side);
+    // Issues has no per-view type registry to remap — openIssues() acts on
+    // whichever pane is now focused, so the setFocusedPaneIdx above is all it
+    // needs.
+    if (c.issues) {
+      openIssues();
+      return;
+    }
+    const rt = c.rt;
+    if (!rt) return;
     setPane("table");
     // Remap to the TARGET view's own type registry — the chosen kind came
     // from whichever view was focused, and the two can be on different
     // clusters (mirrors the mouse-click path's sTypes() remap).
     if (c.side === 1) {
       const st =
-        sTypes().find(
-          (x) => x.kind === c.rt.kind && x.group === c.rt.group,
-        ) ?? c.rt;
+        sTypes().find((x) => x.kind === rt.kind && x.group === rt.group) ?? rt;
       void sSelect(st);
     } else {
       const t =
-        types().find(
-          (x) => x.kind === c.rt.kind && x.group === c.rt.group,
-        ) ?? c.rt;
+        types().find((x) => x.kind === rt.kind && x.group === rt.group) ?? rt;
       void select(t);
     }
   }
@@ -7075,7 +7119,7 @@ function App() {
       // re-fetches the list.
       if (e.key === "Enter") {
         e.preventDefault();
-        if (sideIdx() === -1) openIssues();
+        if (sideIdx() === -1) enterIssues();
         else enterKind();
         return;
       }
@@ -11487,7 +11531,9 @@ function App() {
               <div class="kind-chooser" onClick={(e) => e.stopPropagation()}>
                 <div class="kc-eyebrow">split view</div>
                 <div class="kc-title">
-                  open <b>{kindChooser()!.rt.kind}</b> in…
+                  open{" "}
+                  <b>{kindChooser()?.issues ? "Issues" : kindChooser()?.rt?.kind}</b>{" "}
+                  in…
                 </div>
                 <div class="kc-views">
                   <For each={[0, 1]}>
@@ -11959,7 +12005,7 @@ function App() {
                   <b>⌘← · ⌘→</b><span>jump focus between the views instantly</span>
                   <b>→ · ←</b><span>pan the columns, then cross at the edge (→ off the left view, ← off the right)</span>
                   <b>(each view)</b><span>search, detail, sort — every shortcut acts on the focused view</span>
-                  <b>menu: ↵ · →</b><span>↵ loads the kind (asks which view when split); → moves into the view without loading</span>
+                  <b>menu: ↵ · →</b><span>↵ opens the kind or Issues (asks which view when split); → moves into the view without loading</span>
                   <b class="help-sec">issues</b>
                   <b>⚠ Issues</b><span>problem resources across every cluster, kept live in the background</span>
                   <b>j k · ↑ ↓ · ↵</b><span>move between issues · jump to the resource</span>
