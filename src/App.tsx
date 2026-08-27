@@ -116,6 +116,7 @@ interface ResourceDetail {
   secret_data?: [string, string][];
   replicas: number | null;
   ready_replicas: number | null;
+  generation: number | null;
   yaml: string;
 }
 
@@ -4597,6 +4598,48 @@ function App() {
     }
   }
 
+  // Fill in metrics for pods that appear AFTER a list opens — every replica a
+  // rollout creates — which otherwise show no CPU/MEM until the next watch
+  // resync (~10 min). This MUST cost nothing in steady state: replacing the
+  // stats map rebuilds every display row (dispCache keys on the map's
+  // identity), so a blind periodic refresh would be a perf regression on a big
+  // cluster. Instead each tick just counts Running pods (integer compares — no
+  // string keys, no allocation) and refreshes ONLY when that count exceeds the
+  // number of metrics we hold, i.e. some running pod has no metrics yet. A jump
+  // in running pods (a rollout) arms a short burst so the fetch retries as
+  // metrics-server catches up, then stops — capped so a pod metrics-server
+  // can't scrape can never drive an endless rebuild. Settled lists, and
+  // Pending/Completed pods (never counted), do zero fetches and zero rebuilds.
+  const statBurst = new Map<object, { lastRunning: number; ticks: number }>();
+  onMount(() => {
+    const id = window.setInterval(() => {
+      if (document.hidden) return;
+      for (const pane of activePanes()) {
+        const rt = pane.selected();
+        const ctx = pane.active();
+        if (!rt || !ctx || rt.group !== "" || rt.kind !== "Pod") continue;
+        const t = pane.table();
+        const stats = pane.podStats();
+        if (!t || !stats) continue; // metrics not in play (e.g. no metrics-server)
+        const si = t.columns.findIndex((c) => /^status$/i.test(c.name));
+        if (si < 0) continue;
+        let running = 0;
+        for (const r of t.rows) if (r.cells[si] === "Running") running++;
+        const b = statBurst.get(pane) ?? { lastRunning: 0, ticks: 0 };
+        if (running > b.lastRunning) b.ticks = 5; // new pods → arm a retry burst
+        b.lastRunning = running;
+        if (running <= stats.size) b.ticks = 0; // all running pods have metrics
+        else if (b.ticks > 0) {
+          b.ticks--;
+          const ns = rt.namespaced && pane.namespace() ? pane.namespace() : null;
+          void loadPodStats(ctx, ns, pane);
+        }
+        statBurst.set(pane, b);
+      }
+    }, 20000);
+    onCleanup(() => clearInterval(id));
+  });
+
   async function jumpToNode(node: string) {
     const t = types().find((x) => x.group === "" && x.kind === "Node");
     if (!t) return;
@@ -4952,6 +4995,131 @@ function App() {
     });
   }
 
+  // "updated 2/3 · ready 2/3 · gen 4→5" — the numbers behind the badge.
+  function replicaNote(
+    updated: number | null,
+    ready: number | null,
+    desired: number | null,
+    gen: number | null,
+    observed: number | null,
+  ): string {
+    const parts: string[] = [];
+    if (desired != null) {
+      if (updated != null) parts.push(`updated ${updated}/${desired}`);
+      if (ready != null) parts.push(`ready ${ready}/${desired}`);
+    }
+    if (gen != null && observed != null && observed !== gen)
+      parts.push(`gen ${observed}→${gen}`);
+    return parts.join(" · ");
+  }
+
+  type RolloutState =
+    | "synced"
+    | "applying"
+    | "progressing"
+    | "partial"
+    | "paused"
+    | "degraded";
+  /// Derive a rollout/sync state for a workload from its live `.status`, the
+  /// way `kubectl rollout status` does: has the controller seen the latest
+  /// spec (observedGeneration vs generation → "applying"), are the new pods
+  /// up (updated/available vs desired → "progressing"), is it wedged
+  /// (ProgressDeadlineExceeded / Rollout Degraded → "stuck"), else "synced".
+  /// Pure over its args so each split pane can call it with its own detail.
+  function rolloutInfoOf(
+    rt: ResourceType | null,
+    d: ResourceDetail | null,
+  ): { state: RolloutState; label: string; note: string } | null {
+    if (!rt || !d) return null;
+    const st = d.status as Record<string, unknown> | null;
+    if (!st || typeof st !== "object") return null;
+    const num = (v: unknown): number | null =>
+      typeof v === "number" ? v : null;
+    const gen = d.generation;
+    const observed = num(st.observedGeneration);
+    const applying = gen != null && observed != null && observed < gen;
+    const conds = Array.isArray(st.conditions)
+      ? (st.conditions as Array<Record<string, unknown>>)
+      : [];
+    const mk = (state: RolloutState, label: string, note: string) => ({
+      state,
+      label,
+      note,
+    });
+
+    // Argo Rollout: status.phase is authoritative.
+    if (rt.group === "argoproj.io" && rt.kind === "Rollout") {
+      const phase = typeof st.phase === "string" ? st.phase : "";
+      const paused =
+        st.paused === true ||
+        (Array.isArray(st.pauseConditions) && st.pauseConditions.length > 0);
+      const note = replicaNote(
+        num(st.updatedReplicas),
+        num(st.availableReplicas),
+        num(d.replicas),
+        gen,
+        observed,
+      );
+      if (paused) return mk("paused", "Paused", note);
+      if (phase === "Degraded" || phase === "Error")
+        return mk("degraded", phase === "Error" ? "Error" : "Degraded", note);
+      if (applying) return mk("applying", "Applying", note);
+      if (phase === "Progressing") return mk("progressing", "Rolling out", note);
+      if (phase === "Healthy") return mk("synced", "Synced", note);
+      return null; // unknown phase — don't guess
+    }
+
+    if (rt.group === "apps" && rt.kind === "Deployment") {
+      const desired = num(d.replicas) ?? 0;
+      const updated = num(st.updatedReplicas) ?? 0;
+      const ready = num(st.readyReplicas) ?? 0;
+      const avail = num(st.availableReplicas) ?? 0;
+      const unavail = num(st.unavailableReplicas) ?? 0;
+      const prog = conds.find((c) => c.type === "Progressing");
+      const note = replicaNote(updated, ready, desired, gen, observed);
+      if (prog?.reason === "DeploymentPaused")
+        return mk("paused", "Paused", note);
+      if (prog?.reason === "ProgressDeadlineExceeded")
+        return mk("degraded", "Stuck", note);
+      if (applying) return mk("applying", "Applying", note);
+      if (updated < desired) return mk("progressing", "Rolling out", note);
+      if (avail < desired || ready < desired || unavail > 0)
+        return mk("partial", "Not fully available", note);
+      return mk("synced", "Synced", note);
+    }
+
+    if (rt.group === "apps" && rt.kind === "StatefulSet") {
+      const desired = num(d.replicas) ?? 0;
+      const updated = num(st.updatedReplicas) ?? 0;
+      const ready = num(st.readyReplicas) ?? 0;
+      const cur = st.currentRevision;
+      const upd = st.updateRevision;
+      const rolling =
+        typeof cur === "string" && typeof upd === "string" && cur !== upd;
+      const note = replicaNote(updated, ready, desired, gen, observed);
+      if (applying) return mk("applying", "Applying", note);
+      if (rolling || updated < desired)
+        return mk("progressing", "Rolling out", note);
+      if (ready < desired) return mk("partial", "Not fully available", note);
+      return mk("synced", "Synced", note);
+    }
+
+    if (rt.group === "apps" && rt.kind === "DaemonSet") {
+      const desired = num(st.desiredNumberScheduled) ?? 0;
+      const updated = num(st.updatedNumberScheduled) ?? 0;
+      const ready = num(st.numberReady) ?? 0;
+      const avail = num(st.numberAvailable) ?? 0;
+      const note = replicaNote(updated, ready, desired, gen, observed);
+      if (applying) return mk("applying", "Applying", note);
+      if (updated < desired) return mk("progressing", "Rolling out", note);
+      if (avail < desired || ready < desired)
+        return mk("partial", "Not fully available", note);
+      return mk("synced", "Synced", note);
+    }
+
+    return null;
+  }
+
   // The action row only exists once the detail has loaded; paint the
   // cursor when it does.
   createEffect(() => {
@@ -4959,6 +5127,92 @@ function App() {
       const i = actionIdx();
       requestAnimationFrame(() => paintRowCursor("actions", i));
     }
+  });
+
+  // A workload's rollout state for a LIST row, read straight from the printer
+  // cells it already carries (READY / UP-TO-DATE / AVAILABLE / DESIRED) — no
+  // extra fetch, updates live with the watch. So the state is legible at a
+  // glance in the list itself, EVERY workload row gets a status dot, not only
+  // the ones mid-rollout:
+  //   "rolling"  — UP-TO-DATE < DESIRED, new pods still spreading
+  //   "partial"  — fully rolled out but READY/AVAILABLE < DESIRED (some pods
+  //                unhealthy: a health state, NOT a rollout)
+  //   "synced"   — up to date and all healthy
+  // Coarser than the detail badge (cells carry no observedGeneration, so no
+  // "applying"). Returns null for non-workloads and rows with no usable counts.
+  function rowRollout(
+    rt: ResourceType | null,
+    row: TableRow,
+    columns: { name: string }[] | undefined,
+  ): "rolling" | "partial" | "synced" | null {
+    if (!rt || !columns) return null;
+    const workload =
+      (rt.group === "apps" &&
+        (rt.kind === "Deployment" ||
+          rt.kind === "StatefulSet" ||
+          rt.kind === "DaemonSet" ||
+          rt.kind === "ReplicaSet")) ||
+      (rt.group === "argoproj.io" && rt.kind === "Rollout");
+    if (!workload) return null;
+    const cell = (re: RegExp) => {
+      const i = columns.findIndex((c) => re.test(c.name));
+      return i >= 0 ? row.cells[i] : undefined;
+    };
+    const int = (v: unknown): number | null => {
+      if (typeof v === "number") return v;
+      if (typeof v === "string" && /^\d+$/.test(v.trim())) return parseInt(v, 10);
+      return null;
+    };
+    // desired + ready from READY "a/b" (Deployment/StatefulSet) or the DESIRED
+    // column plus a plain READY count (DaemonSet/ReplicaSet/Rollout).
+    let desired: number | null = null;
+    let ready: number | null = null;
+    const readyCell = cell(/^ready$/i);
+    if (typeof readyCell === "string" && /^\d+\/\d+$/.test(readyCell.trim())) {
+      const parts = readyCell.trim().split("/");
+      ready = parseInt(parts[0], 10);
+      desired = parseInt(parts[1], 10);
+    } else {
+      ready = int(readyCell);
+    }
+    if (desired == null) desired = int(cell(/^desired$/i));
+    if (desired == null) return null; // no usable counts → no dot
+    const upToDate = int(cell(/^up-?to-?date$/i));
+    const avail = int(cell(/^available$/i));
+    if (upToDate != null && upToDate < desired) return "rolling";
+    if ((ready != null && ready < desired) || (avail != null && avail < desired))
+      return "partial";
+    return "synced";
+  }
+
+  // While the focused pane's workload is mid-rollout, keep its detail fresh so
+  // the badge flips to "Synced" on its own. It re-fetches ONLY while the state
+  // is actively changing (applying/progressing) and stops the moment it
+  // settles, and it replaces just detail() — never the YAML buffer — so an
+  // open edit is never clobbered. setDetail re-runs this effect, which is the
+  // poll loop; a settled state simply doesn't reschedule.
+  let rolloutPollTimer: number | undefined;
+  createEffect(() => {
+    clearTimeout(rolloutPollTimer);
+    const info = rolloutInfoOf(selected(), detail());
+    if (!info || (info.state !== "applying" && info.state !== "progressing"))
+      return;
+    const key = detailKey();
+    const d = detail();
+    if (!d) return;
+    const ns = d.namespace;
+    const name = d.name;
+    rolloutPollTimer = window.setTimeout(() => {
+      if (detailKey() !== key) return;
+      void fetchDetail(ns, name)
+        .then((nd) => {
+          if (detailKey() === key && nd) setDetail(nd);
+        })
+        .catch(() => {
+          /* transient — the next detail change re-arms the poll */
+        });
+    }, 2500);
+    onCleanup(() => clearTimeout(rolloutPollTimer));
   });
 
   /// The one way a detail panel opens — table click, keyboard, or a
@@ -10584,6 +10838,20 @@ function App() {
                                         toggleMark(vr.row);
                                       }}
                                     />
+                                    <Show
+                                      when={
+                                        rowRollout(
+                                          selected(),
+                                          vr.row,
+                                          table()?.columns,
+                                        ) === "rolling"
+                                      }
+                                    >
+                                      <span
+                                        class="row-rollout-dot"
+                                        title="rolling out — new pods still spreading"
+                                      />
+                                    </Show>
                                     <For
                                       each={
                                         openSessions().get(
@@ -10687,6 +10955,19 @@ function App() {
                   ✕
                 </button>
               </div>
+              <Show when={rolloutInfoOf(selected(), detail())}>
+                {(info) => (
+                  <div class={`rollout-bar ${info().state}`}>
+                    <span class="rollout-badge">
+                      <span class="rollout-dot" />
+                      {info().label}
+                    </span>
+                    <Show when={info().note}>
+                      <span class="rollout-note">{info().note}</span>
+                    </Show>
+                  </div>
+                )}
+              </Show>
               <Show
                 when={!detailLoading() && detail()}
                 fallback={<div class="empty">loading…</div>}

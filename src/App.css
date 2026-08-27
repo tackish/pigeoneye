@@ -2585,6 +2585,92 @@ kbd.key {
   background: color-mix(in srgb, var(--error-fg) 16%, transparent);
   border-color: color-mix(in srgb, var(--error-fg) 42%, transparent);
 }
+
+/* Workload rollout / sync state under the detail header. Colours come from the
+   shared good/warn/bad/accent tokens so light and dark track automatically. */
+.rollout-bar {
+  --rc: var(--good);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-family: var(--font-ui);
+  color: var(--rc);
+  background: color-mix(in srgb, var(--rc) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--rc) 34%, transparent);
+}
+.rollout-bar.progressing {
+  --rc: var(--accent);
+}
+.rollout-bar.applying {
+  --rc: var(--warn);
+}
+.rollout-bar.partial {
+  --rc: var(--warn);
+}
+.rollout-bar.synced {
+  --rc: var(--good);
+}
+.rollout-bar.degraded {
+  --rc: var(--bad);
+}
+.rollout-bar.paused {
+  --rc: var(--dim);
+}
+.rollout-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.rollout-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--rc);
+  flex: none;
+}
+.rollout-bar.progressing .rollout-dot,
+.rollout-bar.applying .rollout-dot {
+  animation: rollout-pulse 1.1s ease-in-out infinite;
+}
+@keyframes rollout-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(0.66);
+  }
+}
+.rollout-note {
+  font-size: 11px;
+  color: inherit;
+  opacity: 0.72;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Per-row rolling marker in a workload list — a small pulsing accent dot that
+   shows only while that workload is mid-rollout (settled rows carry nothing). */
+.row-rollout-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 5px;
+  vertical-align: middle;
+  flex: none;
+  animation: rollout-pulse 1.1s ease-in-out infinite;
+}
 .iss-name {
   overflow: hidden;
   text-overflow: ellipsis;

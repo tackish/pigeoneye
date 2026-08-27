@@ -241,6 +241,10 @@ pub struct ResourceDetail {
     /// Scalable workloads: desired and currently ready replicas.
     pub replicas: Option<i64>,
     pub ready_replicas: Option<i64>,
+    /// metadata.generation, compared against status.observedGeneration to
+    /// tell "spec changed, controller hasn't acted yet" apart from a settled
+    /// object — the "applying" vs "synced" distinction for a rollout badge.
+    pub generation: Option<i64>,
     /// Desired manifest as YAML: status and server-managed metadata
     /// stripped, i.e. what you would `kubectl apply`.
     pub yaml: String,
@@ -2454,6 +2458,7 @@ pub async fn get_resource(
             .or_else(|| v.pointer("/status/availableReplicas"))
             .or_else(|| v.pointer("/status/numberReady"))
             .and_then(|r| r.as_i64()),
+        generation: meta.get("generation").and_then(|g| g.as_i64()),
         links: related_links(&v, &rt.kind),
         has_pod_selector: v.pointer("/spec/selector").is_some()
             && rt.kind != "PersistentVolumeClaim",
