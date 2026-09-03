@@ -1608,7 +1608,13 @@ function App() {
         // the watch expired or the server closed it: re-list, which
         // starts a fresh watch from the new resourceVersion. Bound to
         // pane #0 — the pane this watch belongs to, not whoever's focused.
-        if (panes[0].selected() === rt && panes[0].active() === ctx)
+        // A paused context has broken credentials: re-listing would re-run the
+        // exec, and that helper can open a browser. Wait for a real sign-in.
+        if (
+          panes[0].selected() === rt &&
+          panes[0].active() === ctx &&
+          !authPaused().has(ctx)
+        )
           void refreshList();
         return;
       }
@@ -1806,9 +1812,35 @@ function App() {
     exec_command: string | null;
   } | null>(null);
 
+  /// Contexts whose credentials are broken, parked out of all BACKGROUND
+  /// polling. This is a safety valve, not a nicety: a kubeconfig exec can be a
+  /// helper that opens a BROWSER every time it runs (`aws-vault exec …`,
+  /// oidc-login), and kube-rs re-runs the exec on every request once the token
+  /// can no longer be refreshed. Unattended loops — the 60s Issues sweep above
+  /// all — then spawn a browser tab per cluster per minute, which is how an
+  /// expired SSO session turns into hundreds of tabs and a security lockout.
+  /// Foreground actions the user takes are untouched; a successful reconnect
+  /// (i.e. they signed in) resumes the context.
+  const [authPaused, setAuthPaused] = createSignal<Set<string>>(new Set());
+  function pauseAuth(ctx: string) {
+    if (!ctx || authPaused().has(ctx)) return;
+    const next = new Set(authPaused());
+    next.add(ctx);
+    setAuthPaused(next);
+  }
+  function resumeAuth(ctx: string) {
+    if (!authPaused().has(ctx)) return;
+    const next = new Set(authPaused());
+    next.delete(ctx);
+    setAuthPaused(next);
+  }
+
   /// On an auth failure, ask the backend how this context logs in and
   /// offer to do it — an expired SSO session is a browser click away.
   async function offerLogin(name: string) {
+    // Every auth failure funnels through here, so this is where background
+    // polling for the context gets parked until the user signs in again.
+    pauseAuth(name);
     try {
       const hint = await invoke<{
         kind: string;
@@ -2051,6 +2083,7 @@ function App() {
       await setupContext(name);
       if (!tabs().includes(name)) setTabs([...tabs(), name]);
       setFailed(failed().filter((f) => f.name !== name));
+      resumeAuth(name); // credentials work again: background polling resumes
       if (focus) {
         setAuthHint(null);
         activate(name);
@@ -2746,8 +2779,21 @@ function App() {
   /// yet) blanks the list and shows the scanning spinner — so a tab left open
   /// on Issues no longer flashes empty every 60s.
   function loadIssues(quiet = false) {
-    const targets = tabs();
-    if (!targets.length) return;
+    // Never sweep a context whose credentials are broken: its exec helper can
+    // open a browser on every attempt and this runs every 60s unattended.
+    // Paused contexts stay visible as "needs sign-in" rather than vanishing.
+    const paused = authPaused();
+    const targets = tabs().filter((t) => !paused.has(t));
+    const pausedNote: Record<string, string> = {};
+    for (const t of tabs())
+      if (paused.has(t)) pausedNote[t] = "sign-in needed — sweep paused";
+    if (!targets.length) {
+      setIssues([]);
+      setIssueErrors(pausedNote);
+      setIssuePending([]);
+      setIssuesLoading(false);
+      return;
+    }
     // Each sweep is stamped; a late message from a superseded sweep (e.g. a
     // warm re-aggregate started while the previous one is still streaming)
     // is ignored, so rows never double up and the spinner tracks one sweep.
@@ -2763,7 +2809,7 @@ function App() {
         );
     if (!quiet) {
       setIssues([]);
-      setIssueErrors({});
+      setIssueErrors({ ...pausedNote });
       setIssuePending(targets);
       setIssuesLoading(true);
     }
@@ -2778,7 +2824,7 @@ function App() {
       if (published || gen !== issueSweepSeq) return;
       published = true;
       setIssues(sortIss(acc));
-      setIssueErrors(errAcc);
+      setIssueErrors({ ...pausedNote, ...errAcc });
     };
     const chan = new Channel<{
       context: string;
@@ -2789,14 +2835,20 @@ function App() {
       if (gen !== issueSweepSeq) return;
       if (quiet) {
         seen.add(b.context);
-        if (b.error) errAcc[b.context] = b.error;
-        else acc.push(...b.issues);
+        if (b.error) {
+          errAcc[b.context] = b.error;
+          // Stop at the FIRST failure: one browser, not one per minute.
+          if (isAuthError(b.error)) pauseAuth(b.context);
+        } else acc.push(...b.issues);
         if (seen.size >= targets.length) publishQuiet();
         return;
       }
       setIssuePending(issuePending().filter((c) => c !== b.context));
-      if (b.error) setIssueErrors({ ...issueErrors(), [b.context]: b.error });
-      else if (b.issues.length) setIssues(sortIss([...issues(), ...b.issues]));
+      if (b.error) {
+        setIssueErrors({ ...issueErrors(), [b.context]: b.error });
+        if (isAuthError(b.error)) pauseAuth(b.context);
+      } else if (b.issues.length)
+        setIssues(sortIss([...issues(), ...b.issues]));
       if (!issuePending().length) setIssuesLoading(false);
     };
     void invoke("aggregate_issues", { contexts: targets, channel: chan })
@@ -3013,7 +3065,10 @@ function App() {
       if (ev.type === "RESYNC") {
         // Quiet re-list (like pane 1's refreshList) — NOT sSelect, which would
         // flash the loading spinner and reset cursor/scroll on every resync.
-        if (sSel() === rt && sCtx() === ctx) void sRefreshList();
+        // Same credential guard as pane 1: a paused context must not be
+        // re-listed, because that re-runs the browser-opening exec helper.
+        if (sSel() === rt && sCtx() === ctx && !authPaused().has(ctx))
+          void sRefreshList();
         return;
       }
       const del = ev.type === "DELETED";
@@ -3555,6 +3610,26 @@ function App() {
     apply: ".drawer .yaml-actions",
   };
 
+  /// Button rows that are really a vertical STACK of rows, so ↓/↑ should walk
+  /// those rows instead of skipping the whole section. The value is the
+  /// per-row wrapper, which tells us how many navigable items share one row:
+  /// 1 for related (the row *is* the button), 2 for containers (logs +
+  /// shell). ↓ then drops to the next container rather than sliding sideways.
+  const VERTICAL_ROWS: Record<string, string> = {
+    related: ".rel-row",
+    containers: ".ctr-row",
+  };
+  /// How many navigable items sit in one visual row of `sec` (0 = not a
+  /// vertical section, so ↓/↑ move between sections as before).
+  function rowStride(sec: string): number {
+    const wrap = VERTICAL_ROWS[sec];
+    if (!wrap) return 0;
+    const items = rowItems(sec).length;
+    const rows = focusedPaneRoot().querySelectorAll(`.drawer ${wrap}`).length;
+    if (!items || !rows) return 0;
+    return Math.max(1, Math.round(items / rows));
+  }
+
   // Aux buttons inside a *content* section (copy / copy all) — reachable
   // with → even though the section's Enter still does its primary action
   // (toggle the fold / open the editor).
@@ -3654,7 +3729,7 @@ function App() {
       // Entering the vertical related list while moving UP should land on its
       // LAST item, so ↑ keeps stepping through it instead of skipping past.
       const enterIdx =
-        delta < 0 && sec === "related" ? rowItems(sec).length : 0;
+        delta < 0 && VERTICAL_ROWS[sec] ? rowItems(sec).length : 0;
       requestAnimationFrame(() => focusRowButton(sec, enterIdx));
       return;
     }
@@ -4618,6 +4693,7 @@ function App() {
         const rt = pane.selected();
         const ctx = pane.active();
         if (!rt || !ctx || rt.group !== "" || rt.kind !== "Pod") continue;
+        if (authPaused().has(ctx)) continue; // broken creds: never poke the exec
         const t = pane.table();
         const stats = pane.podStats();
         if (!t || !stats) continue; // metrics not in play (e.g. no metrics-server)
@@ -7479,24 +7555,30 @@ function App() {
       }
       if (!e.shiftKey && (e.key === "j" || e.key === "ArrowDown")) {
         e.preventDefault();
-        // The related list is stacked vertically, so ↓/↑ walks its items
-        // (then falls through to the next section at the end) — → / ← still
-        // work too, but ↓ is what you reach for on a vertical list.
-        if (
-          panelSec() === "related" &&
-          actionIdx() < rowItems("related").length - 1
-        )
-          moveWithinRow(1);
+        // Vertically stacked sections (related, containers) walk their own
+        // rows first and only fall through to the next section at the end.
+        // The step is one ROW, so on a containers row (logs + shell) ↓ drops
+        // to the next container instead of sliding sideways — → / ← still
+        // step button to button within the row.
+        const stride = rowStride(panelSec());
+        if (stride && actionIdx() + stride < rowItems(panelSec()).length)
+          moveWithinRow(stride);
         else movePanel(1);
         return;
       }
       if (!e.shiftKey && (e.key === "k" || e.key === "ArrowUp")) {
         e.preventDefault();
-        if (panelSec() === "related" && actionIdx() > 0) moveWithinRow(-1);
+        const stride = rowStride(panelSec());
+        if (stride && actionIdx() - stride >= 0) moveWithinRow(-stride);
         else movePanel(-1);
         return;
       }
-      if (e.key === "Enter") {
+      // Space presses the cursored control, exactly like Enter. Without it
+      // Space fell through to the table underneath, where it marks the row the
+      // list cursor sits on — so tapping Space on "force" ticked a pod behind
+      // the drawer instead of the checkbox in front of you. (Safe: the global
+      // `typing` guard has already returned for inputs and the YAML editor.)
+      if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         if (BUTTON_ROWS[panelSec()]) pressRowButton();
         else if (secBtn() >= 0) sectionButtons(panelSec())[secBtn()]?.click();
