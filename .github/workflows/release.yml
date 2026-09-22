@@ -81,12 +81,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
-            # Windows support is new and has never been built here. Until a
-            # run proves it green, a failure on this leg must not hold back
-            # the macOS and Linux release — drop `soft` once it has.
-            soft: true
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.soft || false }}
     steps:
       - uses: actions/checkout@v4
 
