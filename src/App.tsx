@@ -138,6 +138,24 @@ interface DisplayRow {
   hay: string;
 }
 
+interface PaneTableView {
+  baseRows: () => { cols: string[]; rows: DisplayRow[] };
+  allColsOrdered: () => string[];
+  view: () => { cols: string[]; allCols: string[]; rows: DisplayRow[] };
+}
+
+// Hidden or reordered columns give each row a projected copy. Reuse it
+// while the base row and the column order are unchanged, so <For> keeps
+// the DOM of every row a watch flush didn't touch.
+const projected = new WeakMap<DisplayRow, { sig: string; row: DisplayRow }>();
+function projectRow(r: DisplayRow, keepIdx: number[], sig: string): DisplayRow {
+  const hit = projected.get(r);
+  if (hit?.sig === sig) return hit.row;
+  const row = { ...r, cells: keepIdx.map((i) => r.cells[i]) };
+  projected.set(r, { sig, row });
+  return row;
+}
+
 interface PodStat {
   key: string;
   cpu: number;
@@ -1480,7 +1498,10 @@ function App() {
     const [colNumFilters, setColNumFilters] = createSignal<
       Record<string, { op: NumOp; val: number }>
     >({});
+    const [tableView, setTableView] = createSignal<PaneTableView | null>(null);
     return {
+      tableView,
+      setTableView,
       active,
       setActive,
       podStats,
@@ -1583,11 +1604,16 @@ function App() {
   // collapse. Flushed on a timer, not per event.
   const watchBuf = new Map<string, { del: boolean; row: TableRow }>();
   let watchFlushTimer: number | undefined;
+  let watchDelTimer: number | undefined;
 
   function flushWatch(seq: number) {
     if (watchFlushTimer != null) {
       window.clearTimeout(watchFlushTimer);
       watchFlushTimer = undefined;
+    }
+    if (watchDelTimer != null) {
+      window.clearTimeout(watchDelTimer);
+      watchDelTimer = undefined;
     }
     if (seq !== listSeq || !watchBuf.size) {
       watchBuf.clear();
@@ -1612,6 +1638,10 @@ function App() {
     if (watchFlushTimer != null) {
       window.clearTimeout(watchFlushTimer);
       watchFlushTimer = undefined;
+    }
+    if (watchDelTimer != null) {
+      window.clearTimeout(watchDelTimer);
+      watchDelTimer = undefined;
     }
     watchBuf.clear();
     if (watchId != null) void invoke("watch_stop", { id: watchId }).catch(() => {});
@@ -1658,8 +1688,10 @@ function App() {
       const del = ev.type === "DELETED";
       for (const r of incoming) watchBuf.set(rowKeyOf(r), { del, row: r });
       // A vanished row (Node gone NotReady/deleted) should leave the list
-      // at once — don't let it sit behind the 700ms coalescing window.
-      if (del) flushWatch(seq);
+      // at once — don't let it sit behind the 700ms coalescing window. A
+      // rollout deletes dozens back to back, so they share one flush a frame
+      // later (a timer: rAF would stall while the window is hidden).
+      if (del) watchDelTimer ??= window.setTimeout(() => flushWatch(seq), 16);
       else scheduleWatchFlush(seq);
     };
     try {
@@ -1702,7 +1734,6 @@ function App() {
     P().setRowFilter(v as never);
   // Backend full-text hits, as row keys (namespace/name). Keys survive
   // the watch informer reordering the list; positional indices would not.
-  const matched = () => P().matched();
   const setMatched: Pane["setMatched"] = (v) => P().setMatched(v as never);
   const [confirm, setConfirm] = createSignal<ConfirmState | null>(null);
   // 0 = Cancel, 1 = the action. Confirm dialogs open on the action so
@@ -2274,7 +2305,6 @@ function App() {
     .then(setForwards)
     .catch(() => {});
   const podStats = () => P().podStats();
-  const nodeStats = () => P().nodeStats();
   async function loadNodeStats(ctx: string, pane = panes[0]) {
     const s0 = pane;
     try {
@@ -2315,14 +2345,6 @@ function App() {
   const setColOrder = (next: Record<string, string[]>) => {
     setColOrderRaw(next);
     localStorage.setItem("pigeoneye.colorder", JSON.stringify(next));
-  };
-  const applyColOrder = (shown: string[]): string[] => {
-    const ord = colOrder()[colKey()];
-    if (!ord || !ord.length) return shown;
-    const set = new Set(shown);
-    const front = ord.filter((c) => set.has(c));
-    const seen = new Set(front);
-    return [...front, ...shown.filter((c) => !seen.has(c))];
   };
   // The column being dragged / the row we'd drop before. Pointer-based
   // (not HTML5 drag) because WKWebView barely fires drag events.
@@ -3009,11 +3031,16 @@ function App() {
   let sWatchId: number | null = null;
   const sWatchBuf = new Map<string, { del: boolean; row: TableRow }>();
   let sWatchTimer: number | undefined;
+  let sWatchDelTimer: number | undefined;
 
   function sFlush(seq: number) {
     if (sWatchTimer != null) {
       window.clearTimeout(sWatchTimer);
       sWatchTimer = undefined;
+    }
+    if (sWatchDelTimer != null) {
+      window.clearTimeout(sWatchDelTimer);
+      sWatchDelTimer = undefined;
     }
     if (seq !== sListSeq || !sWatchBuf.size) {
       sWatchBuf.clear();
@@ -3037,6 +3064,10 @@ function App() {
     if (sWatchTimer != null) {
       window.clearTimeout(sWatchTimer);
       sWatchTimer = undefined;
+    }
+    if (sWatchDelTimer != null) {
+      window.clearTimeout(sWatchDelTimer);
+      sWatchDelTimer = undefined;
     }
     sWatchBuf.clear();
     if (sWatchId != null)
@@ -3107,7 +3138,7 @@ function App() {
       }
       const del = ev.type === "DELETED";
       for (const r of ev.rows ?? []) sWatchBuf.set(rowKeyOf(r), { del, row: r });
-      if (del) sFlush(seq);
+      if (del) sWatchDelTimer ??= window.setTimeout(() => sFlush(seq), 16);
       else sSchedule(seq);
     };
     try {
@@ -5943,256 +5974,14 @@ function App() {
     });
   }
 
-  /// Display cells for every row, built once per list — not per
-  /// keystroke. On a 24k-pod cluster rebuilding this while typing was
-  /// what made search collapse.
-  // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
-  let dispCache = new Map<TableRow, DisplayRow>();
-  let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
-  let dispCacheCustom: Map<string, Record<string, string>> | null = null;
-  let dispCacheCcols: { name: string; path: string }[] | null = null;
-  const baseRows = createMemo(() => {
-    const t = table();
-    const rt = selected();
-    if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
-    let cols = t.columns.map((c) => c.name);
-    if (rt.namespaced) cols = [cols[0], "Namespace", ...cols.slice(1)];
-    const stats = rt.group === "" && rt.kind === "Pod" ? podStats() : null;
-    let statAt = -1;
-    if (stats) {
-      const ri = cols.findIndex((c) => /^restarts$/i.test(c));
-      statAt = ri >= 0 ? ri + 1 : cols.length;
-      cols = [...cols.slice(0, statAt), ...POD_STAT_COLS, ...cols.slice(statAt)];
-    }
-    const nodeView = rt.group === "" && rt.kind === "Node";
-    const nstats = nodeView ? nodeStats() : null;
-    if (nstats) cols = [...cols, ...NODE_STAT_COLS];
-    if (nodeView) cols = [...cols, "AZ"];
-    // User-defined columns, appended last. Label columns read straight
-    // from the row's labels; other paths come from the backend eval.
-    const ccols = myCustomCols();
-    if (ccols.length) cols = [...cols, ...ccols.map((c) => c.name)];
-    const ccolKeys = ccols.map((c) => labelPathKey(c.path));
-    const needBackend = ccolKeys.some((k) => k === null);
-    const cdata = needBackend ? customData() : null;
-    // One object identifies "the stats in play" for the row cache.
-    const activeStats = stats ?? nstats;
-
-    // Reuse the display row for any TableRow object that hasn't
-    // changed identity — a watch flush replaces only touched rows, so
-    // this rebuilds a handful instead of all 24k.
-    const prev =
-      dispCacheStats === activeStats &&
-      dispCacheCustom === cdata &&
-      dispCacheCcols === ccols
-        ? dispCache
-        : null;
-    const rows: DisplayRow[] = t.rows.map((r) => {
-      const hit = prev?.get(r);
-      if (hit) return hit;
-      let cells = r.cells.map((c) => String(c ?? ""));
-      if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
-      if (stats) {
-        const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
-        const six = st
-          ? [
-              fmtCpu(st.cpu),
-              pct(st.cpu, st.cpu_r),
-              pct(st.cpu, st.cpu_l),
-              fmtMem(st.mem),
-              pct(st.mem, st.mem_r),
-              pct(st.mem, st.mem_l),
-            ]
-          : ["-", "-", "-", "-", "-", "-"];
-        cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
-      }
-      if (nstats) {
-        const ns = nstats.get(r.name);
-        cells = [
-          ...cells,
-          ns ? fmtCpu(ns.cpu) : "-",
-          ns ? `${ns.cpu_pct}%` : "-",
-          ns ? fmtMem(ns.mem) : "-",
-          ns ? `${ns.mem_pct}%` : "-",
-        ];
-      }
-      if (nodeView) cells = [...cells, zoneOf(r.labels)];
-      if (ccols.length) {
-        const rec = needBackend
-          ? cdata?.get(`${r.namespace ?? ""}/${r.name}`)
-          : undefined;
-        cells = [
-          ...cells,
-          ...ccols.map((c, i) => {
-            const lk = ccolKeys[i];
-            if (lk !== null) return r.labels?.[lk] ?? "";
-            return rec?.[c.path] ?? "";
-          }),
-        ];
-      }
-      const hay = (
-        cells.join(" ") +
-        " " +
-        Object.entries(r.labels)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(" ")
-      ).toLowerCase();
-      return { row: r, cells, hay };
-    });
-    const next = new Map<TableRow, DisplayRow>();
-    for (const d of rows) next.set(d.row, d);
-    dispCache = next;
-    dispCacheStats = activeStats;
-    dispCacheCustom = cdata;
-    dispCacheCcols = ccols;
-    return { cols, rows };
-  });
-
-  /// Column widths follow the data, but sampling the first rows is
-  /// enough — scanning 24k rows on every change is not.
-  // Display column order: base columns minus hidden, then the user's drag
-  // order. Independent of the row filter so headers/widths don't rebuild
-  // on every keystroke. The header, widths and view() all read this so
-  // they can never disagree on order.
-  const displayCols = createMemo(() => {
-    const b = baseRows();
-    const hide = hiddenFor();
-    return applyColOrder(
-      hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols,
-    );
-  });
-
-  // Every column (visible + hidden) in the user's drag order — what the
-  // columns menu lists so you can reorder by dragging its rows.
-  const allColsOrdered = createMemo(() => applyColOrder(baseRows().cols));
-
-
-  /// Filter, then sort, then drop hidden columns. Only this part runs
-  /// per keystroke, and it works on already-built rows.
-  const view = createMemo(() => {
-    const b = baseRows();
-    if (!b.rows.length && !b.cols.length)
-      return {
-        cols: [] as string[],
-        allCols: [] as string[],
-        rows: [] as DisplayRow[],
-      };
-
-    const raw = rowFilter().trim();
-    let out: DisplayRow[];
-    if (!raw) {
-      out = b.rows;
-    } else {
-      // Query supports plain substrings, /regex/ tokens, and !negation.
-      // A row survives if it matches on visible fields (name/namespace/
-      // cells/labels) OR the backend full-text index (deep fields), then
-      // must satisfy every regex and no negation. Backend hits arrive
-      // keyed by namespace/name so they stay aligned through reordering.
-      const { poss, res, negs } = parseQuery(raw);
-      const extra = matched();
-      const passExtra = (h: string) =>
-        res.every((re) => re.test(h)) && !negs.some((n) => h.includes(n));
-      const nameHit = (r: DisplayRow) =>
-        poss.every((x) => r.row.name.toLowerCase().includes(x));
-      const visibleHit = (r: DisplayRow) =>
-        poss.every((x) => r.hay.includes(x)) && passExtra(r.hay);
-      const deepHit = (r: DisplayRow) =>
-        (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r.hay);
-      out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
-      // Rank by why it matched: name first, then other visible fields,
-      // then deep-field-only hits (which the user can't see, so they'd
-      // otherwise look like noise flooding out the real matches).
-      const sc0 = sortCol();
-      if (sc0 === null) {
-        const rankOf = (r: DisplayRow) =>
-          nameHit(r) ? 0 : visibleHit(r) ? 1 : 2;
-        out = out
-          .map((r, i) => [r, rankOf(r), i] as const)
-          .sort((a, z) => a[1] - z[1] || a[2] - z[2])
-          .map(([r]) => r);
-      }
-    }
-
-    // Per-column value filters (AND across columns). Keyed by column
-    // name; map to the cell index in the full (pre-hide) column list.
-    const cfs = colFilters();
-    const activeCF = Object.entries(cfs)
-      .filter(([, s]) => s.size > 0)
-      .map(([name, set]) => [b.cols.indexOf(name), set] as const)
-      .filter(([ci]) => ci >= 0);
-    if (activeCF.length) {
-      out = out.filter((r) =>
-        activeCF.every(([ci, set]) => set.has(r.cells[ci] ?? "")),
-      );
-    }
-    // Numeric comparison filters (>, ≥, <, ≤, =). A cell with no number
-    // (n/a, -) never satisfies a numeric filter.
-    const activeNF = Object.entries(colNumFilters())
-      .map(([name, f]) => [b.cols.indexOf(name), f] as const)
-      .filter(([ci]) => ci >= 0);
-    if (activeNF.length) {
-      out = out.filter((r) =>
-        activeNF.every(([ci, f]) => {
-          const n = cellNum(r.cells[ci] ?? "");
-          if (n === null) return false;
-          return f.op === ">"
-            ? n > f.val
-            : f.op === ">="
-              ? n >= f.val
-              : f.op === "<"
-                ? n < f.val
-                : f.op === "<="
-                  ? n <= f.val
-                  : n === f.val;
-        }),
-      );
-    }
-
-    // The sort index comes from the DISPLAYED columns (thead iterates
-    // view().cols), but cells here are still the full base set — map the
-    // displayed index back to the base-cells index by column name, or
-    // hiding/reordering a column would sort a different one.
-    const shownCols = displayCols();
-    const sc = sortCol();
-    const sortIdx =
-      sc !== null && sc >= 0 && sc < shownCols.length
-        ? b.cols.indexOf(shownCols[sc])
-        : -1;
-    if (sortIdx >= 0) {
-      const dir = sortDir();
-      out = [...out].sort((x, y) => {
-        const av = x.cells[sortIdx] ?? "";
-        const bv = y.cells[sortIdx] ?? "";
-        // Blanks (n/a, -, <none>, empty) always sink, so a descending
-        // sort doesn't float the not-yet-loaded / metric-less rows to top.
-        const ab = isBlankCell(av);
-        const bb = isBlankCell(bv);
-        if (ab || bb) return ab && bb ? 0 : ab ? 1 : -1;
-        return cmpCells(av, bv) * dir;
-      });
-    } else if (isPod() && !namespace()) {
-      // Default order for an all-namespaces pod list: sink DaemonSet pods
-      // (ebs-csi-node, kube-proxy, log/metrics agents — one per node, so
-      // thousands of them) to the bottom so the workloads you actually
-      // care about sit on top. A real column sort overrides this.
-      out = out
-        .map((r, i) => [r, r.row.owner_kind === "DaemonSet" ? 1 : 0, i] as const)
-        .sort((a, z) => a[1] - z[1] || a[2] - z[2])
-        .map(([r]) => r);
-    }
-
-    // Fast path: nothing hidden and order unchanged → ship base cells.
-    const identity =
-      shownCols.length === b.cols.length &&
-      shownCols.every((c, i) => c === b.cols[i]);
-    if (identity) return { cols: b.cols, allCols: b.cols, rows: out };
-    const keepIdx = shownCols.map((c) => b.cols.indexOf(c));
-    return {
-      cols: shownCols,
-      allCols: b.cols,
-      rows: out.map((r) => ({ ...r, cells: keepIdx.map((i) => r.cells[i]) })),
-    };
-  });
+  // The focused pane's table pipeline. The pane renders it anyway, and
+  // App scope only reads it, so each flush or keystroke computes it once.
+  const NO_BASE = { cols: [] as string[], rows: [] as DisplayRow[] };
+  const NO_VIEW = { ...NO_BASE, allCols: [] as string[] };
+  const baseRows = () => P().tableView()?.baseRows() ?? NO_BASE;
+  const allColsOrdered = () =>
+    P().tableView()?.allColsOrdered() ?? NO_BASE.cols;
+  const view = () => P().tableView()?.view() ?? NO_VIEW;
 
   /// Row count for the header badge — the filtered set lives in view().
   // DaemonSet pods in an all-namespaces pod list — shown in the badge so
@@ -9682,7 +9471,8 @@ function App() {
       const setScrollTop = S.setScrollTop;
       const viewH = () => S.viewH();
       const setViewH = S.setViewH;
-      // per-pane caches (shadow module-level)
+      // per-pane caches
+      // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
       let dispCache = new Map<TableRow, DisplayRow>();
       let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
       let dispCacheCustom: Map<string, Record<string, string>> | null = null;
@@ -9727,7 +9517,7 @@ function App() {
           : detailKey()
             ? "detail"
             : pane();
-      // per-pane derived (copied; bare refs resolve to the rebinds above)
+      // per-pane derived (bare refs resolve to the rebinds above)
       const colKey = () => (selected() ? typeKey(selected()!) : "");
       const applyColOrder = (shown: string[]): string[] => {
         const ord = colOrder()[colKey()];
@@ -9751,6 +9541,9 @@ function App() {
         if (!t) return new Set<string>();
         return new Set(t.columns.filter((c) => c.priority > 0).map((c) => c.name));
       });
+      /// Display cells for every row, built once per list — not per
+      /// keystroke. On a 24k-pod cluster rebuilding this while typing was
+      /// what made search collapse.
       const baseRows = createMemo(() => {
         const t = table();
         const rt = selected();
@@ -9847,6 +9640,10 @@ function App() {
         dispCacheCcols = ccols;
         return { cols, rows };
       });
+      // Display column order: base columns minus hidden, then the user's drag
+      // order. Independent of the row filter so headers/widths don't rebuild
+      // on every keystroke. The header, widths and view() all read this so
+      // they can never disagree on order.
       const displayCols = createMemo(() => {
         const b = baseRows();
         const hide = hiddenFor();
@@ -9854,7 +9651,11 @@ function App() {
           hide.size ? b.cols.filter((c) => !hide.has(c)) : b.cols,
         );
       });
+      // Every column (visible + hidden) in the user's drag order — what the
+      // columns menu lists so you can reorder by dragging its rows.
       const allColsOrdered = createMemo(() => applyColOrder(baseRows().cols));
+      /// Column widths follow the data, but sampling the first rows is
+      /// enough — scanning 24k rows on every change is not.
       const colWidths = createMemo(() => {
         const b = baseRows();
         const idxOf = new Map(b.cols.map((c, i) => [c, i] as const));
@@ -9869,6 +9670,8 @@ function App() {
           return Math.min(Math.max(max * 7.4 + 28, 76), 460);
         });
       });
+      /// Filter, then sort, then drop hidden columns. Only this part runs
+      /// per keystroke, and it works on already-built rows.
       const view = createMemo(() => {
         const b = baseRows();
         if (!b.rows.length && !b.cols.length)
@@ -9987,12 +9790,15 @@ function App() {
           shownCols.every((c, i) => c === b.cols[i]);
         if (identity) return { cols: b.cols, allCols: b.cols, rows: out };
         const keepIdx = shownCols.map((c) => b.cols.indexOf(c));
+        const sig = keepIdx.join();
         return {
           cols: shownCols,
           allCols: b.cols,
-          rows: out.map((r) => ({ ...r, cells: keepIdx.map((i) => r.cells[i]) })),
+          rows: out.map((r) => projectRow(r, keepIdx, sig)),
         };
       });
+      S.setTableView({ baseRows, allColsOrdered, view });
+      onCleanup(() => S.setTableView(null));
       const rowCount = createMemo(() => view().rows.length);
       const dsCount = createMemo(() => {
         if (!isPod() || namespace()) return 0;
@@ -10012,6 +9818,9 @@ function App() {
       });
       const labelEntries = createMemo(() => {
         const m = new Map<string, string>();
+        // Only the columns panel lists these; while it's closed, don't
+        // rescan every row's labels on each watch flush.
+        if (!colsOpen()) return m;
         for (const r of table()?.rows ?? []) {
           for (const [k, v] of Object.entries(r.labels ?? {})) {
             if (v && !m.has(k)) m.set(k, v);
