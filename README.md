@@ -123,7 +123,7 @@ is one click via related-object jumps.
 |---|---|
 | macOS (Apple Silicon / Intel) | ✅ Supported |
 | Linux (x86_64) | ✅ Supported |
-| Windows | ❌ Not supported |
+| Windows (x86_64) | ✅ Supported |
 
 ## Install
 
@@ -140,6 +140,11 @@ Then launch it from anywhere — Spotlight, or just type `peye` in a terminal:
 ```sh
 peye
 ```
+
+**Windows** — download the `-setup.exe` installer from
+[Releases](https://github.com/tackish/pigeoneye/releases) (an `.msi` is
+there too, for deploying by policy). The installer isn't code-signed yet,
+so SmartScreen will ask: **More info → Run anyway**.
 
 **Linux** — download the `.deb` / `.rpm` / `.AppImage` from
 [Releases](https://github.com/tackish/pigeoneye/releases).

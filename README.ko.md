@@ -116,7 +116,7 @@ watch 증분 갱신(배치 병합), 재방문 시 watch 재개 캐시.
 |---|---|
 | macOS (Apple Silicon / Intel) | ✅ 지원 |
 | Linux (x86_64) | ✅ 지원 |
-| Windows | ❌ 미지원 |
+| Windows (x86_64) | ✅ 지원 |
 
 ## 설치
 
@@ -133,6 +133,11 @@ brew install --cask peye
 ```sh
 peye
 ```
+
+**Windows** — [Releases](https://github.com/tackish/pigeoneye/releases)에서
+`-setup.exe`를 받아 설치합니다(정책 배포용 `.msi`도 함께 올라갑니다).
+아직 코드 서명이 없어서 SmartScreen이 막습니다 — **추가 정보 → 실행**으로
+넘어가면 됩니다.
 
 **Linux** — [Releases](https://github.com/tackish/pigeoneye/releases)에서
 `.deb` / `.rpm` / `.AppImage`를 받아 설치합니다.
