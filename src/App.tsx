@@ -12408,9 +12408,11 @@ function App() {
                   <b>esc</b><span>step up: detail → table → sidebar</span>
                   <b>j k ↑ ↓</b><span>move cursor · g/G first/last</span>
                   <b>enter · →</b><span>from the sidebar: open that kind</span>
+                  <b>/ · p (sidebar)</b><span>jump to the kind filter · pin or unpin the kind under the cursor</span>
                   <b>← →</b><span>pan wide tables · ← at the left edge steps up to the sidebar · Home/End first/last column</span>
                   <b>Enter</b><span>open detail — on a namespace, scope to it and list its pods</span>
                   <b>n</b><span>new resource (creatable kinds) · ⇧↑ on top row → search</span>
+                  <b>⌘↵ (in New)</b><span>create the resource without leaving the editor</span>
                   <b>f</b><span>filter the sorted column (values or &gt;/&lt; for numbers)</span>
                   <b>⌘F</b><span>focus the row search / find in the open detail</span>
                   <b>: kind name</b><span>search that kind by name across every open cluster — ↵ on the header re-reads</span>
@@ -12434,13 +12436,13 @@ function App() {
                   <b>← →</b><span>reach a section's buttons — actions, copy / copy all, Apply</span>
                   <b>Enter</b><span>open the focused section (folds · editor) or press its button</span>
                   <b>← h</b><span>back to the table — from a section header, or from the first button of a row</span>
-                  <b>⇞ ⇟ · g G</b><span>scroll · first / last section</span>
+                  <b>⇞ ⇟ · ⌃d ⌃u · g G</b><span>scroll · half page · first / last section</span>
                   <b>fn ↑↓ (⇞⇟)</b><span>page through any list — table, sidebar, palette, pickers</span>
                   <b>⇧J ⇧K</b><span>previous / next resource, panel follows</span>
                   <b>a · t · v</b><span>toggle annotations · status · events</span>
                   <b>c · ⇧D</b><span>cordon/uncordon · drain (nodes) — each asks first</span>
                   <b>r · n</b><span>rollout restart · scale input</span>
-                  <b>p</b><span>node ↔ its pods</span>
+                  <b>p</b><span>node ↔ its pods · on an event, jump to the object it reports</span>
                   <b>⇧F</b><span>port-forward input (pods)</span>
                   <b>d · ⇧X</b><span>delete · force-delete — each asks first</span>
                   <b class="help-sec">split</b>
@@ -12468,7 +12470,7 @@ function App() {
                   <b>alt+1-9 · ⇧tab</b><span>switch terminal tabs (⇧tab works inside the shell)</span>
                   <b>⌘W</b><span>close what's in front: shell → detail → cluster tab</span>
                   <b>⇧⌘W</b><span>close the current shell session</span>
-                  <b>esc</b><span>leave a focused terminal (ctrl+[ sends a real ESC)</span>
+                  <b>esc · ⌃] · ⌘↑</b><span>leave a focused terminal (ctrl+[ sends a real ESC)</span>
                   <b>?</b><span>this help</span>
                 </div>
               </div>
