@@ -15,6 +15,7 @@
     "smoke:issues": "node scripts/smoke-issues.mjs",
     "smoke:chooser": "node scripts/smoke-issue-chooser.mjs",
     "smoke:rollout": "node scripts/smoke-rollout.mjs",
+    "smoke:watch": "node scripts/smoke-watch.mjs",
     "smoke:auth": "node scripts/smoke-auth-pause.mjs && SMOKE_MODE=net node scripts/smoke-auth-pause.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",

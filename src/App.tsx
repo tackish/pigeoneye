@@ -701,6 +701,73 @@ function subtreeMatches(v: unknown, q: string): boolean {
   }
 }
 
+/// One coalesced batch of watch changes, applied to a listed table.
+///
+/// The batch is keyed namespace/name, but building that key for all N rows
+/// just to find the handful that changed allocated a string per row on every
+/// flush — on a 24k-pod list that was the most expensive thing a watch did,
+/// and most of it was immediately garbage. Match the two fields directly
+/// instead, and drop deleted rows in a single pass: splicing them out one at
+/// a time is O(deleted x rows), so a rollout retiring a few hundred pods
+/// walked the whole array a few hundred times.
+///
+/// Returns `prev` itself when nothing in the batch landed, so a flush that
+/// changes nothing can't bust every downstream memo.
+function applyWatchDelta(
+  prev: ResourceTable,
+  pending: Map<string, { del: boolean; row: TableRow }>,
+): ResourceTable {
+  // The batch, re-keyed namespace -> name -> change, so the scan below can
+  // look a row up without building its key string.
+  type Change = { del: boolean; row: TableRow };
+  const byNs = new Map<string, Map<string, Change>>();
+  for (const ch of pending.values()) {
+    const ns = ch.row.namespace ?? "";
+    let m = byNs.get(ns);
+    if (!m) byNs.set(ns, (m = new Map()));
+    m.set(ch.row.name, ch);
+  }
+
+  // Where each changed row currently sits. Last occurrence wins, matching
+  // the key->index map this replaces; a listed kind can't hold the same
+  // namespace/name twice anyway.
+  const at = new Map<Change, number>();
+  for (let i = 0; i < prev.rows.length; i++) {
+    const r = prev.rows[i];
+    const ch = byNs.get(r.namespace ?? "")?.get(r.name);
+    if (ch) at.set(ch, i);
+  }
+
+  let rows = prev.rows;
+  let copied = false;
+  const ensure = () => {
+    if (!copied) {
+      rows = prev.rows.slice();
+      copied = true;
+    }
+  };
+  let dels: Set<number> | null = null;
+  for (const ch of pending.values()) {
+    const i = at.get(ch);
+    if (ch.del) {
+      if (i !== undefined) (dels ??= new Set()).add(i);
+    } else if (i !== undefined) {
+      ensure();
+      rows[i] = ch.row;
+    } else {
+      ensure();
+      rows.push(ch.row);
+    }
+  }
+  if (dels) {
+    // Appends land past prev.rows.length, so they're never in `dels` and
+    // this pass leaves them alone.
+    rows = rows.filter((_, i) => !dels.has(i));
+    copied = true;
+  }
+  return copied ? { ...prev, rows } : prev;
+}
+
 function App() {
   const [contexts, setContexts] = createSignal<ContextInfo[]>([]);
   const [kubeconfigs, setKubeconfigs] = createSignal<string[]>(
@@ -1530,39 +1597,7 @@ function App() {
     watchBuf.clear();
     // The primary machinery is pane #0's alone — write it directly, never
     // through P(), or a background flush lands on whatever pane has focus.
-    panes[0].setTable((prev) => {
-      if (!prev) return prev;
-      // one index pass, then O(1) updates
-      const idx = new Map<string, number>();
-      for (let i = 0; i < prev.rows.length; i++) idx.set(rowKeyOf(prev.rows[i]), i);
-      let rows = prev.rows;
-      let copied = false;
-      const ensure = () => {
-        if (!copied) {
-          rows = prev.rows.slice();
-          copied = true;
-        }
-      };
-      const dels: number[] = [];
-      for (const [k, ch] of pending) {
-        const i = idx.get(k);
-        if (ch.del) {
-          if (i !== undefined) dels.push(i);
-        } else if (i !== undefined) {
-          ensure();
-          rows[i] = ch.row;
-        } else {
-          ensure();
-          rows.push(ch.row);
-        }
-      }
-      if (dels.length) {
-        ensure();
-        dels.sort((a, b) => b - a);
-        for (const i of dels) rows.splice(i, 1);
-      }
-      return copied ? { ...prev, rows } : prev;
-    });
+    panes[0].setTable((prev) => (prev ? applyWatchDelta(prev, pending) : prev));
   }
 
   function scheduleWatchFlush(seq: number) {
@@ -2986,23 +3021,10 @@ function App() {
     }
     const pending = new Map(sWatchBuf);
     sWatchBuf.clear();
-    setSTable((prev) => {
-      if (!prev) return prev;
-      const idx = new Map<string, number>();
-      for (let i = 0; i < prev.rows.length; i++)
-        idx.set(rowKeyOf(prev.rows[i]), i);
-      const rows = prev.rows.slice();
-      const dels: number[] = [];
-      for (const [k, ch] of pending) {
-        const i = idx.get(k);
-        if (ch.del) {
-          if (i !== undefined) dels.push(i);
-        } else if (i !== undefined) rows[i] = ch.row;
-        else rows.push(ch.row);
-      }
-      dels.sort((a, b) => b - a).forEach((i) => rows.splice(i, 1));
-      return { ...prev, rows };
-    });
+    // Same delta the primary applies — including returning `prev` untouched
+    // when nothing landed, which this copy used not to do: it rebuilt the
+    // table object on every flush and re-ran the whole pane pipeline for it.
+    setSTable((prev) => (prev ? applyWatchDelta(prev, pending) : prev));
   }
   function sSchedule(seq: number) {
     if (sWatchTimer == null)
