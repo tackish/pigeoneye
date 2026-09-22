@@ -28,6 +28,11 @@ The table renders only the rows on screen (virtual scroll), so filtering a
 over a watch, and revisiting a view **resumes the watch from cache** — no
 re-list — so only what changed since arrives.
 
+Staying live is cheap too. A pod changing on that 24k-row list lands in
+**~0.2ms**: the event is matched against the rows it names rather than
+re-indexing the whole list, and however many pods a rollout retires at once,
+they leave in a single pass.
+
 **Where the speed comes from:** server-side printer columns (the Table API,
 one request per view — no full-object sync), streaming pagination, virtual
 scrolling, a lazily-built full-text index, watch-based incremental updates
@@ -39,13 +44,27 @@ coalesced into batches, and a view cache that resumes the watch on return.
   every CRD shows up automatically with the columns `kubectl get` prints.
 - **Columns your way** — hide, drag-reorder, and add **custom columns from
   any field or label** (`kubectl -o custom-columns`, but click instead of
-  type). **Pin** frequently-used kinds into your own **groups**.
+  type). **Pin** frequently-used kinds into your own **groups** — and
+  organize the clusters themselves into named context groups too.
 - **Search that finds things** — full-text over *every* field, plus regex,
   `!`negation, per-column value filters, and numeric comparisons (`> 500`).
 - **Search every open cluster at once** — `: pod api-server` asks all of
   them and says which cluster each answer came from; picking one switches
   tab, kind and namespace and lands the cursor on the row. Costs nothing
   until you ask, and the clusters you have browsed answer from memory.
+- **Split into two live views** — `⌘\` puts two fully independent panes
+  side by side: different clusters, kinds and namespaces, each with its own
+  watch, search, sort and detail panel. `⌘←` / `⌘→` moves focus; every
+  shortcut acts on the focused pane.
+- **Cross-cluster Issues** — one ⚠ list of pods in a bad state and nodes
+  that aren't Ready, gathered from *every* connected cluster and refreshed
+  in the background. `↵` jumps straight to the resource in its own tab.
+- **Rollout at a glance** — Deployments, StatefulSets, DaemonSets,
+  ReplicaSets and Argo **Rollouts** carry a dot while replicas are still
+  spreading, so a half-finished rollout is visible without opening it.
+- **Share the exact view** — copy a `peye://` link to the view, or to a
+  single resource. Whoever opens it lands on the same cluster, kind,
+  namespace and row.
 - **A real log viewer** — follow, previous (crashed) container, since
   windows, timestamps, in-view search, copy/download, and combined
   workload logs.
@@ -87,6 +106,9 @@ coalesced into batches, and a view cache that resumes the watch on return.
 | Node & pod **metrics columns** (metrics-server) | ✅ | ✅ | needs Prometheus |
 | `auth can-i` / permissions | ✅ | reverse-lookup | RBAC views |
 | Search by name across every open cluster | ✅ | — | — |
+| Two independent panes side by side | ✅ | — | — |
+| Problem resources across every cluster in one list | ✅ | — | — |
+| Deep link to an exact view / resource | ✅ | — | — |
 | Auth re-login, including CLIs that prompt (OTP) | ✅ | — | — |
 | Per-context pre-connect command (tunnel / `tsh login`) | ✅ | — | — |
 | Time-series metric charts | — | — | ✅ (Prometheus) |
