@@ -3811,6 +3811,16 @@ function App() {
     localStorage.setItem("pigeoneye.theme", theme());
   });
 
+  // Only macOS hides its title bar behind the top bar (titleBarStyle:
+  // Overlay), so only there does the top bar need to keep the traffic
+  // lights' corner clear. Windows and Linux draw a real title bar above
+  // it, and that reserved space would just be a gap.
+  document.documentElement.dataset.os = /Mac|iPhone|iPad/.test(
+    navigator.userAgent,
+  )
+    ? "mac"
+    : "other";
+
   // ── shell tabs ─────────────────────────────────────────
   const shellKey = (t: ShellTarget) =>
     `${t.kind}:${t.resource?.kind ?? ""}:${t.context}:${t.namespace ?? ""}:${t.name}:${t.container ?? ""}`;

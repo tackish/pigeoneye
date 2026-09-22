@@ -78,7 +78,15 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            # Windows support is new and has never been built here. Until a
+            # run proves it green, a failure on this leg must not hold back
+            # the macOS and Linux release — drop `soft` once it has.
+            soft: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.soft || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,7 +123,9 @@ jobs:
           V=${{ needs.version.outputs.version }}
           node -e "const f='package.json',j=require('./'+f);j.version='$V';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
           node -e "const f='src-tauri/tauri.conf.json',j=require('./'+f);j.version='$V';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-          perl -pi -e "s/^version = \".*\"/version = \"$V\"/ if 1..10" src-tauri/Cargo.toml
+          # node, not perl: setup-node guarantees it on every runner, and
+          # the Windows image's perl is not something to bet a release on.
+          node -e "const f='src-tauri/Cargo.toml',fs=require('fs');let n=0;fs.writeFileSync(f,fs.readFileSync(f,'utf8').split('\n').map(l=>(n++<10&&/^version = \"/.test(l))?'version = \"$V\"':l).join('\n'))"
 
       - run: npm ci --registry=https://registry.npmjs.org/
       - run: npm run build
@@ -132,7 +142,12 @@ jobs:
           # sweeping it into the release litters the page with .js/.css/.svg.
           mkdir -p out
           B=src-tauri/target/${{ matrix.target }}/release/bundle
-          if [ "${{ runner.os }}" = "macOS" ]; then
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # NSIS is the installer people expect on Windows; the MSI is
+            # there for anyone deploying by policy.
+            find "$B/nsis" -name '*-setup.exe' -exec cp {} "out/PigeonEye-${V}-windows-x86_64-setup.exe" \; || true
+            find "$B/msi" -name '*.msi' -exec cp {} "out/PigeonEye-${V}-windows-x86_64.msi" \; || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then
             # Ad-hoc sign the whole bundle. Without any signature a
             # quarantined app reads as "damaged" on Apple Silicon (not just
             # "unidentified developer"); an ad-hoc signature makes it a

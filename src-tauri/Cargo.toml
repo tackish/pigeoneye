@@ -33,3 +33,9 @@ thiserror = "2"
 base64 = "0.22"
 serde_json_path = "0.7"
 portable-pty = "0.9.0"
+
+# Windows hands a peye:// link to a NEW process. This is what forwards it
+# to the instance already running; macOS delivers the URL to the live app
+# itself and Linux is packaged without a scheme handler, so neither needs it.
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

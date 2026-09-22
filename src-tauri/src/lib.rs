@@ -17,10 +17,11 @@ async fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
-/// Upgrade the app in place via Homebrew (how it's distributed), so the
-/// user doesn't have to drop to a terminal. Refreshes the tap then
+/// Upgrade the app in place via Homebrew (how it's distributed on macOS),
+/// so the user doesn't have to drop to a terminal. Refreshes the tap then
 /// upgrades the cask; the running process keeps the old code until it's
 /// relaunched. `brew` is resolved from the login-shell PATH set at start.
+#[cfg(target_os = "macos")]
 #[tauri::command]
 async fn self_upgrade() -> Result<String, String> {
     let out = tokio::task::spawn_blocking(|| {
@@ -46,6 +47,15 @@ async fn self_upgrade() -> Result<String, String> {
     } else {
         Err(combined.trim().to_string())
     }
+}
+
+/// Everywhere else the app is a downloaded installer, not a managed cask,
+/// so there is nothing to upgrade in place — say where to get the build
+/// rather than failing with "could not run brew".
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn self_upgrade() -> Result<String, String> {
+    Err("This build updates by download: grab the new installer from the Releases page.".to_string())
 }
 
 /// The macOS build architecture as it appears in release asset names
@@ -651,7 +661,13 @@ fn augment_path() {
     // importantly $KUBECONFIG, so clusters that live only in a
     // $KUBECONFIG-listed file are visible. One newline-separated probe;
     // off-thread with a timeout so a slow rc can't hang startup.
+    // `mut` only matters where the probe below runs.
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut shell_vars: Vec<String> = Vec::new();
+    // Windows has no login shell whose profile would add anything: a GUI
+    // process already inherits the user+machine PATH that every installer,
+    // `winget` and `scoop` shim writes to. Nothing to probe.
+    #[cfg(not(windows))]
     if let Ok(shell) = std::env::var("SHELL") {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -680,10 +696,11 @@ fn augment_path() {
     // Keep whatever we were launched with, then guarantee the common
     // locations even if the shell probe came up short.
     if let Ok(cur) = std::env::var("PATH") {
-        for p in cur.split(':') {
-            push(p.to_string(), &mut dirs);
+        for p in std::env::split_paths(&cur) {
+            push(p.to_string_lossy().into_owned(), &mut dirs);
         }
     }
+    #[cfg(not(windows))]
     for d in [
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
@@ -696,13 +713,37 @@ fn augment_path() {
     ] {
         push(d.to_string(), &mut dirs);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        for d in [".local/bin", "bin", ".krew/bin", "google-cloud-sdk/bin"] {
-            push(format!("{home}/{d}"), &mut dirs);
+    #[cfg(windows)]
+    // Chocolatey's shim directory is machine-wide and is where a
+    // chocolatey-installed kubectl/aws/tsh ends up.
+    for d in ["C:\\ProgramData\\chocolatey\\bin"] {
+        push(d.to_string(), &mut dirs);
+    }
+    if let Some(home) = k8s::home_dir() {
+        // Where the tools a kubeconfig `exec` block names actually land.
+        #[cfg(not(windows))]
+        let extra = [".local/bin", "bin", ".krew/bin", "google-cloud-sdk/bin"];
+        #[cfg(windows)]
+        let extra = [
+            ".krew\\bin",
+            "scoop\\shims",
+            "AppData\\Local\\Google\\Cloud SDK\\google-cloud-sdk\\bin",
+        ];
+        for d in extra {
+            push(home.join(d).to_string_lossy().into_owned(), &mut dirs);
         }
     }
 
-    std::env::set_var("PATH", dirs.join(":"));
+    // join_paths gets the separator right per platform; it only refuses a
+    // directory that contains the separator itself, and a naive join is
+    // still better than leaving PATH as we found it.
+    match std::env::join_paths(dirs.iter()) {
+        Ok(joined) => std::env::set_var("PATH", joined),
+        Err(_) => std::env::set_var(
+            "PATH",
+            dirs.join(if cfg!(windows) { ";" } else { ":" }),
+        ),
+    }
 
     // Import the auth vars from the login shell when the process lacks them.
     for (name, idx) in [("KUBECONFIG", 1), ("AWS_PROFILE", 2), ("AWS_CONFIG_FILE", 3)] {
@@ -717,7 +758,13 @@ fn augment_path() {
 pub fn run() {
     clear_aws_vault_env();
     augment_path();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must come before every other plugin: it is what makes a second launch
+    // (which is how Windows delivers a peye:// link) hand its arguments to
+    // the running app instead of opening a second window.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -735,34 +782,39 @@ pub fn run() {
             // would throw away every open cluster tab. Build the menu
             // without it so ⌘W reaches the app and closes just the
             // thing you are looking at. Edit stays for terminal copy
-            // and paste.
-            use tauri::menu::{MenuBuilder, SubmenuBuilder};
-            let app_menu = SubmenuBuilder::new(app, "PigeonEye")
-                .about(None)
-                .separator()
-                .hide()
-                .hide_others()
-                .show_all()
-                .separator()
-                .quit()
-                .build()?;
-            let edit = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
-            let window = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .fullscreen()
-                .build()?;
-            let menu = MenuBuilder::new(app)
-                .items(&[&app_menu, &edit, &window])
-                .build()?;
-            app.set_menu(menu)?;
+            // and paste. Only macOS gets a menu at all — this one exists
+            // to replace the one macOS imposes, and Windows and Linux
+            // would just gain a menu bar this app has no use for.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::menu::{MenuBuilder, SubmenuBuilder};
+                let app_menu = SubmenuBuilder::new(app, "PigeonEye")
+                    .about(None)
+                    .separator()
+                    .hide()
+                    .hide_others()
+                    .show_all()
+                    .separator()
+                    .quit()
+                    .build()?;
+                let edit = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
+                let window = SubmenuBuilder::new(app, "Window")
+                    .minimize()
+                    .fullscreen()
+                    .build()?;
+                let menu = MenuBuilder::new(app)
+                    .items(&[&app_menu, &edit, &window])
+                    .build()?;
+                app.set_menu(menu)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

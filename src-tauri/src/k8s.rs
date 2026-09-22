@@ -564,6 +564,34 @@ pub async fn auth_hint(
 /// cluster is rarely one command: `tsh login` then the token, a tunnel
 /// left running, a second try with a different flag. The buttons type
 /// into this; the user can type anything else.
+/// Which shell the in-app terminal runs.
+///
+/// Unix answers with $SHELL. Windows has no such variable, so pick
+/// PowerShell: pwsh if the user installed PowerShell 7 (that is the one
+/// whose profile a developer actually maintains), otherwise the Windows
+/// PowerShell every install ships with. Not cmd.exe — a kubeconfig `exec`
+/// login that wants to print a prompt and read an answer needs a shell
+/// that can.
+fn login_shell() -> String {
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+    #[cfg(windows)]
+    {
+        let on_path = |exe: &str| {
+            std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
+                .unwrap_or(false)
+        };
+        if on_path("pwsh.exe") {
+            "pwsh.exe".to_string()
+        } else {
+            "powershell.exe".to_string()
+        }
+    }
+}
+
 pub async fn local_shell_start(
     state: &AppState,
     command: Option<String>,
@@ -572,7 +600,7 @@ pub async fn local_shell_start(
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = login_shell();
     let command = command.filter(|c| !c.trim().is_empty());
     let had_command = command.is_some();
 
@@ -598,14 +626,25 @@ pub async fn local_shell_start(
     // Given a command it runs that and exits, which is what makes its exit
     // status worth something: the caller can connect on a zero and stay put
     // on anything else.
+    #[cfg(not(windows))]
     match &command {
         Some(c) => builder.args(["-ilc", c]),
         None => builder.args(["-il"]),
     }
+    // PowerShell loads the user's profile unless told not to, which is the
+    // point — that is where PATH edits, AWS_PROFILE and any `aws`/`tsh`
+    // shim live, the same reason the unix side insists on an interactive
+    // login shell. `exit $LASTEXITCODE` is what makes a one-command run
+    // report the native program's status instead of PowerShell's own.
+    #[cfg(windows)]
+    match &command {
+        Some(c) => builder.args(["-NoLogo", "-Command", &format!("{c}; exit $LASTEXITCODE")]),
+        None => builder.args(["-NoLogo"]),
+    }
     // A GUI launch inherits no TERM, and a shell that cannot identify the
     // terminal drops to dumb output.
     builder.env("TERM", "xterm-256color");
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = home_dir() {
         builder.cwd(home);
     }
     let mut child = pair
@@ -700,10 +739,23 @@ fn shell_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', r"'\''"))
 }
 
+/// The user's home directory. Unix states it in $HOME; Windows has no $HOME
+/// of its own, so fall back to %USERPROFILE%. $HOME still wins when it is
+/// set, because a unix-ish shell on Windows (Git Bash, MSYS) puts its
+/// dotfiles — and its kubeconfig — under that one.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 fn shellexpand_home(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{rest}", home.to_string_lossy());
+    // `~\` as well as `~/`: a path typed on Windows uses backslashes.
+    let rest = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\"));
+    if let Some(rest) = rest {
+        if let Some(home) = home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
         }
     }
     p.to_string()

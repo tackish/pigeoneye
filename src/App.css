@@ -122,11 +122,16 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  /* Left room for the macOS traffic lights (titleBarStyle: Overlay), which
-     now sit over this bar so it reads as the native title bar. */
-  padding: 8px 14px 8px 82px;
+  padding: 8px 14px;
   background: var(--chrome);
   border-bottom: 1px solid var(--border);
+}
+
+/* Left room for the macOS traffic lights (titleBarStyle: Overlay), which
+   sit over this bar so it reads as the native title bar. Windows and Linux
+   get their own title bar above, so there is nothing to leave room for. */
+:root[data-os="mac"] .topbar {
+  padding-left: 82px;
 }
 
 .logo {
