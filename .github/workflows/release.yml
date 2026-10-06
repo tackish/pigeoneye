@@ -185,7 +185,10 @@ jobs:
           A=$(ls out/*.AppImage 2>/dev/null | head -1)
           [ -z "$A" ] && { echo "no AppImage produced; nothing to do"; exit 0; }
           B=src-tauri/target/${{ matrix.target }}/release/bundle
-          AD=$(ls -d "$B/appimage"/*.AppDir 2>/dev/null | head -1)
+          # Absolute: the repack runs from a temp dir, and appimagetool resolves
+          # the AppDir relative to ITS cwd — a relative path silently made the
+          # whole repack a no-op and shipped the unfixed bundle.
+          AD=$(ls -d "$PWD/$B/appimage"/*.AppDir 2>/dev/null | head -1)
           [ -d "$AD" ] || { echo "no AppDir left by the bundler; keeping the original"; exit 0; }
 
           echo "::group::AppDir permissions BEFORE"
