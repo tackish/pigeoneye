@@ -191,8 +191,11 @@ jobs:
           find "$R" -type f ! -perm -u+x -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && echo "  $1"' _ {} \; 2>/dev/null
           echo "::endgroup::"
 
-          chmod +x "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
-          find "$R" -type f -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && chmod +x "$1"' _ {} \; 2>/dev/null
+          # a+rx, not `chmod +x`: the runner's umask strips the "other" bits, and
+          # the bug was exactly that — AppRun.wrapped shipped as 0770, so anyone
+          # who was not the build user got "Permission denied". AppImages expect 0755.
+          chmod a+rx "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
+          find "$R" -type f -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && chmod a+rx "$1"' _ {} \; 2>/dev/null
 
           echo "::group::AppImage permissions AFTER"
           ls -l "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
