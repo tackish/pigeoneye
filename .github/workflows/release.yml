@@ -160,16 +160,22 @@ jobs:
           fi
           ls -la out
 
-      # The AppImage catalog's automated test (appimage.github.io#6549) found a
-      # non-executable file inside the bundle: AppRun.wrapped exits with
-      # "Permission denied", so the app never shows a window. Repair it here,
-      # and log what was actually wrong so the cause is on record either way.
+      # The AppImage catalog's test (appimage.github.io#6549) rejected our
+      # bundle: AppRun.wrapped was packed 0770 — fine for the build user, but
+      # "Permission denied" for anyone who downloads it. Fix the permissions in
+      # the AppDir the bundler leaves behind and repack it.
+      #
+      # Repacking MUST use the bundler's own linuxdeploy-plugin-appimage. An
+      # earlier attempt used the standalone appimagetool, which swapped in a
+      # different AppImage runtime; the permissions were then correct (the
+      # catalog's own log showed AppRun as 0755) but the app would not launch
+      # at all. Same tool in, same runtime out.
       #
       # EVERY line is best-effort and the step is continue-on-error. A Linux
       # packaging problem must never fail this job: `release` needs the whole
       # build matrix, so a failure here would skip the release and with it the
-      # macOS Homebrew cask update. On any problem the original AppImage is
-      # kept exactly as the bundler produced it.
+      # macOS Homebrew cask update. On any problem the AppImage the bundler
+      # produced is shipped untouched.
       - name: Repair AppImage permissions (best-effort, never fails the job)
         if: runner.os == 'Linux'
         continue-on-error: true
@@ -178,46 +184,45 @@ jobs:
           set +e
           A=$(ls out/*.AppImage 2>/dev/null | head -1)
           [ -z "$A" ] && { echo "no AppImage produced; nothing to do"; exit 0; }
+          B=src-tauri/target/${{ matrix.target }}/release/bundle
+          AD=$(ls -d "$B/appimage"/*.AppDir 2>/dev/null | head -1)
+          [ -d "$AD" ] || { echo "no AppDir left by the bundler; keeping the original"; exit 0; }
+
+          echo "::group::AppDir permissions BEFORE"
+          ls -l "$AD/AppRun" "$AD/AppRun.wrapped" 2>/dev/null
+          echo "files without world-execute:"
+          find "$AD" -type f ! -perm -o+x -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && ls -l "$1"' _ {} \; 2>/dev/null | head -20
+          echo "::endgroup::"
+
+          chmod a+rx "$AD/AppRun" "$AD/AppRun.wrapped" 2>/dev/null
+          find "$AD" -type d -exec chmod a+rx {} \; 2>/dev/null
+          find "$AD" -type f -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && chmod a+rx "$1"' _ {} \; 2>/dev/null
+
+          echo "::group::AppDir permissions AFTER"
+          ls -l "$AD/AppRun" "$AD/AppRun.wrapped" 2>/dev/null
+          echo "::endgroup::"
+
+          PLUG=$(find "$B/appimage" "$HOME/.cache" -maxdepth 5 -name 'linuxdeploy-plugin-appimage*.AppImage' 2>/dev/null | head -1)
+          [ -n "$PLUG" ] || { echo "linuxdeploy-plugin-appimage not found; keeping the original"; exit 0; }
+          chmod +x "$PLUG"
+          echo "repacking with $PLUG"
           W=$(mktemp -d) || exit 0
-          mkdir -p "$W/app" "$W/tool"
-          cp "$A" "$W/app/app.AppImage" && chmod +x "$W/app/app.AppImage" || exit 0
-          ( cd "$W/app" && ./app.AppImage --appimage-extract >/dev/null 2>&1 )
-          R="$W/app/squashfs-root"
-          [ -d "$R" ] || { echo "could not extract; keeping the original"; exit 0; }
+          ( cd "$W" && APPIMAGE_EXTRACT_AND_RUN=1 "$PLUG" --appdir "$AD" >repack.log 2>&1 )
+          NEW=$(ls "$W"/*.AppImage 2>/dev/null | head -1)
+          if [ ! -s "$NEW" ]; then
+            echo "repack produced nothing; keeping the original"
+            tail -20 "$W/repack.log" 2>/dev/null
+            exit 0
+          fi
 
-          echo "::group::AppImage permissions BEFORE"
-          ls -l "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
-          echo "non-executable ELF files:"
-          find "$R" -type f ! -perm -u+x -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && echo "  $1"' _ {} \; 2>/dev/null
-          echo "::endgroup::"
-
-          # a+rx, not `chmod +x`: the runner's umask strips the "other" bits, and
-          # the bug was exactly that — AppRun.wrapped shipped as 0770, so anyone
-          # who was not the build user got "Permission denied". AppImages expect 0755.
-          chmod a+rx "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
-          find "$R" -type f -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && chmod a+rx "$1"' _ {} \; 2>/dev/null
-
-          echo "::group::AppImage permissions AFTER"
-          ls -l "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
-          echo "::endgroup::"
-
-          curl -fsSL -o "$W/tool/tool.AppImage" \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
-            || { echo "appimagetool download failed; keeping the original"; exit 0; }
-          chmod +x "$W/tool/tool.AppImage"
-          ( cd "$W/tool" && ./tool.AppImage --appimage-extract >/dev/null 2>&1 )
-          TOOL="$W/tool/squashfs-root/AppRun"
-          [ -x "$TOOL" ] || { echo "appimagetool not usable; keeping the original"; exit 0; }
-
-          ARCH=x86_64 "$TOOL" "$R" "$W/fixed.AppImage" >/dev/null 2>&1
-          [ -s "$W/fixed.AppImage" ] || { echo "repack produced nothing; keeping the original"; exit 0; }
-
-          # Only swap it in once the repacked file proves it can still unpack.
-          chmod +x "$W/fixed.AppImage"
-          mkdir -p "$W/verify" && cp "$W/fixed.AppImage" "$W/verify/v.AppImage"
-          ( cd "$W/verify" && ./v.AppImage --appimage-extract >/dev/null 2>&1 )
-          if [ -x "$W/verify/squashfs-root/AppRun.wrapped" ]; then
-            cp "$W/fixed.AppImage" "$A" && echo "repacked with executable bits restored: $A"
+          # Only swap it in once the repacked file proves it still unpacks AND
+          # both launchers came out executable.
+          chmod +x "$NEW"
+          mkdir -p "$W/v" && cp "$NEW" "$W/v/v.AppImage"
+          ( cd "$W/v" && ./v.AppImage --appimage-extract >/dev/null 2>&1 )
+          if [ -x "$W/v/squashfs-root/AppRun" ] && [ -x "$W/v/squashfs-root/AppRun.wrapped" ]; then
+            ls -l "$W/v/squashfs-root/AppRun" "$W/v/squashfs-root/AppRun.wrapped"
+            cp "$NEW" "$A" && echo "repacked with the bundler's own tool: $A"
           else
             echo "repacked file failed verification; keeping the original"
           fi
