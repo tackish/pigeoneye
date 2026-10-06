@@ -153,9 +153,71 @@ jobs:
             tar -czf "out/PigeonEye-${{ matrix.label }}.tar.gz" -C "$B/macos" PigeonEye.app
           else
             find "$B/deb" -name '*.deb' -exec cp {} "out/PigeonEye-${V}-linux-x86_64.deb" \;
-            find "$B/appimage" -name '*.AppImage' -exec cp {} "out/PigeonEye-${V}-linux-x86_64.AppImage" \; || true
+            # No 'linux' in an AppImage name — every AppImage is for Linux, and
+            # the catalog's test flags the redundant token. The .deb keeps its
+            # name: nothing reads these, but there is no reason to churn it.
+            find "$B/appimage" -name '*.AppImage' -exec cp {} "out/PigeonEye-${V}-x86_64.AppImage" \; || true
           fi
           ls -la out
+
+      # The AppImage catalog's automated test (appimage.github.io#6549) found a
+      # non-executable file inside the bundle: AppRun.wrapped exits with
+      # "Permission denied", so the app never shows a window. Repair it here,
+      # and log what was actually wrong so the cause is on record either way.
+      #
+      # EVERY line is best-effort and the step is continue-on-error. A Linux
+      # packaging problem must never fail this job: `release` needs the whole
+      # build matrix, so a failure here would skip the release and with it the
+      # macOS Homebrew cask update. On any problem the original AppImage is
+      # kept exactly as the bundler produced it.
+      - name: Repair AppImage permissions (best-effort, never fails the job)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          A=$(ls out/*.AppImage 2>/dev/null | head -1)
+          [ -z "$A" ] && { echo "no AppImage produced; nothing to do"; exit 0; }
+          W=$(mktemp -d) || exit 0
+          mkdir -p "$W/app" "$W/tool"
+          cp "$A" "$W/app/app.AppImage" && chmod +x "$W/app/app.AppImage" || exit 0
+          ( cd "$W/app" && ./app.AppImage --appimage-extract >/dev/null 2>&1 )
+          R="$W/app/squashfs-root"
+          [ -d "$R" ] || { echo "could not extract; keeping the original"; exit 0; }
+
+          echo "::group::AppImage permissions BEFORE"
+          ls -l "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
+          echo "non-executable ELF files:"
+          find "$R" -type f ! -perm -u+x -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && echo "  $1"' _ {} \; 2>/dev/null
+          echo "::endgroup::"
+
+          chmod +x "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
+          find "$R" -type f -exec sh -c 'head -c4 "$1" 2>/dev/null | grep -q ELF && chmod +x "$1"' _ {} \; 2>/dev/null
+
+          echo "::group::AppImage permissions AFTER"
+          ls -l "$R/AppRun" "$R/AppRun.wrapped" 2>/dev/null
+          echo "::endgroup::"
+
+          curl -fsSL -o "$W/tool/tool.AppImage" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            || { echo "appimagetool download failed; keeping the original"; exit 0; }
+          chmod +x "$W/tool/tool.AppImage"
+          ( cd "$W/tool" && ./tool.AppImage --appimage-extract >/dev/null 2>&1 )
+          TOOL="$W/tool/squashfs-root/AppRun"
+          [ -x "$TOOL" ] || { echo "appimagetool not usable; keeping the original"; exit 0; }
+
+          ARCH=x86_64 "$TOOL" "$R" "$W/fixed.AppImage" >/dev/null 2>&1
+          [ -s "$W/fixed.AppImage" ] || { echo "repack produced nothing; keeping the original"; exit 0; }
+
+          # Only swap it in once the repacked file proves it can still unpack.
+          chmod +x "$W/fixed.AppImage"
+          mkdir -p "$W/verify" && cp "$W/fixed.AppImage" "$W/verify/v.AppImage"
+          ( cd "$W/verify" && ./v.AppImage --appimage-extract >/dev/null 2>&1 )
+          if [ -x "$W/verify/squashfs-root/AppRun.wrapped" ]; then
+            cp "$W/fixed.AppImage" "$A" && echo "repacked with executable bits restored: $A"
+          else
+            echo "repacked file failed verification; keeping the original"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
