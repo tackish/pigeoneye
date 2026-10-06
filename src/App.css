@@ -2541,6 +2541,21 @@ kbd.key {
 .iss-row:last-child td {
   border-bottom: none;
 }
+/* The list is windowed: spacer rows stand in for the rows that are not in the
+   DOM so the scrollbar and the cluster card keep their real height. They are
+   structural only — no padding, no separator, nothing to hit. */
+.iss-spacer td {
+  padding: 0;
+  border: none;
+}
+.iss-spacer {
+  pointer-events: none;
+}
+/* With a spacer below it the last real row is no longer :last-child, so it
+   would grow a separator the un-windowed list never had. */
+.iss-row.last-real td {
+  border-bottom: none;
+}
 .view-count {
   margin-left: auto;
   font-size: 10px;

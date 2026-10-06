@@ -125,6 +125,23 @@ if (box) {
   searchMs = performance.now() - tS;
 }
 
+// 5. A BROAD query: every row matches, so the ranking pass runs over all of
+//    them. This is where re-deriving the match to rank it shows up.
+mark("broad");
+let broadMs = 0;
+if (box) {
+  const tB = performance.now();
+  box.value = "";
+  box.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  await wait(200);
+  for (const s of ["p", "po", "pod"]) {
+    box.value = s;
+    box.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await wait(200);
+  }
+  broadMs = performance.now() - tB;
+}
+
 mark("settle"); await wait(600);
 clearInterval(sampler);
 
@@ -134,6 +151,7 @@ console.log(line("listing (first paint)", listMs, "listing"));
 console.log(line("live metrics landing", statsMs, "metrics"));
 console.log(line("watch burst (500 rows)", watchMs, "watch"));
 console.log(line("search typing (4 keys)", searchMs, "search"));
+console.log(line("search broad (all match)", broadMs, "broad"));
 console.log(line("idle after", 0, "settle"));
 
 const bad = [];
@@ -142,6 +160,7 @@ for (const [name, p, limit] of [
   ["live metrics", "metrics", 400],
   ["watch burst", "watch", 250],
   ["search", "search", 250],
+  ["broad search", "broad", 250],
   ["idle", "settle", 100],
 ]) if (worst(p) > limit) bad.push(`${name}: ${worst(p).toFixed(0)}ms > ${limit}ms`);
 if (bad.length) { console.error("PERF HOTPATH FAILED — " + bad.join("; ")); process.exit(1); }

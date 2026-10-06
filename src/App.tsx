@@ -2826,9 +2826,9 @@ function App() {
     if (!n) return;
     const next = Math.min(Math.max(issueIdx() + delta, 0), n - 1);
     setIssueIdx(next);
-    focusedPaneRoot()
-      .querySelector(`.iss-row[data-ii="${next}"]`)
-      ?.scrollIntoView({ block: "nearest" });
+    // The view scrolls itself: the rows are windowed, so the target row may not
+    // be in the DOM to scroll to yet. An effect beside the window arithmetic
+    // owns that now.
   }
   // Hard failures get the strong red badge; softer "not ready yet" states
   // (pending, creating, init) get amber.
@@ -10130,6 +10130,84 @@ function App() {
           .filter((r) => keys.has(rowKeyOf(r)))
           .map((r) => ({ namespace: r.namespace, name: r.name }));
       });
+      // The Issues list is windowed like the table: only rows near the viewport
+      // exist in the DOM, with spacer rows holding the scroll height so the
+      // scrollbar and the cluster cards keep their real size. Row height is the
+      // SAME --row-h the table uses (the global `td` rule applies here too), so
+      // ⌥ +/- still resizes these rows and the window follows along.
+      let issBodyEl: HTMLDivElement | undefined;
+      const [issScroll, setIssScroll] = createSignal(0);
+      const [issViewH, setIssViewH] = createSignal(0);
+      const ISS_HEAD_H = 33; // group header; only shifts the window, overscan absorbs drift
+      const ISS_CHROME = 16; // card borders + the margin between cards
+      const ISS_PAD = 12; // .iss-body padding-top
+      const ISS_OVERSCAN = 10;
+      /// Y of the first row of group `gi` inside the scroll container.
+      const issGroupRowsTop = (g: number) => {
+        const cs = issueClusters();
+        let top = ISS_PAD;
+        for (let k = 0; k < g && k < cs.length; k++)
+          top += ISS_HEAD_H + cs[k].items.length * rowH() + ISS_CHROME;
+        return top + ISS_HEAD_H;
+      };
+      /// Flat index of group `g`'s first row.
+      const issGroupBase = (g: number) => {
+        const cs = issueClusters();
+        let base = 0;
+        for (let k = 0; k < g && k < cs.length; k++) base += cs[k].items.length;
+        return base;
+      };
+      /// The slice of group `g` worth rendering right now.
+      const issWindow = (g: number, n: number) => {
+        const h = rowH();
+        const vh = issViewH() || 600;
+        const rel = (issScroll() - issGroupRowsTop(g)) / h;
+        let first = Math.max(0, Math.floor(rel) - ISS_OVERSCAN);
+        let last = Math.min(n, Math.max(first, Math.ceil(rel + vh / h) + ISS_OVERSCAN));
+        // The cursored row is ALWAYS rendered, whatever the scroll says. The
+        // highlight and Enter must not depend on the scroll having caught up —
+        // and without that the cursor could sit on a row that does not exist.
+        const local = issueIdx() - issGroupBase(g);
+        if (local >= 0 && local < n) {
+          first = Math.min(first, Math.max(0, local - 2));
+          last = Math.max(last, Math.min(n, local + 3));
+        }
+        return { first, last };
+      };
+      /// Y of the row at flat index `n`, for scrolling the cursor into view.
+      const issueRowY = (n: number) => {
+        const cs = issueClusters();
+        let seen = 0;
+        for (let g = 0; g < cs.length; g++) {
+          const len = cs[g].items.length;
+          if (n < seen + len) return issGroupRowsTop(g) + (n - seen) * rowH();
+          seen += len;
+        }
+        return 0;
+      };
+      // Keep the cursor in the scrollport. The rows are windowed, so the old
+      // scrollIntoView on a row element could not be relied on — the row may
+      // not be in the DOM yet when the cursor jumps a page.
+      createEffect(() => {
+        const n = issueIdx();
+        if (customView() !== "issues" || !issues().length) return;
+        const el = issBodyEl;
+        if (!el) return;
+        const h = rowH();
+        const vh = el.clientHeight || issViewH() || 600;
+        const y = issueRowY(n);
+        if (y < el.scrollTop) el.scrollTop = y;
+        else if (y + h > el.scrollTop + vh) el.scrollTop = y + h - vh;
+      });
+      // Row -> its position in the flat issue list. Built once per sweep: the
+      // row template used to call issues().indexOf(i), which is a linear scan
+      // per row and so quadratic over the view — the Issues list is not
+      // virtualised, so every issue pays it.
+      const issueIndex = createMemo(() => {
+        const m = new Map<Issue, number>();
+        issues().forEach((it, n) => m.set(it, n));
+        return m;
+      });
       const issueClusters = createMemo(() => {
         const by = new Map<string, Issue[]>();
         for (const i of issues()) {
@@ -10284,7 +10362,17 @@ function App() {
               </Show>
             </span>
           </div>
-          <div class="iss-body">
+          <div
+            class="iss-body"
+            ref={(el) => {
+              issBodyEl = el;
+              requestAnimationFrame(() => setIssViewH(el.clientHeight));
+            }}
+            onScroll={(e) => {
+              setIssScroll(e.currentTarget.scrollTop);
+              setIssViewH(e.currentTarget.clientHeight);
+            }}
+          >
             <Show when={issuesLoading() && !issues().length}>
               <div class="empty">
                 <span class="ring-spinner" />
@@ -10292,7 +10380,9 @@ function App() {
               </div>
             </Show>
             <For each={issueClusters()}>
-              {(c) => (
+              {(c, gi) => {
+                const win = createMemo(() => issWindow(gi(), c.items.length));
+                return (
                 <div class="iss-group">
                   <div class="iss-group-head">
                     <span class="ctx-dot" style={{ "--ctx-hue": ctxHue(c.context) }} />
@@ -10301,12 +10391,20 @@ function App() {
                   </div>
                   <table class="iss-table">
                     <tbody>
-                      <For each={c.items}>
-                        {(i) => (
+                      <Show when={win().first > 0}>
+                        <tr class="iss-spacer" aria-hidden="true">
+                          <td style={{ height: `${win().first * rowH()}px` }} />
+                        </tr>
+                      </Show>
+                      <For each={c.items.slice(win().first, win().last)}>
+                        {(i, k) => (
                           <tr
                             class="iss-row"
-                            data-ii={issues().indexOf(i)}
-                            classList={{ cursor: issues()[issueIdx()] === i }}
+                            data-ii={issueIndex().get(i) ?? -1}
+                            classList={{
+                              cursor: issues()[issueIdx()] === i,
+                              "last-real": win().first + k() === c.items.length - 1,
+                            }}
                             onClick={() => void gotoIssue(i)}
                           >
                             <td>
@@ -10330,10 +10428,20 @@ function App() {
                           </tr>
                         )}
                       </For>
+                      <Show when={c.items.length - win().last > 0}>
+                        <tr class="iss-spacer" aria-hidden="true">
+                          <td
+                            style={{
+                              height: `${(c.items.length - win().last) * rowH()}px`,
+                            }}
+                          />
+                        </tr>
+                      </Show>
                     </tbody>
                   </table>
                 </div>
-              )}
+                );
+              }}
             </For>
             <For each={Object.entries(issueErrors())}>
               {([ctx, err]) => (

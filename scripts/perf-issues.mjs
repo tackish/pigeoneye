@@ -84,4 +84,21 @@ clearInterval(sampler);
 console.log(`issues: ${N}   rows rendered in the DOM: ${rendered}`);
 console.log(`  open Issues view : wall ${openMs.toFixed(0)} ms   longest main-thread block ${worst("open").toFixed(0)} ms`);
 console.log(`  idle after       : longest block ${worst("settle").toFixed(0)} ms`);
+
+// The list is windowed, so what reaches the DOM must not track the issue
+// count — that is the whole point, and it is what regresses silently.
+const CAP = 200;
+if (rendered > CAP) {
+  console.error(
+    `PERF-ISSUES FAILED — ${rendered} rows reached the DOM for ${N} issues. ` +
+    `The list is supposed to be windowed, so this should stay near a screenful ` +
+    `however many issues there are.`,
+  );
+  process.exit(1);
+}
+if (worst("open") > 120) {
+  console.error(`PERF-ISSUES FAILED — opening the view blocked ${worst("open").toFixed(0)}ms`);
+  process.exit(1);
+}
+console.log("perf-issues ok");
 process.exit(0);

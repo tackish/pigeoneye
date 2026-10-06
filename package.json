@@ -19,7 +19,9 @@
     "perf:sort": "node scripts/perf-age-sort.mjs",
     "perf:idle": "node scripts/perf-idle.mjs",
     "perf:hotpaths": "node scripts/perf-hotpaths.mjs",
+    "perf:split": "node scripts/perf-split.mjs",
     "perf:issues": "node scripts/perf-issues.mjs",
+    "smoke:issues-nav": "node scripts/smoke-issues-nav.mjs",
     "smoke:age": "node scripts/smoke-age-sort.mjs",
     "smoke:auth": "node scripts/smoke-auth-pause.mjs && SMOKE_MODE=net node scripts/smoke-auth-pause.mjs"
   },
