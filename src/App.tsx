@@ -893,15 +893,33 @@ function App() {
     TableRow,
     { atMs: number; baseSec: number } | null
   >();
-  function liveAge(row: TableRow, raw: string): string {
+  function ageAnchorOf(row: TableRow, raw: string) {
     let a = ageAnchor.get(row);
     if (a === undefined) {
       const base = parseAgeSeconds(raw);
-      a = base !== null && base < 3600 ? { atMs: nowTick(), baseSec: base } : null;
+      // Date.now(), not nowTick(): this is a plain timestamp, and reading the
+      // tick here would make every sort that needs it re-run once a second.
+      a = base !== null && base < 3600 ? { atMs: Date.now(), baseSec: base } : null;
       ageAnchor.set(row, a);
     }
+    return a;
+  }
+  function liveAge(row: TableRow, raw: string): string {
+    const a = ageAnchorOf(row, raw);
     if (!a) return raw;
     return fmtAgeSeconds(a.baseSec + Math.floor((nowTick() - a.atMs) / 1000));
+  }
+  /// The age the AGE column is SHOWING, in seconds as of `refMs` — which is
+  /// what a sort on that column has to compare. The cell only holds what the
+  /// server printed when the row arrived, so sorting it ordered rows by how old
+  /// they were when we first saw them; on a list that keeps taking in new rows
+  /// the two drift apart and the column looks unsorted. One reference instant
+  /// per sort is enough: every row ages at the same rate, so the order settled
+  /// here stays correct without re-sorting on every tick.
+  function ageSeconds(row: TableRow, raw: string, refMs: number): number | null {
+    const a = ageAnchorOf(row, raw);
+    if (a) return a.baseSec + (refMs - a.atMs) / 1000;
+    return sortVal(raw); // an hour or older: the server string, which doesn't tick
   }
   const [pickerQ, setPickerQ] = createSignal("");
   const [pickerIdx, setPickerIdx] = createSignal(0);
@@ -6160,6 +6178,17 @@ function App() {
         : -1;
     if (sortIdx >= 0) {
       const dir = sortDir();
+      // Precomputed per row, not per comparison: the comparator runs O(n log n)
+      // times and this would otherwise re-derive the same number for every one
+      // of them. One pass, then the sort is plain number lookups.
+      const ageKey = /^age$/i.test(b.cols[sortIdx] ?? "")
+        ? (() => {
+            const ref = Date.now();
+            const m = new Map<DisplayRow, number | null>();
+            for (const r of out) m.set(r, ageSeconds(r.row, r.cells[sortIdx] ?? "", ref));
+            return m;
+          })()
+        : null;
       out = [...out].sort((x, y) => {
         const av = x.cells[sortIdx] ?? "";
         const bv = y.cells[sortIdx] ?? "";
@@ -6168,6 +6197,11 @@ function App() {
         const ab = isBlankCell(av);
         const bb = isBlankCell(bv);
         if (ab || bb) return ab && bb ? 0 : ab ? 1 : -1;
+        if (ageKey) {
+          const ax = ageKey.get(x);
+          const bx = ageKey.get(y);
+          if (ax != null && bx != null) return (ax - bx) * dir;
+        }
         return cmpCells(av, bv) * dir;
       });
     } else if (isPod() && !namespace()) {
@@ -9960,6 +9994,17 @@ function App() {
             : -1;
         if (sortIdx >= 0) {
           const dir = sortDir();
+          // Precomputed per row, not per comparison: the comparator runs O(n log n)
+          // times and this would otherwise re-derive the same number for every one
+          // of them. One pass, then the sort is plain number lookups.
+          const ageKey = /^age$/i.test(b.cols[sortIdx] ?? "")
+            ? (() => {
+                const ref = Date.now();
+                const m = new Map<DisplayRow, number | null>();
+                for (const r of out) m.set(r, ageSeconds(r.row, r.cells[sortIdx] ?? "", ref));
+                return m;
+              })()
+            : null;
           out = [...out].sort((x, y) => {
             const av = x.cells[sortIdx] ?? "";
             const bv = y.cells[sortIdx] ?? "";
@@ -9968,6 +10013,11 @@ function App() {
             const ab = isBlankCell(av);
             const bb = isBlankCell(bv);
             if (ab || bb) return ab && bb ? 0 : ab ? 1 : -1;
+            if (ageKey) {
+              const ax = ageKey.get(x);
+              const bx = ageKey.get(y);
+              if (ax != null && bx != null) return (ax - bx) * dir;
+            }
             return cmpCells(av, bv) * dir;
           });
         } else if (isPod() && !namespace()) {

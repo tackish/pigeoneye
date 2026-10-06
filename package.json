@@ -16,6 +16,11 @@
     "smoke:chooser": "node scripts/smoke-issue-chooser.mjs",
     "smoke:rollout": "node scripts/smoke-rollout.mjs",
     "smoke:watch": "node scripts/smoke-watch.mjs",
+    "perf:sort": "node scripts/perf-age-sort.mjs",
+    "perf:idle": "node scripts/perf-idle.mjs",
+    "perf:hotpaths": "node scripts/perf-hotpaths.mjs",
+    "perf:issues": "node scripts/perf-issues.mjs",
+    "smoke:age": "node scripts/smoke-age-sort.mjs",
     "smoke:auth": "node scripts/smoke-auth-pause.mjs && SMOKE_MODE=net node scripts/smoke-auth-pause.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
