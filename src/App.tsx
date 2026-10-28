@@ -1621,6 +1621,18 @@ function App() {
   const P = () => panes[focusedPaneIdx()];
   const error = () => P().error();
   const setError: Pane["setError"] = (v) => P().setError(v as never);
+  // Somewhere to put a promise nobody caught. Until this is registered the
+  // boot handler still takes the screen, because a failure to start has
+  // nothing else to show — see src/index.tsx.
+  onMount(() => {
+    (window as unknown as { __peyeError?: (m: string) => void }).__peyeError = (
+      m,
+    ) => setError(prettyError(m));
+    onCleanup(() => {
+      delete (window as unknown as { __peyeError?: (m: string) => void })
+        .__peyeError;
+    });
+  });
   const types = () => P().types();
   const setTypes: Pane["setTypes"] = (v) => P().setTypes(v as never);
   const namespaces = () => P().namespaces();
