@@ -43,7 +43,14 @@ const stats = table.rows.map((r) => ({
   cpu_r: 100, cpu_l: 200, mem_r: 512, mem_l: 1024,
 }));
 
-let podStatsCalls = 0, issueSweeps = 0;
+let podStatsCalls = 0, issueSweeps = 0, eventSweeps = 0;
+// A fixed set of warnings: the Event column's sweep must notice they never
+// change and stop republishing its map, because republishing rebuilds all
+// 20k display rows.
+const warnings = [
+  { key: "ns-0/pod-3", reason: "Unhealthy", message: "probe failed", count: 4, last: "2026-10-27T01:00:00Z" },
+  { key: "ns-0/pod-9", reason: "FailedScheduling", message: "insufficient cpu", count: 1, last: "2026-10-27T01:01:00Z" },
+];
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
   invoke: (cmd) => {
@@ -55,6 +62,7 @@ dom.window.__TAURI_INTERNALS__ = {
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
       case "pod_stats": podStatsCalls++; return Promise.resolve(stats);
+      case "pod_events": eventSweeps++; return Promise.resolve(warnings);
       case "aggregate_issues": issueSweeps++; return Promise.resolve(null);
       default: return Promise.resolve([]);
     }
@@ -80,6 +88,9 @@ ageTh?.querySelector(".th-text")?.dispatchEvent(new dom.window.MouseEvent("click
 await wait(500);
 
 const statsAtStart = podStatsCalls, sweepsAtStart = issueSweeps;
+const eventsAtStart = eventSweeps;
+if (!q("th").some((h) => /^event/i.test((h.textContent || "").trim())))
+  fail("the Event column never appeared");
 const gaps = [];
 let last = performance.now();
 const id = setInterval(() => { const n = performance.now(); gaps.push(n - last); last = n; }, 50);
@@ -92,8 +103,12 @@ const over = (ms) => gaps.filter((g) => g > ms).length;
 console.log(`rows: ${N}, idle window: ${SECS}s, samples: ${gaps.length}`);
 console.log(`  event-loop gap  p50 ${p(0.5).toFixed(0)}ms  p95 ${p(0.95).toFixed(0)}ms  p99 ${p(0.99).toFixed(0)}ms  max ${gaps[gaps.length - 1].toFixed(0)}ms`);
 console.log(`  gaps >100ms: ${over(100)}   >250ms: ${over(250)}`);
-console.log(`  background fetches while idle — pod_stats: ${podStatsCalls - statsAtStart}, issue sweeps: ${issueSweeps - sweepsAtStart}`);
+const evs = eventSweeps - eventsAtStart;
+console.log(`  background fetches while idle — pod_stats: ${podStatsCalls - statsAtStart}, issue sweeps: ${issueSweeps - sweepsAtStart}, event sweeps: ${evs}`);
 
 if (over(250) > 0) fail(`${over(250)} stall(s) over 250ms while idle — a periodic job is doing heavy work`);
+// One per 20s tick and no more: the Event column must never land on a faster
+// timer, and must never retry.
+if (evs > Math.ceil(SECS / 20)) fail(`${evs} event sweeps in ${SECS}s — the Event column is polling too often`);
 console.log("perf-idle ok");
 process.exit(0);

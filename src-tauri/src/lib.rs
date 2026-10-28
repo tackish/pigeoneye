@@ -524,6 +524,15 @@ async fn get_events(
 }
 
 #[tauri::command]
+async fn pod_events(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: Option<String>,
+) -> Result<Vec<k8s::PodEvent>, String> {
+    k8s::pod_events(&state, context, namespace).await
+}
+
+#[tauri::command]
 async fn pod_stats(
     state: State<'_, AppState>,
     context: String,
@@ -861,6 +870,7 @@ pub fn run() {
             exec_stop,
             get_events,
             pod_stats,
+            pod_events,
             node_stats,
             ensure_index,
             filter_rows,

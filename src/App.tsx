@@ -29,6 +29,7 @@ import splitUrl from "./assets/svg/pigeon-split.svg";
 import gearUrl from "./assets/svg/pigeon-gear.svg";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
+import { podEventSignature, shouldPublishEvents } from "./podevents";
 
 // "ResizeObserver loop completed with undelivered notifications" is a benign
 // browser warning (an observer callback reflowed within the same frame) that
@@ -146,6 +147,15 @@ interface PodStat {
   cpu_l: number;
   mem_r: number;
   mem_l: number;
+}
+
+/// The newest warning event against a pod — the Event column.
+interface PodEvent {
+  key: string;
+  reason: string;
+  message: string;
+  count: number;
+  last: string | null;
 }
 
 interface NodeStat {
@@ -666,6 +676,8 @@ function cmpCells(a: string, b: string): number {
 }
 
 const POD_STAT_COLS = ["CPU", "%CPU/R", "%CPU/L", "MEM", "%MEM/R", "%MEM/L"];
+/// The newest warning event against the pod, next to the status it explains.
+const POD_EVENT_COL = "Event";
 const NODE_STAT_COLS = ["CPU", "%CPU", "MEM", "%MEM"];
 
 /// Resource aliases for the `:` command.
@@ -1478,6 +1490,10 @@ function App() {
     const [podStats, setPodStats] = createSignal<Map<string, PodStat> | null>(
       null,
     );
+    const [podEvents, setPodEvents] = createSignal<Map<
+      string,
+      PodEvent
+    > | null>(null);
     const [nodeStats, setNodeStats] = createSignal<Map<
       string,
       NodeStat
@@ -1503,6 +1519,8 @@ function App() {
       setActive,
       podStats,
       setPodStats,
+      podEvents,
+      setPodEvents,
       nodeStats,
       setNodeStats,
       pane,
@@ -2292,6 +2310,7 @@ function App() {
     .then(setForwards)
     .catch(() => {});
   const podStats = () => P().podStats();
+  const podEvents = () => P().podEvents();
   const nodeStats = () => P().nodeStats();
   async function loadNodeStats(ctx: string, pane = panes[0]) {
     const s0 = pane;
@@ -4560,6 +4579,7 @@ function App() {
     s0.setMatched(null);
     stopWatch();
     s0.setPodStats(null);
+    s0.setPodEvents(null);
     s0.setNodeStats(null);
     s0.setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
@@ -4704,7 +4724,41 @@ function App() {
   /// Metrics join the table asynchronously: the first fetch lands as
   /// soon as metrics.k8s.io answers, then retries pick up the
   /// requests/limits once the background indexer has them.
+  /// Warning events for the pod list's Event column.
+  ///
+  /// Swapping this map rebuilds every display row (dispCache keys on its
+  /// identity), so a poll that replaced it every tick would be a steady-state
+  /// perf regression on a big list — the same trap the stats poll works
+  /// around. Hence the signature: nothing is published unless the warnings
+  /// actually changed, so a healthy cluster costs one small request and zero
+  /// rebuilds no matter how long it is left open.
+  const podEventSig = new Map<object, string>();
+  async function loadPodEvents(ctx: string, ns: string | null, pane = panes[0]) {
+    const s0 = pane;
+    try {
+      const evs = await invoke<PodEvent[]>("pod_events", {
+        context: ctx,
+        namespace: ns,
+      });
+      if (
+        s0.active() !== ctx ||
+        s0.selected()?.group !== "" ||
+        s0.selected()?.kind !== "Pod"
+      )
+        return;
+      const sig = podEventSignature(evs);
+      if (!shouldPublishEvents(podEventSig.get(s0), sig, !!s0.podEvents())) return;
+      podEventSig.set(s0, sig);
+      s0.setPodEvents(new Map(evs.map((e) => [e.key, e])));
+    } catch (e) {
+      // No permission to list events, or creds just broke. Leave the column
+      // off rather than half-filled, and never let it drive the exec plugin.
+      if (isCredError(String(e))) pauseAuth(ctx);
+    }
+  }
+
   async function loadPodStats(ctx: string, ns: string | null, pane = panes[0]) {
+    void loadPodEvents(ctx, ns, pane);
     // Whichever pane asked — never P(), which moves with focus while this
     // is in flight.
     const s0 = pane;
@@ -4756,6 +4810,15 @@ function App() {
         const ctx = pane.active();
         if (!rt || !ctx || rt.group !== "" || rt.kind !== "Pod") continue;
         if (authPaused().has(ctx)) continue; // broken creds: never poke the exec
+        // A pod can start failing without the list changing shape at all, so
+        // the Event column refreshes on its own schedule rather than on the
+        // stats burst's "pods appeared" trigger. It publishes nothing unless
+        // the warnings changed, so a quiet cluster stays at zero rebuilds.
+        void loadPodEvents(
+          ctx,
+          rt.namespaced && pane.namespace() ? pane.namespace() : null,
+          pane,
+        );
         const t = pane.table();
         const stats = pane.podStats();
         if (!t || !stats) continue; // metrics not in play (e.g. no metrics-server)
@@ -5967,6 +6030,7 @@ function App() {
   // TableRow → its built DisplayRow, so unchanged rows skip rebuilding.
   let dispCache = new Map<TableRow, DisplayRow>();
   let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
+  let dispCachePevs: Map<string, PodEvent> | null = null;
   let dispCacheCustom: Map<string, Record<string, string>> | null = null;
   let dispCacheCcols: { name: string; path: string }[] | null = null;
   const baseRows = createMemo(() => {
@@ -5975,7 +6039,18 @@ function App() {
     if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
     let cols = t.columns.map((c) => c.name);
     if (rt.namespaced) cols = [cols[0], "Namespace", ...cols.slice(1)];
-    const stats = rt.group === "" && rt.kind === "Pod" ? podStats() : null;
+    const isPodList = rt.group === "" && rt.kind === "Pod";
+    // Next to the STATUS it explains. Only present once a warning sweep has
+    // come back, so a cluster that will not let us list events just keeps
+    // the table it had rather than growing a column of blanks.
+    const pevs = isPodList ? podEvents() : null;
+    let evAt = -1;
+    if (pevs) {
+      const si = cols.findIndex((c) => /^status$/i.test(c));
+      evAt = si >= 0 ? si + 1 : cols.length;
+      cols = [...cols.slice(0, evAt), POD_EVENT_COL, ...cols.slice(evAt)];
+    }
+    const stats = isPodList ? podStats() : null;
     let statAt = -1;
     if (stats) {
       const ri = cols.findIndex((c) => /^restarts$/i.test(c));
@@ -6001,6 +6076,7 @@ function App() {
     // this rebuilds a handful instead of all 24k.
     const prev =
       dispCacheStats === activeStats &&
+      dispCachePevs === pevs &&
       dispCacheCustom === cdata &&
       dispCacheCcols === ccols
         ? dispCache
@@ -6010,6 +6086,14 @@ function App() {
       if (hit) return hit;
       let cells = r.cells.map((c) => String(c ?? ""));
       if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+      if (pevs) {
+        const e = pevs.get(`${r.namespace ?? ""}/${r.name}`);
+        // Empty means nothing is wrong — the reading that makes the column
+        // worth scanning. A repeat count rides along; the message is the
+        // cell\'s tooltip, so the column stays one reason wide.
+        const cell = e ? (e.count > 1 ? `${e.reason} ×${e.count}` : e.reason) : "";
+        cells = [...cells.slice(0, evAt), cell, ...cells.slice(evAt)];
+      }
       if (stats) {
         const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
         const six = st
@@ -6061,6 +6145,7 @@ function App() {
     for (const d of rows) next.set(d.row, d);
     dispCache = next;
     dispCacheStats = activeStats;
+    dispCachePevs = pevs;
     dispCacheCustom = cdata;
     dispCacheCcols = ccols;
     return { cols, rows };
@@ -9677,6 +9762,7 @@ function App() {
       });
       const active = () => S.active();
       const podStats = () => S.podStats();
+      const podEvents = () => S.podEvents();
       const nodeStats = () => S.nodeStats();
       const customView = () => S.customView();
       const indexing = () => S.indexing();
@@ -9719,6 +9805,7 @@ function App() {
       // per-pane caches (shadow module-level)
       let dispCache = new Map<TableRow, DisplayRow>();
       let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
+      let dispCachePevs: Map<string, PodEvent> | null = null;
       let dispCacheCustom: Map<string, Record<string, string>> | null = null;
       let dispCacheCcols: { name: string; path: string }[] | null = null;
       // Per-pane kind/field/region predicates. These derive from this
@@ -9791,7 +9878,18 @@ function App() {
         if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
         let cols = t.columns.map((c) => c.name);
         if (rt.namespaced) cols = [cols[0], "Namespace", ...cols.slice(1)];
-        const stats = rt.group === "" && rt.kind === "Pod" ? podStats() : null;
+        const isPodList = rt.group === "" && rt.kind === "Pod";
+        // Next to the STATUS it explains. Only present once a warning sweep has
+        // come back, so a cluster that will not let us list events just keeps
+        // the table it had rather than growing a column of blanks.
+        const pevs = isPodList ? podEvents() : null;
+        let evAt = -1;
+        if (pevs) {
+          const si = cols.findIndex((c) => /^status$/i.test(c));
+          evAt = si >= 0 ? si + 1 : cols.length;
+          cols = [...cols.slice(0, evAt), POD_EVENT_COL, ...cols.slice(evAt)];
+        }
+        const stats = isPodList ? podStats() : null;
         let statAt = -1;
         if (stats) {
           const ri = cols.findIndex((c) => /^restarts$/i.test(c));
@@ -9817,6 +9915,7 @@ function App() {
         // this rebuilds a handful instead of all 24k.
         const prev =
           dispCacheStats === activeStats &&
+          dispCachePevs === pevs &&
           dispCacheCustom === cdata &&
           dispCacheCcols === ccols
             ? dispCache
@@ -9826,6 +9925,14 @@ function App() {
           if (hit) return hit;
           let cells = r.cells.map((c) => String(c ?? ""));
           if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+          if (pevs) {
+            const e = pevs.get(`${r.namespace ?? ""}/${r.name}`);
+            // Empty means nothing is wrong — the reading that makes the column
+            // worth scanning. A repeat count rides along; the message is the
+            // cell\'s tooltip, so the column stays one reason wide.
+            const cell = e ? (e.count > 1 ? `${e.reason} ×${e.count}` : e.reason) : "";
+            cells = [...cells.slice(0, evAt), cell, ...cells.slice(evAt)];
+          }
           if (stats) {
             const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
             const six = st
@@ -9877,6 +9984,7 @@ function App() {
         for (const d of rows) next.set(d.row, d);
         dispCache = next;
         dispCacheStats = activeStats;
+        dispCachePevs = pevs;
         dispCacheCustom = cdata;
         dispCacheCcols = ccols;
         return { cols, rows };
@@ -11141,7 +11249,23 @@ function App() {
                               {(cell, i) => (
                                 <td
                                   class={
-                                    i() === 0 ? "cell name" : cellClass(cell)
+                                    i() === 0
+                                      ? "cell name"
+                                      : // the Event column carries nothing but
+                                        // warnings, so every reason in it reads
+                                        // as one — no guessing at reason names
+                                        displayCols()[i()] === POD_EVENT_COL
+                                        ? cell
+                                          ? "cell bad"
+                                          : "cell"
+                                        : cellClass(cell)
+                                  }
+                                  title={
+                                    displayCols()[i()] === POD_EVENT_COL
+                                      ? podEvents()?.get(
+                                          `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                        )?.message
+                                      : undefined
                                   }
                                 >
                                   <Show when={i() === 0}>

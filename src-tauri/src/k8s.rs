@@ -3281,6 +3281,173 @@ pub async fn get_events(
 }
 
 #[derive(Serialize)]
+pub struct PodEvent {
+    /// "namespace/name" of the pod the event is about.
+    pub key: String,
+    pub reason: String,
+    pub message: String,
+    pub count: i64,
+    pub last: Option<String>,
+}
+
+/// The newest WARNING event per pod, for the Event column in the pod list.
+///
+/// Only warnings, for two reasons. Events expire after an hour by default, so
+/// the Normal ones (Scheduled, Pulled, Started) are gone from every pod that
+/// has been up a while — a column that showed them would be blank for most of
+/// the list anyway, and arbitrarily so. And the whole point of the column is
+/// the pod that did NOT come up: FailedScheduling, FailedMount, Unhealthy,
+/// BackOff. An empty cell then means "nothing is wrong", which is the reading
+/// that makes the column worth scanning.
+///
+/// Keeping it to warnings is also what makes it cheap enough to poll: the
+/// selector is applied by the API server, and a healthy cluster returns almost
+/// nothing where the full event list on a big cluster is six figures of rows.
+pub async fn pod_events(
+    state: &AppState,
+    context: String,
+    namespace: Option<String>,
+) -> Result<Vec<PodEvent>, String> {
+    let client = client(state, &context).await?;
+    let base = match namespace.as_deref() {
+        Some(ns) if !ns.is_empty() => format!("/api/v1/namespaces/{ns}/events"),
+        _ => "/api/v1/events".to_string(),
+    };
+    // resourceVersion=0 serves from the API server's watch cache rather than a
+    // quorum read out of etcd — this is a column, not an audit log.
+    let url = format!(
+        "{base}?fieldSelector={}&limit=500&resourceVersion=0",
+        urlencode("involvedObject.kind=Pod,type=Warning"),
+    );
+    let req = http::Request::get(&url)
+        .header(http::header::ACCEPT, "application/json")
+        .body(Vec::new())
+        .map_err(err)?;
+    let list: serde_json::Value = client.request(req).await.map_err(err)?;
+    Ok(newest_per_pod(list["items"].as_array().map(|v| &v[..]).unwrap_or(&[])))
+}
+
+/// One event per pod — the newest — out of a raw event list.
+fn newest_per_pod(items: &[serde_json::Value]) -> Vec<PodEvent> {
+    let mut best: std::collections::HashMap<String, PodEvent> =
+        std::collections::HashMap::new();
+    for v in items {
+        let obj = &v["involvedObject"];
+        let name = obj["name"].as_str().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let ns = obj["namespace"]
+            .as_str()
+            .or_else(|| v.pointer("/metadata/namespace").and_then(|n| n.as_str()))
+            .unwrap_or_default();
+        let ev = PodEvent {
+            key: format!("{ns}/{name}"),
+            reason: v["reason"].as_str().unwrap_or_default().to_string(),
+            message: v["message"].as_str().unwrap_or_default().to_string(),
+            count: v["count"].as_i64().unwrap_or(1),
+            // core/v1 Events carry lastTimestamp; the ones the events.k8s.io
+            // recorder writes leave it null and carry eventTime instead.
+            last: v["lastTimestamp"]
+                .as_str()
+                .or_else(|| v["eventTime"].as_str())
+                .or_else(|| v.pointer("/metadata/creationTimestamp").and_then(|t| t.as_str()))
+                .map(String::from),
+        };
+        // Timestamps are RFC 3339 in UTC, so they compare as strings. An event
+        // with no timestamp at all loses to one that has any — None sorts
+        // below Some, which is the order we want here.
+        match best.get(&ev.key) {
+            Some(cur) if cur.last >= ev.last => {}
+            _ => {
+                best.insert(ev.key.clone(), ev);
+            }
+        }
+    }
+    let mut out: Vec<PodEvent> = best.into_values().collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+#[cfg(test)]
+mod pod_event_tests {
+    use super::newest_per_pod;
+    use serde_json::json;
+
+    fn ev(ns: &str, name: &str, reason: &str, last: Option<&str>) -> serde_json::Value {
+        let mut v = json!({
+            "involvedObject": {"kind": "Pod", "name": name, "namespace": ns},
+            "reason": reason,
+            "message": format!("{reason} happened"),
+            "count": 1,
+        });
+        if let Some(t) = last {
+            v["lastTimestamp"] = json!(t);
+        }
+        v
+    }
+
+    #[test]
+    fn keeps_the_newest_per_pod() {
+        let out = newest_per_pod(&[
+            ev("sre", "a", "FailedScheduling", Some("2026-10-27T01:00:00Z")),
+            ev("sre", "a", "Preempted", Some("2026-10-27T01:05:00Z")),
+            ev("sre", "a", "FailedMount", Some("2026-10-27T00:10:00Z")),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reason, "Preempted");
+        assert_eq!(out[0].key, "sre/a");
+    }
+
+    #[test]
+    fn arrival_order_does_not_decide() {
+        let newest = Some("2026-10-27T09:00:00Z");
+        let older = Some("2026-10-27T08:00:00Z");
+        for pair in [[newest, older], [older, newest]] {
+            let out = newest_per_pod(&[
+                ev("sre", "a", "New", pair[0]),
+                ev("sre", "a", "Old", pair[1]),
+            ]);
+            let want = if pair[0] == newest { "New" } else { "Old" };
+            assert_eq!(out[0].reason, want);
+        }
+    }
+
+    #[test]
+    fn separates_same_name_in_different_namespaces() {
+        let out = newest_per_pod(&[
+            ev("one", "a", "FailedScheduling", Some("2026-10-27T01:00:00Z")),
+            ev("two", "a", "Unhealthy", Some("2026-10-27T01:00:00Z")),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].key, "one/a");
+        assert_eq!(out[1].key, "two/a");
+    }
+
+    #[test]
+    fn a_timestamped_event_beats_an_undated_one() {
+        let out = newest_per_pod(&[
+            ev("sre", "a", "Undated", None),
+            ev("sre", "a", "Dated", Some("2026-10-27T01:00:00Z")),
+        ]);
+        assert_eq!(out[0].reason, "Dated");
+    }
+
+    #[test]
+    fn falls_back_to_event_time() {
+        let mut v = ev("sre", "a", "Newer", None);
+        v["eventTime"] = json!("2026-10-27T02:00:00Z");
+        let out = newest_per_pod(&[ev("sre", "a", "Older", Some("2026-10-27T01:00:00Z")), v]);
+        assert_eq!(out[0].reason, "Newer");
+    }
+
+    #[test]
+    fn skips_an_event_with_no_involved_pod() {
+        assert!(newest_per_pod(&[ev("sre", "", "Orphan", Some("2026-10-27T01:00:00Z"))]).is_empty());
+    }
+}
+
+#[derive(Serialize)]
 pub struct PodStat {
     pub key: String,
     pub cpu: i64,
