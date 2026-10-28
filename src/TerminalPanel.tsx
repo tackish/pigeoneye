@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
+import { autotypeLine } from "./autotype";
 
 export interface ResourceTypeRef {
   group: string;
@@ -393,10 +394,14 @@ export default function TerminalPanel(props: {
     }
     if (t.kind === "logs") term.write(logHeaderLine());
     const chan = new Channel<string>();
+    // When the shell last printed anything. A shell that has stopped printing
+    // is the only moment it is safe to type into.
+    let lastOut = 0;
     chan.onmessage = (d) => {
       // Stopping a session is not instant: the backend can still be
       // draining what the process already printed.
       if (disposed) return;
+      lastOut = Date.now();
       // The marker carries a verdict when the session ran one command:
       // ":0" is what a pre-connect step has to clear to go on connecting.
       if (d === "\u0000exit" || d === "\u0000exit:0") {
@@ -478,12 +483,25 @@ export default function TerminalPanel(props: {
             () => {},
           ),
       );
-      // A line to run on arrival. It waits for the shell to finish drawing
-      // its first prompt — type into zsh before its line editor is up and
-      // the characters are swallowed.
+      // A line to run on arrival — see src/autotype.ts for why this is not
+      // just a delay and a newline.
       if (t.kind === "local" && t.initialCommand && !t.oneShot) {
         const line = t.initialCommand;
-        setTimeout(() => send(line + "\n"), 400);
+        const tm = term; // narrowing does not survive into the callbacks below
+        void autotypeLine(line, {
+          idleMs: () => (lastOut ? Date.now() - lastOut : null),
+          nap: (ms) => new Promise((r) => setTimeout(r, ms)),
+          send,
+          lineText: () => {
+            const buf = tm.buffer.active;
+            return (
+              buf.getLine(buf.viewportY + buf.cursorY)?.translateToString(true) ??
+              ""
+            );
+          },
+          note: (msg) => tm.write(`\r\n\x1b[33m${msg}\x1b[0m\r\n`),
+          alive: () => !disposed,
+        });
       }
       term.onResize(
         ({ cols, rows }) =>
