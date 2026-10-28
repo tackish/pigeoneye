@@ -7686,8 +7686,24 @@ function App() {
       }
       if (e.key === "ArrowRight" || e.key === "l") {
         e.preventDefault();
-        if (sideIdx() === -1) openIssues();
-        else setPane("table");
+        if (sideIdx() === -1) {
+          openIssues();
+          return;
+        }
+        setPane("table");
+        // `l` is logs everywhere else, and the list it steps into is already
+        // on screen — so moving focus and stopping there reads as "l did
+        // nothing" and costs a keystroke to find out. Step in AND open the
+        // logs. Plain → still only moves, for arrowing around without
+        // opening anything.
+        if (e.key === "l") {
+          const vr = view().rows[cursor()];
+          if (vr) {
+            if (isPod()) void openPodSessionForRow("logs", vr.row);
+            else if (hasWorkloadLogs())
+              openWorkloadLogs(vr.row.namespace, vr.row.name);
+          }
+        }
         return;
       }
       // typing a kind name is the fastest way through a long sidebar
@@ -12721,7 +12737,7 @@ function App() {
                   <b>/</b><span>search rows (any field value)</span>
                   <b>esc</b><span>step up: detail → table → sidebar</span>
                   <b>j k ↑ ↓</b><span>move cursor · g/G first/last</span>
-                  <b>enter · →</b><span>from the sidebar: open that kind</span>
+                  <b>enter · →</b><span>from the sidebar: open that kind · → steps into the list without opening anything</span>
                   <b>/ · p (sidebar)</b><span>jump to the kind filter · pin or unpin the kind under the cursor</span>
                   <b>← →</b><span>pan wide tables · ← at the left edge steps up to the sidebar · Home/End first/last column</span>
                   <b>Enter</b><span>open detail — on a namespace, scope to it and list its pods</span>
@@ -12732,7 +12748,7 @@ function App() {
                   <b>: kind name</b><span>search that kind by name across every open cluster — ↵ on the header re-reads</span>
                   <b>tab (in :)</b><span>complete to the highlighted kind and keep typing</span>
                   <b>s</b><span>shell (pod / node)</span>
-                  <b>l</b><span>logs (pod / workload aggregate)</span>
+                  <b>l</b><span>logs (pod / workload aggregate) — also from the sidebar, which steps into the list and opens them</span>
                   <b>e / y</b><span>edit manifest (YAML) of cursor row</span>
                   <b>⌘C</b><span>copy the cursor row's name (or the manifest, in an open detail)</span>
                   <b>space</b><span>mark a row · ⌘A all · esc clears</span>

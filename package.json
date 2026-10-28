@@ -25,6 +25,8 @@
     "smoke:age": "node scripts/smoke-age-sort.mjs",
     "smoke:autotype": "node scripts/smoke-autotype.mjs",
     "smoke:podevents": "node scripts/smoke-pod-events.mjs",
+    "smoke:logskey": "node scripts/smoke-logs-key.mjs",
+    "smoke:split-regress": "node scripts/smoke-split-regress.mjs",
     "smoke:auth": "node scripts/smoke-auth-pause.mjs && SMOKE_MODE=net node scripts/smoke-auth-pause.mjs"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
