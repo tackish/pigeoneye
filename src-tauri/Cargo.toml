@@ -25,7 +25,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 http = "1"
-kube = { version = "1", features = ["client", "runtime", "ws"] }
+# socks5/http-proxy: honour a kubeconfig `proxy-url:` (or HTTPS_PROXY) so a
+# cluster only reachable through a bastion or a corporate proxy connects at
+# all. Without them kube does not fall back to a direct connection — it
+# refuses to build the client. Inert when no proxy is configured.
+kube = { version = "1", features = ["client", "runtime", "ws", "socks5", "http-proxy"] }
 k8s-openapi = { version = "0.25", features = ["latest"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"

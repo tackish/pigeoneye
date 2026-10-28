@@ -5043,3 +5043,164 @@ mod cc_tests {
         assert_eq!(ev(".metadata.creationTimestamp"), "2026-01-01T00:00:00Z");
     }
 }
+
+/// The proxy features are build-time flags, so nothing in this file changes
+/// when they are on or off — what changes is whether a kubeconfig `proxy-url:`
+/// works or refuses to build a client at all. These tests stand a real proxy
+/// in front of a real `kube::Client` and read the bytes it is sent, so the
+/// flags are verified end to end rather than merely compiled.
+#[cfg(test)]
+mod proxy_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A kube client aimed at `host`, routed through `proxy`.
+    fn client_through(proxy: &str, host: &str) -> kube::Client {
+        let mut cfg = kube::Config::new(format!("https://{host}").parse().unwrap());
+        cfg.proxy_url = Some(proxy.parse().unwrap());
+        kube::Client::try_from(cfg).expect("the proxy feature must be built in")
+    }
+
+    /// Speaks just enough SOCKS5 to report what it was asked to connect to.
+    async fn socks5_target(listener: TcpListener) -> String {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut greet = [0u8; 3];
+        s.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet[0], 0x05, "not a SOCKS5 greeting");
+        s.write_all(&[0x05, 0x00]).await.unwrap(); // no auth
+        let mut head = [0u8; 4]; // VER CMD RSV ATYP
+        s.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[1], 0x01, "expected CONNECT");
+        let host = match head[3] {
+            0x01 => {
+                let mut a = [0u8; 4];
+                s.read_exact(&mut a).await.unwrap();
+                format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                s.read_exact(&mut len).await.unwrap();
+                let mut d = vec![0u8; len[0] as usize];
+                s.read_exact(&mut d).await.unwrap();
+                String::from_utf8_lossy(&d).into_owned()
+            }
+            other => panic!("unexpected address type {other}"),
+        };
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port).await.unwrap();
+        format!("{host}:{}", u16::from_be_bytes(port))
+    }
+
+    /// Reads the CONNECT request line an HTTP proxy is sent.
+    async fn http_connect_target(listener: TcpListener) -> String {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n") {
+            if s.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        String::from_utf8_lossy(&buf).trim().to_string()
+    }
+
+    /// The whole point of the socks5 feature: a `proxy-url:` of that scheme
+    /// routes the API server connection instead of refusing to build.
+    #[tokio::test]
+    async fn socks5_carries_the_api_server_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(socks5_target(listener));
+
+        let client = client_through(&format!("socks5://{addr}"), "127.0.0.1:6443");
+        // The handshake is all we need; there is no server behind the proxy,
+        // so the request itself is expected to fail afterwards.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.apiserver_version(),
+        )
+        .await;
+
+        let target = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("the client never reached the proxy")
+            .unwrap();
+        assert_eq!(target, "127.0.0.1:6443");
+    }
+
+    /// Same for an HTTP proxy, which tunnels with CONNECT because the API
+    /// server is always https.
+    #[tokio::test]
+    async fn an_http_proxy_tunnels_with_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(http_connect_target(listener));
+
+        let client = client_through(&format!("http://{addr}"), "127.0.0.1:6443");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.apiserver_version(),
+        )
+        .await;
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("the client never reached the proxy")
+            .unwrap();
+        assert!(
+            line.starts_with("CONNECT 127.0.0.1:6443"),
+            "expected a CONNECT tunnel, got {line:?}"
+        );
+    }
+
+    /// Which end resolves DNS. It decides whether a kubeconfig may name the
+    /// cluster by hostname: if the proxy resolves, the name never has to work
+    /// on this machine; if we resolve, it does. kube has no `socks5h` scheme
+    /// to pick with, so the answer is whatever the connector does -- pinned
+    /// here because a kubeconfig is written against it.
+    #[tokio::test]
+    async fn socks5_leaves_dns_to_the_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(socks5_target(listener));
+
+        // .invalid is reserved by RFC 2606 and never resolves anywhere.
+        let client = client_through(&format!("socks5://{addr}"), "not-in-dns.invalid:6443");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.apiserver_version(),
+        )
+        .await;
+
+        let target = tokio::time::timeout(std::time::Duration::from_secs(5), seen)
+            .await
+            .expect("a name that does not resolve never reached the proxy")
+            .unwrap();
+        assert_eq!(target, "not-in-dns.invalid:6443");
+    }
+
+    /// Nothing is routed when no proxy is configured — the feature must be
+    /// inert for every cluster that does not ask for one.
+    #[tokio::test]
+    async fn no_proxy_url_means_no_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(socks5_target(listener));
+
+        let cfg = kube::Config::new("https://127.0.0.1:6443".parse().unwrap());
+        let client = kube::Client::try_from(cfg).unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.apiserver_version(),
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), seen)
+                .await
+                .is_err(),
+            "a client with no proxy_url still went to {addr}"
+        );
+    }
+}
