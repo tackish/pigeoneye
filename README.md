@@ -69,6 +69,11 @@ coalesced into batches, and a view cache that resumes the watch on return.
   (the spec changed, the controller hasn't acted on it yet), *Not fully
   available*, *Paused*, *Stuck* or *Synced* — with the replica and
   generation numbers behind the verdict, refreshing itself until it settles.
+- **Why a pod isn't up, in the list** — the status column says *Pending*;
+  the **Event** column next to it says `FailedScheduling`, and hovering it
+  gives you `0/50 nodes are available: insufficient cpu`. Only warnings
+  appear there, so an empty cell means nothing is wrong and the rows with
+  text in them are the ones to look at.
 - **Share the exact view** — copy a `peye://` link to the view, or to a
   single resource. Whoever opens it lands on the same cluster, kind,
   namespace and row.
@@ -186,6 +191,21 @@ npm run tauri dev     # or run directly
    ```
    tsh status >/dev/null 2>&1 || tsh login --proxy=teleport.example.com:443
    ```
+
+5. **Cluster behind a bastion or a corporate proxy?** PigeonEye honours a
+   cluster's `proxy-url:` — SOCKS5 or HTTP `CONNECT` — and `HTTPS_PROXY`,
+   so a cluster you can only reach through a jump host connects like any
+   other. It reads the same line `kubectl` does, so the two never drift,
+   and it is per-cluster: everything else keeps going out directly.
+
+   ```yaml
+   - cluster:
+       server: https://XXXX.gr7.ap-northeast-2.eks.amazonaws.com
+       proxy-url: socks5://127.0.0.1:1080   # e.g. an `ssh -D 1080` bastion
+   ```
+
+   The proxy resolves the name, so a private endpoint that doesn't resolve
+   on your laptop still works.
 
 ## License
 
