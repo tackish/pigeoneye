@@ -1977,6 +1977,17 @@ th.sorted {
   color: var(--bad);
 }
 
+/* A warning too old to still be happening: kept, because it is often why a
+   pod restarted, but muted so the live ones are the red on the screen. */
+.cell.stale {
+  color: color-mix(in srgb, var(--bad) 45%, var(--dim));
+}
+
+/* How long ago, trailing the reason — the reason is what you scan for. */
+.ev-age {
+  opacity: 0.65;
+}
+
 .dim {
   color: var(--dim);
 }

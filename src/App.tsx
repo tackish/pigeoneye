@@ -677,7 +677,9 @@ function cmpCells(a: string, b: string): number {
 
 const POD_STAT_COLS = ["CPU", "%CPU/R", "%CPU/L", "MEM", "%MEM/R", "%MEM/L"];
 /// The newest warning event against the pod, next to the status it explains.
-const POD_EVENT_COL = "Event";
+/// "Recent", because the cell is a record and not a live state: events last
+/// about an hour, so a Running pod can carry a warning that is long over.
+const POD_EVENT_COL = "Recent event";
 const NODE_STAT_COLS = ["CPU", "%CPU", "MEM", "%MEM"];
 
 /// Resource aliases for the `:` command.
@@ -916,6 +918,24 @@ function App() {
     }
     return a;
   }
+  /// How old a pod's warning is, and whether it is recent enough to still be
+  /// going on. Rendered live rather than baked into the cell: the sweep only
+  /// republishes when a warning CHANGES, so an age stored in the row would
+  /// freeze at whatever it was when the warning first landed.
+  ///
+  /// Five minutes, because that is as far apart as a CrashLoopBackOff's
+  /// events get — a pod that is still broken can be that quiet, and calling
+  /// it settled would be the one mistake worth avoiding here.
+  function eventAgeNote(e: PodEvent | undefined, nowMs: number) {
+    if (!e?.last) return null;
+    const ms = nowMs - new Date(e.last).getTime();
+    if (!Number.isFinite(ms)) return null;
+    return {
+      text: fmtAgeSeconds(Math.max(0, Math.floor(ms / 1000))),
+      hot: ms <= 5 * 60_000,
+    };
+  }
+
   function liveAge(row: TableRow, raw: string): string {
     const a = ageAnchorOf(row, raw);
     if (!a) return raw;
@@ -11267,17 +11287,28 @@ function App() {
                                   class={
                                     i() === 0
                                       ? "cell name"
-                                      : // the Event column carries nothing but
-                                        // warnings, so every reason in it reads
-                                        // as one — no guessing at reason names
-                                        displayCols()[i()] === POD_EVENT_COL
-                                        ? cell
-                                          ? "cell bad"
-                                          : "cell"
+                                      : // The Event column carries nothing but
+                                        // warnings, so no guessing at reason
+                                        // names — but a warning from an hour
+                                        // ago on a Running pod is history, not
+                                        // an alarm, and red made the two look
+                                        // the same. Red while it may still be
+                                        // happening, muted once it is past.
+                                        view().cols[i()] === POD_EVENT_COL
+                                        ? !cell
+                                          ? "cell"
+                                          : eventAgeNote(
+                                                podEvents()?.get(
+                                                  `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                                ),
+                                                nowTick(),
+                                              )?.hot === false
+                                            ? "cell stale"
+                                            : "cell bad"
                                         : cellClass(cell)
                                   }
                                   title={
-                                    displayCols()[i()] === POD_EVENT_COL
+                                    view().cols[i()] === POD_EVENT_COL
                                       ? podEvents()?.get(
                                           `${vr.row.namespace ?? ""}/${vr.row.name}`,
                                         )?.message
@@ -11342,6 +11373,24 @@ function App() {
                                         "age"
                                           ? liveAge(vr.row, cell)
                                           : cell}
+                                        <Show
+                                          when={
+                                            view().cols[i()] ===
+                                              POD_EVENT_COL && cell
+                                          }
+                                        >
+                                          <span class="ev-age">
+                                            {" · "}
+                                            {
+                                              eventAgeNote(
+                                                podEvents()?.get(
+                                                  `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                                ),
+                                                nowTick(),
+                                              )?.text
+                                            }
+                                          </span>
+                                        </Show>
                                       </>
                                     }
                                   >

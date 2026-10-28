@@ -50,7 +50,7 @@ const detail = (name) => ({
 const warn = {
   key: "ns/pod-b", reason: "FailedScheduling",
   message: "0/50 nodes are available: insufficient cpu.", count: 3,
-  last: "2026-10-27T01:00:00Z",
+  last: new Date(Date.now() - 45_000).toISOString(), // recent, so it reads as live
 };
 
 let fetched = [];
@@ -115,10 +115,11 @@ ok("both panes have rows", q("tr.row", panes[0]).length === 2 && q("tr.row", pan
 // --- the Event column, in BOTH panes ---
 for (const [i, p] of panes.entries()) {
   const hs = headers(p);
-  const ev = hs.indexOf("EVENT");
+  const ev = hs.indexOf("RECENTEVENT");
   ok(`pane ${i}: the Event column is present`, ev >= 0, hs.join(","));
   ok(`pane ${i}: it sits after STATUS`, ev === hs.indexOf("STATUS") + 1, hs.join(","));
-  ok(`pane ${i}: the warning shows with its count`, cellsOf(p, "pod-b")?.[ev] === "FailedScheduling ×3", JSON.stringify(cellsOf(p, "pod-b")));
+  ok(`pane ${i}: the warning shows with its count`, /^FailedScheduling ×3\b/.test(cellsOf(p, "pod-b")?.[ev] ?? ""), JSON.stringify(cellsOf(p, "pod-b")));
+  ok(`pane ${i}: and how long ago it happened`, / · \d+s$/.test(cellsOf(p, "pod-b")?.[ev] ?? ""), JSON.stringify(cellsOf(p, "pod-b")?.[ev]));
   ok(`pane ${i}: a healthy pod stays empty`, cellsOf(p, "pod-a")?.[ev] === "", JSON.stringify(cellsOf(p, "pod-a")));
 }
 ok("each pane sweeps for itself", eventSweeps >= 2, `${eventSweeps} sweeps`);

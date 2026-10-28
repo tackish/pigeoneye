@@ -50,9 +50,11 @@ const podTable = {
 // rebuild on). A later sweep adds a warning for the pod that had none.
 let eventCalls = 0;
 let addLate = false;
-const warnStuck = { key: "sre/stuck-1", reason: "FailedScheduling", message: "0/50 nodes are available: insufficient cpu.", count: 1, last: "2026-10-27T01:00:00Z" };
-const warnFlappy = { key: "sre/flappy-1", reason: "Unhealthy", message: "Readiness probe failed: connection refused", count: 12, last: "2026-10-27T01:02:00Z" };
-const warnLate = { key: "sre/healthy-1", reason: "NodeNotReady", message: "Node ip-10-200-145-211 status is now: NodeNotReady", count: 1, last: "2026-10-27T01:05:00Z" };
+const ago = (ms) => new Date(Date.now() - ms).toISOString();
+// still going on (40s) vs long over (52m) — the column has to tell them apart
+const warnStuck = { key: "sre/stuck-1", reason: "FailedScheduling", message: "0/50 nodes are available: insufficient cpu.", count: 1, last: ago(40_000) };
+const warnFlappy = { key: "sre/flappy-1", reason: "Unhealthy", message: "Readiness probe failed: connection refused", count: 12, last: ago(52 * 60_000) };
+const warnLate = { key: "sre/healthy-1", reason: "NodeNotReady", message: "Node ip-10-200-145-211 status is now: NodeNotReady", count: 1, last: ago(10_000) };
 
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
@@ -113,15 +115,17 @@ const rowTds = (name) => {
 };
 
 const hs = headers();
-const evIdx = hs.indexOf("EVENT");
+const evIdx = hs.indexOf("RECENTEVENT");
 ok("the Event column is present", evIdx >= 0, hs.join(","));
 ok("it sits right after STATUS", evIdx === hs.indexOf("STATUS") + 1, hs.join(","));
 
 const stuck = rowCells("stuck-1");
-ok("an unschedulable pod shows its reason", stuck?.[evIdx] === "FailedScheduling", JSON.stringify(stuck));
+ok("an unschedulable pod shows its reason", /^FailedScheduling\b/.test(stuck?.[evIdx] ?? ""), JSON.stringify(stuck));
+ok("with how long ago it happened", / · \d+s$/.test(stuck?.[evIdx] ?? ""), JSON.stringify(stuck?.[evIdx]));
 
 const flappy = rowCells("flappy-1");
-ok("a repeating warning carries its count", flappy?.[evIdx] === "Unhealthy ×12", JSON.stringify(flappy));
+ok("a repeating warning carries its count", /^Unhealthy ×12\b/.test(flappy?.[evIdx] ?? ""), JSON.stringify(flappy));
+ok("an old warning shows its age too", / · 52m$/.test(flappy?.[evIdx] ?? ""), JSON.stringify(flappy?.[evIdx]));
 
 const healthy = rowCells("healthy-1");
 ok("a healthy pod's cell is empty", healthy?.[evIdx] === "", JSON.stringify(healthy));
@@ -136,13 +140,23 @@ ok(
   !rowTds("healthy-1")[evIdx]?.getAttribute("title"),
 );
 ok(
-  "a warning reads as trouble",
+  "a warning that may still be happening is red",
   rowTds("stuck-1")[evIdx]?.className.includes("bad"),
   rowTds("stuck-1")[evIdx]?.className,
 );
 ok(
-  "an empty cell does not",
-  !rowTds("healthy-1")[evIdx]?.className.includes("bad"),
+  "one that is long over is muted instead",
+  rowTds("flappy-1")[evIdx]?.className.includes("stale"),
+  rowTds("flappy-1")[evIdx]?.className,
+);
+ok(
+  "and it is not also red",
+  !rowTds("flappy-1")[evIdx]?.className.includes("bad"),
+  rowTds("flappy-1")[evIdx]?.className,
+);
+ok(
+  "an empty cell is neither",
+  !/bad|stale/.test(rowTds("healthy-1")[evIdx]?.className ?? ""),
   rowTds("healthy-1")[evIdx]?.className,
 );
 
@@ -190,12 +204,12 @@ await wait(600);
 const hs2 = headers();
 ok(
   "a new warning reaches a previously clean pod",
-  rowCells("healthy-1")?.[hs2.indexOf("EVENT")] === "NodeNotReady",
+  /^NodeNotReady\b/.test(rowCells("healthy-1")?.[hs2.indexOf("RECENTEVENT")] ?? ""),
   JSON.stringify(rowCells("healthy-1")),
 );
 ok(
   "the pods that were already warning keep theirs",
-  rowCells("stuck-1")?.[hs2.indexOf("EVENT")] === "FailedScheduling",
+  /^FailedScheduling\b/.test(rowCells("stuck-1")?.[hs2.indexOf("RECENTEVENT")] ?? ""),
   JSON.stringify(rowCells("stuck-1")),
 );
 

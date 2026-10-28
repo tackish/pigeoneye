@@ -21,6 +21,7 @@
     "perf:hotpaths": "node scripts/perf-hotpaths.mjs",
     "perf:split": "node scripts/perf-split.mjs",
     "perf:issues": "node scripts/perf-issues.mjs",
+    "perf:eventcol": "EVENTS=off node scripts/perf-event-col.mjs && EVENTS=few node scripts/perf-event-col.mjs && EVENTS=all node scripts/perf-event-col.mjs",
     "smoke:issues-nav": "node scripts/smoke-issues-nav.mjs",
     "smoke:age": "node scripts/smoke-age-sort.mjs",
     "smoke:autotype": "node scripts/smoke-autotype.mjs",

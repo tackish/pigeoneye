@@ -89,8 +89,8 @@ await wait(500);
 
 const statsAtStart = podStatsCalls, sweepsAtStart = issueSweeps;
 const eventsAtStart = eventSweeps;
-if (!q("th").some((h) => /^event/i.test((h.textContent || "").trim())))
-  fail("the Event column never appeared");
+if (!q("th").some((h) => /^recent event/i.test((h.textContent || "").trim())))
+  fail("the Recent event column never appeared");
 const gaps = [];
 let last = performance.now();
 const id = setInterval(() => { const n = performance.now(); gaps.push(n - last); last = n; }, 50);
