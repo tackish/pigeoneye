@@ -10,9 +10,52 @@
 
 <p align="center">English | <a href="README.ko.md">한국어</a></p>
 
-PigeonEye is a fast, native Kubernetes GUI. Every resource type your cluster
-serves — including every CRD — shows up automatically, with the same columns
-`kubectl get` prints.
+PigeonEye is a fast, native Kubernetes GUI that you drive like a CLI. Every
+resource type your cluster serves — including every CRD — shows up
+automatically, with the same columns `kubectl get` prints.
+
+## A quick look
+
+![The sidebar: pinned kinds, every CRD, a tab per cluster, and split view](src/assets/1.png)
+
+**Every resource your cluster serves, in one sidebar.** Built-in kinds are
+grouped the way you think about them, and every CRD follows on its own — 138
+of them here, with nothing to configure. Pin the kinds you live in with `p`
+and gather them into groups of your own. Each cluster gets a tab, like a
+browser, and `⌘\` splits the window so two clusters sit side by side.
+
+![The pod list: search over every field, a shareable link to the view, and configurable columns](src/assets/2.png)
+
+**A list that keeps up.** Search matches any field of every object, not just
+the name. Columns are yours to show, hide, reorder or add — CPU and memory
+against requests and limits included. **share view** copies a `peye://` link
+that opens the same cluster, kind, namespace and row for whoever clicks it.
+
+![The detail panel: logs, shell, debug and port-forward, related objects, and an editable manifest](src/assets/3.png)
+
+**Everything about one object, without leaving the list.** Logs, shell, a
+debug container and port-forward are one click away — and `l` follows the
+logs of a whole Deployment, one pod, or a single container. Related objects
+link straight through, and the manifest edits in place: **dry-run** shows
+what the server would change before you **Apply**.
+
+## A GUI you drive like a CLI
+
+The screen of a GUI, the hands of a CLI. Point and click when you want to —
+but everything you do day to day has a key: moving around, searching,
+opening logs and shells, editing, scaling, deleting, switching clusters,
+splitting the view. The keys are the ones your fingers already know from
+vim, k9s and `kubectl`.
+
+| Key | Does |
+|---|---|
+| `:` | Go anywhere by typing — `: deploy kube-system`, `: pod app=api`, `: pod @prod` |
+| `/` | Search every field of every row |
+| `j` `k` · `↵` | Move · open the detail |
+| `l` · `s` · `e` | Logs · shell · edit the manifest |
+| `d` · `r` · `space` | Delete · rollout restart · mark rows for a bulk action |
+| `tab` · `⌘\` | Next cluster · split into two views |
+| `?` | Every shortcut, on one sheet |
 
 ## Why it's fast
 
@@ -70,10 +113,11 @@ coalesced into batches, and a view cache that resumes the watch on return.
   available*, *Paused*, *Stuck* or *Synced* — with the replica and
   generation numbers behind the verdict, refreshing itself until it settles.
 - **Why a pod isn't up, in the list** — the status column says *Pending*;
-  the **Event** column next to it says `FailedScheduling`, and hovering it
-  gives you `0/50 nodes are available: insufficient cpu`. Only warnings
-  appear there, so an empty cell means nothing is wrong and the rows with
-  text in them are the ones to look at.
+  the **Recent event** column next to it says `FailedScheduling ×3 · 45s`,
+  and hovering it gives you `0/50 nodes are available: insufficient cpu`.
+  Only warnings appear there, so an empty cell means nothing is wrong. One
+  older than five minutes is dimmed rather than dropped: the pod may be fine
+  now, but that warning is often why it restarted.
 - **Share the exact view** — copy a `peye://` link to the view, or to a
   single resource. Whoever opens it lands on the same cluster, kind,
   namespace and row.
@@ -97,15 +141,15 @@ coalesced into batches, and a view cache that resumes the watch on return.
   have genuinely expired is parked out of background polling until you sign
   in again, so a credential helper that opens a browser (`aws-vault`,
   `oidc-login`) is never re-run on a timer behind your back.
-- **Keyboard-first**, color-coded multi-cluster tabs, light/dark, and
-  **in-app updates** — the top bar flags a new release and upgrades in
-  place, no `brew` needed.
+- Color-coded multi-cluster tabs, light/dark, and **in-app updates** — the
+  top bar flags a new release and upgrades in place, no `brew` needed.
 
 ## vs. k9s & Lens
 
 |  | PigeonEye | k9s | Lens/OpenLens |
 |---|---|---|---|
 | Native GUI | ✅ | terminal | Electron |
+| Every daily action from the keyboard | ✅ | ✅ | mouse-first |
 | Cold-start on a 24k-pod cluster | **~0.35s first screen** | fast | slow (full sync) |
 | All CRDs / aggregated APIs, no config | ✅ | ✅ | ✅ |
 | Regex / negation / numeric / per-column filters | ✅ | regex/`!` | basic |
