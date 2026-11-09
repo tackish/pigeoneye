@@ -11,11 +11,13 @@
  * order its watch cache holds them: without the sort, two identical sweeps
  * would look different and republish on every tick.
  */
-export type PodEventLike = { key: string; reason: string; count: number };
+export type PodEventLike = { key: string; reason: string; count: number; last?: string | null };
 
+/// The time is part of it: a warning can come back as a new event with the
+/// same reason and count, and the age shown must follow it.
 export function podEventSignature(evs: readonly PodEventLike[]): string {
   return evs
-    .map((e) => `${e.key}|${e.reason}|${e.count}`)
+    .map((e) => `${e.key}|${e.reason}|${e.count}|${e.last ?? ""}`)
     .sort()
     .join(",");
 }

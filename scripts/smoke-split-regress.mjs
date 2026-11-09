@@ -73,7 +73,10 @@ dom.window.__TAURI_INTERNALS__ = {
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
       case "get_resource": fetched.push(args?.name); return Promise.resolve(detail(args?.name));
-      case "pod_events": eventSweeps++; return Promise.resolve([warn]);
+      case "pod_events_watch":
+        eventSweeps++;
+        setTimeout(() => args.channel.onmessage({ type: "SNAPSHOT", events: [warn] }), 0);
+        return Promise.resolve(100 + eventSweeps);
       case "pod_exits": exitReads++; return Promise.resolve([exit]);
       case "node_types": typeFetches++; return Promise.resolve([ntype]);
       case "pod_stats": return Promise.reject(new Error("no metrics"));
@@ -131,7 +134,7 @@ for (const [i, p] of panes.entries()) {
   ok(`pane ${i}: and how long ago it happened`, / · \d+s$/.test(cellsOf(p, "pod-b")?.[ev] ?? ""), JSON.stringify(cellsOf(p, "pod-b")?.[ev]));
   ok(`pane ${i}: a healthy pod stays empty`, cellsOf(p, "pod-a")?.[ev] === "", JSON.stringify(cellsOf(p, "pod-a")));
 }
-ok("each pane sweeps for itself", eventSweeps >= 2, `${eventSweeps} sweeps`);
+ok("each pane runs its own event feed", eventSweeps >= 2, `${eventSweeps} feeds`);
 
 // --- Restart reason and Node type, in BOTH panes ---
 for (const [i, p] of panes.entries()) {

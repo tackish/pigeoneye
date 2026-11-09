@@ -28,6 +28,7 @@
     "smoke:autotype": "node scripts/smoke-autotype.mjs",
     "smoke:podevents": "node scripts/smoke-pod-events.mjs",
     "smoke:extras": "node scripts/smoke-pod-extras.mjs",
+    "smoke:feed": "node scripts/smoke-events-feed.mjs",
     "smoke:storm": "ASSERT=1 HANG=10 node scripts/sim-auth-storm.mjs && ASSERT=1 HANG=0.05 node scripts/sim-auth-storm.mjs",
     "smoke:logskey": "node scripts/smoke-logs-key.mjs",
     "smoke:split-regress": "node scripts/smoke-split-regress.mjs",

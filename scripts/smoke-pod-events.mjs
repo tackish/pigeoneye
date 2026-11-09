@@ -42,6 +42,7 @@ const podTable = {
     { name: "healthy-1", namespace: "sre", cells: ["healthy-1", "1/1", "Running", "0", "5h"], labels: {} },
     { name: "stuck-1", namespace: "sre", cells: ["stuck-1", "0/1", "Pending", "0", "2m"], labels: {} },
     { name: "flappy-1", namespace: "sre", cells: ["flappy-1", "0/1", "Running", "7", "9m"], labels: {} },
+    { name: "batched-1", namespace: "sre", cells: ["batched-1", "0/1", "Pending", "0", "3h"], labels: {} },
   ],
   truncated: false, resource_version: "1", include: "Metadata",
 };
@@ -49,16 +50,19 @@ const podTable = {
 // Sweep 1: two warnings. Sweep 2+: identical (the steady state we must not
 // rebuild on). A later sweep adds a warning for the pod that had none.
 let eventCalls = 0;
-let addLate = false;
+let feed = null;
 const ago = (ms) => new Date(Date.now() - ms).toISOString();
 // still going on (40s) vs long over (52m) — the column has to tell them apart
 const warnStuck = { key: "sre/stuck-1", reason: "FailedScheduling", message: "0/50 nodes are available: insufficient cpu.", count: 1, last: ago(40_000) };
 const warnFlappy = { key: "sre/flappy-1", reason: "Unhealthy", message: "Readiness probe failed: connection refused", count: 12, last: ago(52 * 60_000) };
+// The scheduler's kind: repeats reach the API in 30-minute batches, so a
+// warning still going on can be 20 minutes old here.
+const warnBatched = { key: "sre/batched-1", reason: "FailedScheduling", message: "0/50 nodes are available: insufficient memory.", count: 14, last: ago(20 * 60_000), series: true };
 const warnLate = { key: "sre/healthy-1", reason: "NodeNotReady", message: "Node ip-10-200-145-211 status is now: NodeNotReady", count: 1, last: ago(10_000) };
 
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
-  invoke: (cmd) => {
+  invoke: (cmd, args = {}) => {
     switch (cmd) {
       case "list_contexts": return Promise.resolve([ctx]);
       case "discover": return Promise.resolve([podType]);
@@ -66,9 +70,12 @@ dom.window.__TAURI_INTERNALS__ = {
       case "list_resources": return Promise.resolve(podTable);
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
-      case "pod_events":
+      case "pod_events_watch":
+        // The feed answers with the whole list, then only with changes.
         eventCalls++;
-        return Promise.resolve(addLate ? [warnStuck, warnFlappy, warnLate] : [warnStuck, warnFlappy]);
+        feed = args.channel;
+        setTimeout(() => feed.onmessage({ type: "SNAPSHOT", events: [warnStuck, warnFlappy, warnBatched] }), 0);
+        return Promise.resolve(eventCalls);
       case "get_events": return Promise.resolve([]);
       case "pod_stats": return Promise.reject(new Error("metrics API unavailable"));
       case "node_stats": return Promise.resolve([]);
@@ -127,6 +134,19 @@ const flappy = rowCells("flappy-1");
 ok("a repeating warning carries its count", /^Unhealthy ×12\b/.test(flappy?.[evIdx] ?? ""), JSON.stringify(flappy));
 ok("an old warning shows its age too", / · 52m$/.test(flappy?.[evIdx] ?? ""), JSON.stringify(flappy?.[evIdx]));
 
+const batched = rowCells("batched-1");
+ok("a batched series shows its repeat count", /^FailedScheduling ×14 · 20m$/.test(batched?.[evIdx] ?? ""), JSON.stringify(batched?.[evIdx]));
+ok(
+  "and is still red at 20 minutes — its repeats are reported half-hourly",
+  rowTds("batched-1")[evIdx]?.className === "cell bad",
+  rowTds("batched-1")[evIdx]?.className,
+);
+ok(
+  "its tooltip says the count can trail",
+  /insufficient memory\.\n\(repeats are reported every 30 minutes/.test(rowTds("batched-1")[evIdx]?.getAttribute("title") ?? ""),
+  rowTds("batched-1")[evIdx]?.getAttribute("title"),
+);
+
 const healthy = rowCells("healthy-1");
 ok("a healthy pod's cell is empty", healthy?.[evIdx] === "", JSON.stringify(healthy));
 
@@ -170,7 +190,12 @@ ok("AGE still reads correctly", rowCells("healthy-1")?.[hs.indexOf("AGE")] === "
 const sweeps = eventCalls;
 q("button.kind").find((b) => b.textContent?.trim().startsWith("Pod"))?.click();
 await wait(600);
-ok("re-opening the list sweeps again", eventCalls > sweeps, `${eventCalls} vs ${sweeps}`);
+ok("re-opening the same list keeps its feed", eventCalls === sweeps, `${eventCalls} vs ${sweeps}`);
+ok(
+  "and the column comes straight back from it",
+  /^FailedScheduling\b/.test(rowCells("stuck-1")?.[headers().indexOf("RECENTEVENT")] ?? ""),
+  JSON.stringify(rowCells("stuck-1")),
+);
 
 // Unchanged warnings must not republish the map, whatever order the API
 // server hands them back in.
@@ -198,9 +223,8 @@ ok(
 
 // A warning that shows up later must land on its own, with the pod list
 // itself unchanged — that is the case the column exists for.
-addLate = true;
-q("button.kind").find((b) => b.textContent?.trim().startsWith("Pod"))?.click();
-await wait(600);
+feed.onmessage({ type: "DELTA", events: [warnLate], removed: [] });
+await wait(300);
 const hs2 = headers();
 ok(
   "a new warning reaches a previously clean pod",

@@ -58,7 +58,7 @@ let exitsReady = false;
 
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
-  invoke: (cmd) => {
+  invoke: (cmd, args = {}) => {
     switch (cmd) {
       case "list_contexts": return Promise.resolve([ctx]);
       case "discover": return Promise.resolve([podType]);
@@ -66,7 +66,10 @@ dom.window.__TAURI_INTERNALS__ = {
       case "list_resources": return Promise.resolve(table);
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
-      case "pod_events": return held.events.p.then(() => events);
+      case "pod_events": return held.events.p.then(() => events); // builds before the feed
+      case "pod_events_watch":
+        held.events.p.then(() => args.channel.onmessage({ type: "SNAPSHOT", events }));
+        return Promise.resolve(7);
       case "pod_stats": return held.stats.p.then(() => stats);
       case "node_types": return held.types.p.then(() => types);
       case "pod_exits": return Promise.resolve(exitsReady ? exits : null);

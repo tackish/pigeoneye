@@ -58,7 +58,7 @@ const events = rows.map((r, i) => ({
 
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
-  invoke: (cmd) => {
+  invoke: (cmd, args = {}) => {
     switch (cmd) {
       case "list_contexts": return Promise.resolve([ctx]);
       case "discover": return Promise.resolve([podType]);
@@ -66,11 +66,20 @@ dom.window.__TAURI_INTERNALS__ = {
       case "list_resources": return Promise.resolve(table);
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
+      // Builds before the feed polled for the same data; answering both lets
+      // two builds be measured side by side.
       case "pod_events":
         if (MODE === "off") return Promise.reject(new Error("events not listable"));
-        return new Promise((r) =>
-          setTimeout(() => r(MODE === "few" ? events.slice(0, 50) : events), RTT),
-        );
+        return new Promise((r) => setTimeout(() => r(MODE === "few" ? events.slice(0, 50) : events), RTT));
+      case "pod_events_watch":
+        // The feed's first answer, a round trip later; "off" is a cluster
+        // that will not let us read events.
+        setTimeout(() => args.channel.onmessage(
+          MODE === "off"
+            ? { type: "ERROR", error: "events is forbidden (ErrorResponse { code: 403 })" }
+            : { type: "SNAPSHOT", events: MODE === "few" ? events.slice(0, 50) : events },
+        ), RTT);
+        return Promise.resolve(7);
       case "pod_stats": return Promise.reject(new Error("no metrics"));
       // As the backend answers while the pod index is still building — which
       // on a list this size it is, at first paint. What the restart reasons

@@ -534,12 +534,13 @@ async fn get_events(
 }
 
 #[tauri::command]
-async fn pod_events(
+async fn pod_events_watch(
     state: State<'_, AppState>,
     context: String,
     namespace: Option<String>,
-) -> Result<Vec<k8s::PodEvent>, String> {
-    k8s::pod_events(&state, context, namespace).await
+    channel: Channel<serde_json::Value>,
+) -> Result<u32, String> {
+    k8s::pod_events_watch(&state, context, namespace, channel).await
 }
 
 #[tauri::command]
@@ -923,7 +924,7 @@ pub fn run() {
             exec_stop,
             get_events,
             pod_stats,
-            pod_events,
+            pod_events_watch,
             node_stats,
             pod_exits,
             pod_exits_refresh,

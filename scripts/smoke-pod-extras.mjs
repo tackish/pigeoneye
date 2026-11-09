@@ -81,7 +81,7 @@ const nodeDetail = (name) => ({
 });
 const EXPIRED = "ServiceError: auth exec command 'aws-vault exec prod -- aws eks get-token' failed with status exit status: 1";
 
-const calls = { pod_exits: 0, pod_exits_refresh: [], node_types: 0, pod_events: 0, node_allocated: 0 };
+const calls = { pod_exits: 0, pod_exits_refresh: [], node_types: 0, sweeps: 0, node_allocated: 0 };
 let exitsReady = false;
 let refreshFails = false;
 let typesForbidden = false;
@@ -100,7 +100,13 @@ dom.window.__TAURI_INTERNALS__ = {
       case "watch_start":
         if (args?.resource?.kind === "Pod") watchChan = args.channel;
         return Promise.resolve(1);
-      case "pod_events": calls.pod_events++; return Promise.resolve([]);
+      case "pod_events_watch": return Promise.resolve(7);
+      case "aggregate_issues": {
+        // A swept cluster is a live one; a parked cluster is never swept.
+        if ((args.contexts ?? []).includes("smoke")) calls.sweeps++;
+        setTimeout(() => { for (const c of args.contexts ?? []) try { args.channel.onmessage({ context: c, issues: [], error: null }); } catch { /* */ } }, 0);
+        return Promise.resolve(null);
+      }
       case "pod_stats": return Promise.reject(new Error("metrics API unavailable"));
       case "node_stats": return Promise.reject(new Error("metrics API unavailable"));
       case "pod_exits":
@@ -242,10 +248,10 @@ const before = calls.node_types;
 await watch([pod("api-2", "1 (2h ago)", "ip-new")]);
 await wait(ticks(1));
 ok("the node types are fetched again", calls.node_types === before + 1, `${calls.node_types - before} fetches`);
-const eventsBefore = calls.pod_events;
+const eventsBefore = calls.sweeps;
 await wait(ticks(3));
 ok("and not again for the same unknown node", calls.node_types === before + 1, `${calls.node_types - before} fetches`);
-ok("a Forbidden does not park the cluster", calls.pod_events > eventsBefore, `${calls.pod_events - eventsBefore} event polls after`);
+ok("a Forbidden does not park the cluster", calls.sweeps > eventsBefore, `${calls.sweeps - eventsBefore} sweeps after`);
 
 console.log("free room on the node list");
 q("button.kind").find((b) => b.textContent?.trim().startsWith("Node"))?.click();
@@ -285,11 +291,11 @@ const refreshesBefore = calls.pod_exits_refresh.length;
 await watch([pod("api-1", "4 (5s ago)", "ip-a")]);
 await wait(ticks(1));
 ok("the restart is re-read", calls.pod_exits_refresh.length === refreshesBefore + 1, JSON.stringify(calls.pod_exits_refresh.slice(refreshesBefore)));
-const evAtFail = calls.pod_events;
+const evAtFail = calls.sweeps;
 const refreshAtFail = calls.pod_exits_refresh.length;
 await wait(ticks(3));
 ok("the failure parks the cluster: no more re-reads", calls.pod_exits_refresh.length === refreshAtFail, `${calls.pod_exits_refresh.length - refreshAtFail} more`);
-ok("nor event polls", calls.pod_events === evAtFail, `${calls.pod_events - evAtFail} more`);
+ok("nor is it swept for Issues", calls.sweeps === evAtFail, `${calls.sweeps - evAtFail} more`);
 ok("no crash", !crash, crash ?? "");
 
 if (failed) { console.error(`POD-EXTRAS SMOKE FAILED — ${failed} check(s)`); process.exit(1); }

@@ -70,7 +70,7 @@ const warnings = [
 ];
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
-  invoke: (cmd) => {
+  invoke: (cmd, args = {}) => {
     switch (cmd) {
       case "list_contexts": return Promise.resolve([ctx]);
       case "discover": return Promise.resolve([podType]);
@@ -79,7 +79,11 @@ dom.window.__TAURI_INTERNALS__ = {
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
       case "pod_stats": podStatsCalls++; return Promise.resolve(stats);
-      case "pod_events": eventSweeps++; return Promise.resolve(warnings);
+      case "pod_events": return Promise.resolve(warnings); // builds before the feed polled
+      case "pod_events_watch":
+        eventSweeps++;
+        setTimeout(() => args.channel.onmessage({ type: "SNAPSHOT", events: warnings }), 0);
+        return Promise.resolve(7);
       case "aggregate_issues": issueSweeps++; return Promise.resolve(null);
       case "pod_exits": exitReads++; return Promise.resolve(exits);
       case "pod_exits_refresh": exitRefreshes++; return Promise.resolve([]);
@@ -129,13 +133,13 @@ console.log(`rows: ${N}, idle window: ${SECS}s, samples: ${gaps.length}`);
 console.log(`  event-loop gap  p50 ${p(0.5).toFixed(0)}ms  p95 ${p(0.95).toFixed(0)}ms  p99 ${p(0.99).toFixed(0)}ms  max ${gaps[gaps.length - 1].toFixed(0)}ms`);
 console.log(`  gaps >100ms: ${over(100)}   >250ms: ${over(250)}`);
 const evs = eventSweeps - eventsAtStart;
-console.log(`  background fetches while idle — pod_stats: ${podStatsCalls - statsAtStart}, issue sweeps: ${issueSweeps - sweepsAtStart}, event sweeps: ${evs}`);
+console.log(`  background fetches while idle — pod_stats: ${podStatsCalls - statsAtStart}, issue sweeps: ${issueSweeps - sweepsAtStart}, event feed restarts: ${evs}`);
 console.log(`  restart re-reads: ${exitRefreshes}, index reads: ${exitReads - exitReadsAtStart}, node type fetches: ${typeFetches - typesAtStart}`);
 
 if (over(250) > 0) fail(`${over(250)} stall(s) over 250ms while idle — a periodic job is doing heavy work`);
-// One per 20s tick and no more: the Event column must never land on a faster
-// timer, and must never retry.
-if (evs > Math.ceil(SECS / 20)) fail(`${evs} event sweeps in ${SECS}s — the Event column is polling too often`);
+// The Recent event column is a watch now: once started it is never polled
+// or restarted while the list just sits there.
+if (evs) fail(`the Recent event feed was restarted ${evs}x while idle`);
 // Nothing restarted and every pod's node is known: the tick must not ask
 // the cluster for anything.
 if (exitRefreshes) fail(`${exitRefreshes} restart re-read(s) while nothing restarted`);

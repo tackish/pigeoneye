@@ -6,6 +6,7 @@ import {
   onCleanup,
   For,
   Show,
+  untrack,
 } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
@@ -160,6 +161,8 @@ interface PodEvent {
   message: string;
   count: number;
   last: string | null;
+  /// Repeats arrive in 30-minute batches (the events.k8s.io recorder).
+  series?: boolean;
 }
 
 interface NodeStat {
@@ -804,6 +807,15 @@ function cellOf(t: ResourceTable | null | undefined, row: TableRow, name: string
   return i >= 0 ? String(row.cells[i] ?? "") : "";
 }
 
+/// The Recent event cell's tooltip: the message, and for a batched series a
+/// word on why its count and time may trail what is happening.
+function eventTitle(e: PodEvent | undefined): string | undefined {
+  if (!e) return undefined;
+  return e.series
+    ? `${e.message}\n(repeats are reported every 30 minutes, so the count and time can trail)`
+    : e.message;
+}
+
 function nodeTypeText(n: NodeType | undefined): string {
   return n ? [n.instance, n.capacity].filter(Boolean).join(" · ") : "";
 }
@@ -1081,9 +1093,12 @@ function App() {
     if (!e?.last) return null;
     const ms = nowMs - new Date(e.last).getTime();
     if (!Number.isFinite(ms)) return null;
+    // A batched series only reports its repeats every 30 minutes, so one
+    // still going can look that old; past that (and the minute the recorder
+    // takes to flush) it has truly stopped.
     return {
       text: fmtAgeSeconds(Math.max(0, Math.floor(ms / 1000))),
-      hot: ms <= 5 * 60_000,
+      hot: ms <= (e.series ? 31 : 5) * 60_000,
     };
   }
 
@@ -5148,46 +5163,108 @@ function App() {
   }
 
   const podEventSig = new Map<object, string>();
-  /// The pod_events call still out per pane and cluster. While a credential
-  /// helper sits at a login page every request queues behind it, and kube
-  /// runs the helper once more per queued request when it fails — so a 20s
-  /// tick that kept firing left a browser tab behind for every tick the page
-  /// stayed open. The tick skips a view whose last call hasn't come back.
-  const podEventsOut = new Map<string, object>();
-  const podEventsKey = (pane: (typeof panes)[number], ctx: string) =>
-    `${panes.indexOf(pane)}|${ctx}`;
-  async function loadPodEvents(ctx: string, ns: string | null, pane = panes[0]) {
-    const s0 = pane;
-    const key = podEventsKey(s0, ctx);
-    const mine = {};
-    podEventsOut.set(key, mine);
-    try {
-      const evs = await invoke<PodEvent[]>("pod_events", {
-        context: ctx,
-        namespace: ns,
-      });
-      if (
-        s0.active() !== ctx ||
-        s0.selected()?.group !== "" ||
-        s0.selected()?.kind !== "Pod"
-      )
-        return;
-      const sig = podEventSignature(evs);
-      if (!shouldPublishEvents(podEventSig.get(s0), sig, !!s0.podEvents())) return;
-      podEventSig.set(s0, sig);
-      s0.setPodEvents(new Map(evs.map((e) => [e.key, e])));
-    } catch (e) {
-      // No permission to list events, or creds just broke. Leave the column
-      // off rather than half-filled, and never let it drive the exec plugin.
-      if (isCredError(String(e))) pauseAuth(ctx);
-    } finally {
-      // Only our own mark: a newer call (the list reopened) may own it now.
-      if (podEventsOut.get(key) === mine) podEventsOut.delete(key);
-    }
+  /// The Recent event column's feed, one per pane: a watch the backend keeps
+  /// on the pane's pod list scope — the whole warning list once, then only
+  /// what changes, batched. It replaced a 20s poll that read one page of 500
+  /// events, which on a cluster with a few thousand warnings left most pods'
+  /// out (alphabetically by namespace) and showed stale counts for others.
+  /// `map` is the feed's own copy of every pod's summary: re-selecting the
+  /// same list clears the pane's column, and the feed — still running, with
+  /// nothing new to send — puts it straight back from here.
+  type EvWatch = {
+    scope: string;
+    ctx: string;
+    id: number | null;
+    dead: boolean;
+    map: Map<string, PodEvent> | null;
+  };
+  type EvMsg =
+    | { type: "SNAPSHOT"; events: PodEvent[] }
+    | { type: "DELTA"; events: PodEvent[]; removed: string[] }
+    | { type: "ERROR"; error: string };
+  const evWatches = new Map<object, EvWatch>();
+  function publishEvents(pane: (typeof panes)[number], map: Map<string, PodEvent>) {
+    const sig = podEventSignature([...map.values()]);
+    if (!shouldPublishEvents(podEventSig.get(pane), sig, !!pane.podEvents())) return;
+    podEventSig.set(pane, sig);
+    pane.setPodEvents(map);
   }
+  function stopEventsWatch(pane: (typeof panes)[number]) {
+    const w = evWatches.get(pane);
+    if (!w) return;
+    evWatches.delete(pane);
+    if (w.id != null) void invoke("watch_stop", { id: w.id }).catch(() => {});
+  }
+  /// Make sure the pane's feed is running for this scope. Cheap to call
+  /// often: a live feed for the same scope is left alone.
+  function ensureEventsWatch(ctx: string, ns: string | null, pane = panes[0]) {
+    if (authPaused().has(ctx)) return; // a broken credential: never re-run the helper
+    const scope = `${ctx}|${ns ?? ""}`;
+    const cur = evWatches.get(pane);
+    if (cur && cur.scope === scope && !cur.dead) {
+      if (cur.map && !pane.podEvents()) publishEvents(pane, cur.map);
+      return;
+    }
+    stopEventsWatch(pane);
+    const w: EvWatch = { scope, ctx, id: null, dead: false, map: null };
+    evWatches.set(pane, w);
+    const chan = new Channel<EvMsg>();
+    chan.onmessage = (m) => {
+      if (evWatches.get(pane) !== w) return; // superseded
+      if (m.type === "ERROR") {
+        // The backend retries anything else on its own, slowly; a broken
+        // credential ends the feed, and the cluster is parked until sign-in.
+        if (isCredFailure(m.error)) {
+          w.dead = true;
+          pauseAuth(ctx);
+        }
+        return;
+      }
+      let next: Map<string, PodEvent>;
+      if (m.type === "SNAPSHOT") next = new Map(m.events.map((e) => [e.key, e]));
+      else {
+        // Onto the feed's own whole picture, never onto whatever the column
+        // happens to hold — that may have been cleared.
+        next = new Map(w.map ?? []);
+        for (const k of m.removed) next.delete(k);
+        for (const e of m.events) next.set(e.key, e);
+      }
+      w.map = next;
+      if (isPodListOn(pane, ctx)) publishEvents(pane, next);
+    };
+    invoke<number>("pod_events_watch", { context: ctx, namespace: ns, channel: chan })
+      .then((id) => {
+        if (evWatches.get(pane) === w) w.id = id;
+        else void invoke("watch_stop", { id }).catch(() => {}); // superseded while starting
+      })
+      .catch(() => {
+        w.dead = true; // not connected: the next list load starts it again
+      });
+  }
+  // A pane that stops showing that pod list — another kind, cluster or
+  // namespace, the split closed, the cluster parked — stops its feed.
+  createEffect(() => {
+    const live = new Set<object>(activePanes());
+    const paused = authPaused();
+    for (const pane of panes) {
+      const ctx = pane.active();
+      const sel = pane.selected();
+      const ns = sel?.namespaced && pane.namespace() ? pane.namespace() : null;
+      const w = evWatches.get(pane);
+      if (!w) continue;
+      const showing =
+        live.has(pane) &&
+        !!ctx &&
+        !paused.has(ctx) &&
+        sel?.group === "" &&
+        sel?.kind === "Pod" &&
+        w.scope === `${ctx}|${ns ?? ""}`;
+      if (!showing) untrack(() => stopEventsWatch(pane));
+    }
+  });
 
   async function loadPodStats(ctx: string, ns: string | null, pane = panes[0]) {
-    void loadPodEvents(ctx, ns, pane);
+    ensureEventsWatch(ctx, ns, pane);
     loadPodExtras(ctx, ns, pane);
     // Whichever pane asked — never P(), which moves with focus while this
     // is in flight.
@@ -5240,16 +5317,9 @@ function App() {
         const ctx = pane.active();
         if (!rt || !ctx || rt.group !== "" || rt.kind !== "Pod") continue;
         if (authPaused().has(ctx)) continue; // broken creds: never poke the exec
-        // A pod can start failing without the list changing shape at all, so
-        // the Event column refreshes on its own schedule rather than on the
-        // stats burst's "pods appeared" trigger. It publishes nothing unless
-        // the warnings changed, so a quiet cluster stays at zero rebuilds.
-        if (!podEventsOut.has(podEventsKey(pane, ctx)))
-          void loadPodEvents(
-            ctx,
-            rt.namespaced && pane.namespace() ? pane.namespace() : null,
-            pane,
-          );
+        // The Recent event feed runs on its own; this only restarts one that
+        // could not start (not connected yet). A live one is left alone.
+        ensureEventsWatch(ctx, rt.namespaced && pane.namespace() ? pane.namespace() : null, pane);
         const t = pane.table();
         if (t) {
           refreshExits(ctx, pane, t);
@@ -11879,9 +11949,11 @@ function App() {
                                   }
                                   title={
                                     view().cols[i()] === POD_EVENT_COL
-                                      ? podEvents()?.get(
-                                          `${vr.row.namespace ?? ""}/${vr.row.name}`,
-                                        )?.message
+                                      ? eventTitle(
+                                          podEvents()?.get(
+                                            `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                          ),
+                                        )
                                       : view().cols[i()] === POD_EXIT_COL
                                         ? exitTitle(
                                             podExits()?.get(

@@ -98,7 +98,39 @@ function background(ctx, answer) {
   g.tail = run.catch(() => {});
   return run;
 }
-const BACKGROUND = new Set(["pod_events", "node_types", "pod_exits_refresh", "node_rooms"]);
+const BACKGROUND = new Set(["node_types", "pod_exits_refresh", "node_rooms"]);
+/** The Recent event feed, as the backend runs it: a list through the gate,
+ *  then the watch re-opened (through the gate) each time the server closes
+ *  it — every 290s — until a broken credential ends it or it is stopped.
+ *  BACKEND=old has no feed; the bundle it pairs with polls pod_events. */
+const feeds = new Map();
+let feedIds = 5000;
+function startFeed(ctx, ch) {
+  const id = feedIds++;
+  const f = { stopped: false };
+  feeds.set(id, f);
+  (async () => {
+    try {
+      await background(ctx, () => []);
+    } catch (e) {
+      if (!f.stopped) ch.onmessage({ type: "ERROR", error: String(e) });
+      return;
+    }
+    if (f.stopped) return;
+    ch.onmessage({ type: "SNAPSHOT", events: [] });
+    for (;;) {
+      await new Promise((r) => setTimeout(r, simMs(290 / 60)));
+      if (f.stopped) return;
+      try {
+        await background(ctx, () => null);
+      } catch (e) {
+        if (!f.stopped) ch.onmessage({ type: "ERROR", error: String(e) });
+        return;
+      }
+    }
+  })();
+  return id;
+}
 const sweepsOut = {}; // BACKEND=new: one sweep per cluster at a time, shared
 function sweepOne(ctx) {
   clusters[ctx].sweeps.push(simNow());
@@ -127,6 +159,12 @@ dom.window.__TAURI_INTERNALS__ = {
         (args.contexts ?? []).map((c) => sweepOne(c).then((b) => { try { ch.onmessage(b); } catch { /* */ } })),
       ).then(() => null);
     }
+    if (cmd === "pod_events_watch") return Promise.resolve(startFeed(args.context, args.channel));
+    if (cmd === "watch_stop" && feeds.has(args.id)) {
+      feeds.get(args.id).stopped = true;
+      return Promise.resolve(null);
+    }
+    if (cmd === "pod_events") return background(args.context, () => []); // the old bundle's poll
     if (cmd === "watch_start") {
       watches.push(args.channel);
       return Promise.resolve(watches.length);

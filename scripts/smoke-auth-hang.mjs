@@ -4,14 +4,16 @@
  * smoke:auth covers a helper that fails at once. The worse case is one that
  * opens a login page and waits for it — `aws-vault exec` with an expired SSO
  * session sits there for minutes. Nothing has failed yet, so nothing is
- * parked, and every background tick that fires meanwhile queues another
- * request behind the helper. kube runs the helper once per queued request
- * once it does fail (measured in cred_storm_tests), so each queued tick is
- * one more browser tab.
+ * parked, and anything that fires meanwhile queues another request behind
+ * the helper. kube runs the helper once per queued request once it does
+ * fail (measured in cred_storm_tests), so each one is a browser tab.
  *
- * This holds the Recent-event poll's requests open for a simulated five
- * minutes, then fails them, and asserts the poll never had more than one
- * request out and stops for good once the failure lands.
+ * The Recent event column used to poll on a 20s tick and queued one request
+ * per tick. It is a watch now: the backend holds one feed per pane and is
+ * the one that re-opens it (through the cluster's gate). This holds that
+ * feed silent at a login page for a simulated five minutes, then fails it,
+ * and asserts the app never starts a second feed meanwhile and never
+ * restarts one after a broken credential.
  * Run: node scripts/smoke-auth-hang.mjs
  */
 import { JSDOM } from "jsdom";
@@ -57,7 +59,7 @@ const EXPIRED =
   'Output { status: ExitStatus(unix_wait_status(256)), stdout: "", stderr: "Error when retrieving token from sso: Token has expired and refresh failed\\n" }';
 
 let broken = false; // the SSO session is gone; the helper is out at a login page
-const held = []; // pod_events requests queued behind the helper
+let feed = null; // the backend's feed for the pane — silent while its helper waits
 let eventCalls = 0;
 let eventCallsWhileBroken = 0;
 
@@ -71,11 +73,12 @@ dom.window.__TAURI_INTERNALS__ = {
       case "list_resources": return Promise.resolve(podTable);
       case "cached_list": return Promise.resolve(null);
       case "watch_start": return Promise.resolve(1);
-      case "pod_events":
+      case "pod_events_watch":
         eventCalls++;
-        if (!broken) return Promise.resolve([]);
-        eventCallsWhileBroken++;
-        return new Promise((_, reject) => held.push(reject));
+        if (broken) eventCallsWhileBroken++;
+        feed = args.channel;
+        setTimeout(() => feed.onmessage({ type: "SNAPSHOT", events: [] }), 0);
+        return Promise.resolve(eventCalls);
       case "aggregate_issues": {
         const ch = args?.channel;
         setTimeout(() => {
@@ -116,34 +119,34 @@ await wait(800);
 
 console.log("credential helper stuck at a login page");
 
-// Healthy first: the poll is running, so the test can see it stop.
+// Healthy first: one feed for the pod list, and no polling on top of it.
 await wait(simMinutes(1));
-ok("the Recent-event poll runs while credentials work", eventCalls >= 3, `${eventCalls} calls`);
+ok("the pod list runs one Recent-event feed", eventCalls === 1, `${eventCalls} started`);
 
-// The session expires. Every request now waits on the helper.
+// The session expires; the backend's feed sits at the login page, silent.
 broken = true;
 await wait(simMinutes(5));
 ok(
-  "while the helper waits, the poll keeps at most one request queued behind it",
-  eventCallsWhileBroken <= 1,
-  `${eventCallsWhileBroken} queued — each runs the helper once it fails, one browser tab apiece`,
+  "while the helper waits, the app starts no second feed",
+  eventCallsWhileBroken === 0,
+  `${eventCallsWhileBroken} started — each would queue behind the helper and open a browser tab`,
 );
 
 // The user never finishes the login page; the helper gives up.
-for (const reject of held.splice(0)) reject(EXPIRED);
+feed.onmessage({ type: "ERROR", error: EXPIRED });
 await wait(50);
 const atFailure = eventCalls;
 await wait(simMinutes(5));
 ok(
-  "once the failure lands the poll stops for good",
+  "once the failure lands it is never restarted",
   eventCalls === atFailure,
-  `${eventCalls - atFailure} more calls after the failure`,
+  `${eventCalls - atFailure} restarted after the failure`,
 );
 ok("no crash", !crash, crash ?? "");
 
 if (failed) { console.error(`AUTH-HANG SMOKE FAILED — ${failed} check(s)`); process.exit(1); }
 console.log(
-  `auth-hang smoke ok — ${eventCallsWhileBroken} request(s) queued behind a helper that waited ` +
-  `five simulated minutes, and none after it failed`,
+  `auth-hang smoke ok — no feed started while the helper waited five simulated minutes, ` +
+  `and none after it failed`,
 );
 process.exit(0);

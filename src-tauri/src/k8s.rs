@@ -3544,95 +3544,403 @@ pub async fn get_events(
     Ok(out)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct PodEvent {
     /// "namespace/name" of the pod the event is about.
     pub key: String,
     pub reason: String,
     pub message: String,
+    /// Every time this reason was recorded against the pod, across all the
+    /// event objects that carry it (see `PodEventIndex::summary`).
     pub count: i64,
     pub last: Option<String>,
+    /// Written by the events.k8s.io recorder (the scheduler, among others),
+    /// which records the first repeat at once but every later one only in a
+    /// batch every 30 minutes — so its count and time can lag that long.
+    pub series: bool,
 }
 
-/// The newest WARNING event per pod, for the Event column in the pod list.
-///
-/// Only warnings, for two reasons. Events expire after an hour by default, so
-/// the Normal ones (Scheduled, Pulled, Started) are gone from every pod that
-/// has been up a while — a column that showed them would be blank for most of
-/// the list anyway, and arbitrarily so. And the whole point of the column is
-/// the pod that did NOT come up: FailedScheduling, FailedMount, Unhealthy,
-/// BackOff. An empty cell then means "nothing is wrong", which is the reading
-/// that makes the column worth scanning.
-///
-/// Keeping it to warnings is also what makes it cheap enough to poll: the
-/// selector is applied by the API server, and a healthy cluster returns almost
-/// nothing where the full event list on a big cluster is six figures of rows.
-pub async fn pod_events(
-    state: &AppState,
-    context: String,
-    namespace: Option<String>,
-) -> Result<Vec<PodEvent>, String> {
-    let client = client(state, &context).await?;
-    let base = match namespace.as_deref() {
-        Some(ns) if !ns.is_empty() => format!("/api/v1/namespaces/{ns}/events"),
-        _ => "/api/v1/events".to_string(),
-    };
-    // resourceVersion=0 serves from the API server's watch cache rather than a
-    // quorum read out of etcd — this is a column, not an audit log.
-    let url = format!(
-        "{base}?fieldSelector={}&limit=500&resourceVersion=0",
-        urlencode("involvedObject.kind=Pod,type=Warning"),
-    );
-    let req = http::Request::get(&url)
-        .header(http::header::ACCEPT, "application/json")
-        .body(Vec::new())
-        .map_err(err)?;
-    let list: serde_json::Value =
-        in_background(cred_gate(state, &context), async { client.request(req).await.map_err(err) })
-            .await?;
-    Ok(newest_per_pod(list["items"].as_array().map(|v| &v[..]).unwrap_or(&[])))
+/// One warning event object, reduced to what the column needs.
+#[derive(Clone, Debug)]
+struct EvRec {
+    /// The event object's own ns/name — the tie-breaker between equal times.
+    id: String,
+    pod: String,
+    reason: String,
+    message: String,
+    count: i64,
+    last: Option<String>,
+    series: bool,
 }
 
-/// One event per pod — the newest — out of a raw event list.
-fn newest_per_pod(items: &[serde_json::Value]) -> Vec<PodEvent> {
-    let mut best: std::collections::HashMap<String, PodEvent> =
-        std::collections::HashMap::new();
-    for v in items {
-        let obj = &v["involvedObject"];
-        let name = obj["name"].as_str().unwrap_or_default();
-        if name.is_empty() {
-            continue;
+fn ev_rec(id: String, v: &serde_json::Value) -> Option<EvRec> {
+    let obj = &v["involvedObject"];
+    let name = obj["name"].as_str().unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    let ns = obj["namespace"]
+        .as_str()
+        .or_else(|| v.pointer("/metadata/namespace").and_then(|n| n.as_str()))
+        .unwrap_or_default();
+    // core/v1 Events count repeats in `count` and `lastTimestamp`. The
+    // events.k8s.io recorder leaves both empty and keeps them in `series`
+    // instead, with `eventTime` the FIRST occurrence.
+    let series = v.get("series").filter(|s| s.is_object());
+    Some(EvRec {
+        id,
+        pod: format!("{ns}/{name}"),
+        reason: v["reason"].as_str().unwrap_or_default().to_string(),
+        message: v["message"].as_str().unwrap_or_default().to_string(),
+        count: series
+            .and_then(|s| s["count"].as_i64())
+            .or_else(|| v["count"].as_i64())
+            .unwrap_or(1),
+        last: series
+            .and_then(|s| s["lastObservedTime"].as_str())
+            .or_else(|| v["lastTimestamp"].as_str())
+            .or_else(|| v["eventTime"].as_str())
+            .or_else(|| v.pointer("/metadata/creationTimestamp").and_then(|t| t.as_str()))
+            .map(String::from),
+        series: series.is_some(),
+    })
+}
+
+fn event_id(v: &serde_json::Value) -> Option<String> {
+    let name = v.pointer("/metadata/name").and_then(|n| n.as_str())?;
+    let ns = v.pointer("/metadata/namespace").and_then(|n| n.as_str()).unwrap_or_default();
+    Some(format!("{ns}/{name}"))
+}
+
+/// Every live warning event object, and what each pod's adds up to.
+///
+/// Kubernetes splits one pod's repeats of a reason across several event
+/// objects — a new object, counting from one again, whenever the message
+/// changes even slightly ("0/50 nodes are available" becoming "0/51"). So a
+/// pod that failed to schedule a hundred thousand times can have its newest
+/// object at ×7. The summary takes the reason from the newest object and the
+/// count from all of that reason's objects together.
+#[derive(Default)]
+pub struct PodEventIndex {
+    recs: std::collections::HashMap<String, EvRec>,
+    by_pod: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl PodEventIndex {
+    /// Add or replace an event object; returns the pod(s) whose summary may
+    /// have changed.
+    fn upsert(&mut self, id: String, v: &serde_json::Value) -> Vec<String> {
+        let mut touched = Vec::new();
+        if let Some(old) = self.recs.remove(&id) {
+            self.unlink(&old);
+            touched.push(old.pod);
         }
-        let ns = obj["namespace"]
-            .as_str()
-            .or_else(|| v.pointer("/metadata/namespace").and_then(|n| n.as_str()))
-            .unwrap_or_default();
-        let ev = PodEvent {
-            key: format!("{ns}/{name}"),
-            reason: v["reason"].as_str().unwrap_or_default().to_string(),
-            message: v["message"].as_str().unwrap_or_default().to_string(),
-            count: v["count"].as_i64().unwrap_or(1),
-            // core/v1 Events carry lastTimestamp; the ones the events.k8s.io
-            // recorder writes leave it null and carry eventTime instead.
-            last: v["lastTimestamp"]
-                .as_str()
-                .or_else(|| v["eventTime"].as_str())
-                .or_else(|| v.pointer("/metadata/creationTimestamp").and_then(|t| t.as_str()))
-                .map(String::from),
-        };
-        // Timestamps are RFC 3339 in UTC, so they compare as strings. An event
-        // with no timestamp at all loses to one that has any — None sorts
-        // below Some, which is the order we want here.
-        match best.get(&ev.key) {
-            Some(cur) if cur.last >= ev.last => {}
-            _ => {
-                best.insert(ev.key.clone(), ev);
+        if let Some(rec) = ev_rec(id.clone(), v) {
+            self.by_pod.entry(rec.pod.clone()).or_default().insert(id.clone());
+            if touched.first() != Some(&rec.pod) {
+                touched.push(rec.pod.clone());
+            }
+            self.recs.insert(id, rec);
+        }
+        touched
+    }
+
+    fn remove(&mut self, id: &str) -> Option<String> {
+        let old = self.recs.remove(id)?;
+        self.unlink(&old);
+        Some(old.pod)
+    }
+
+    fn unlink(&mut self, rec: &EvRec) {
+        if let Some(set) = self.by_pod.get_mut(&rec.pod) {
+            set.remove(&rec.id);
+            if set.is_empty() {
+                self.by_pod.remove(&rec.pod);
             }
         }
     }
-    let mut out: Vec<PodEvent> = best.into_values().collect();
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    out
+
+    fn summary(&self, pod: &str) -> Option<PodEvent> {
+        let recs: Vec<&EvRec> = self.by_pod.get(pod)?.iter().filter_map(|id| self.recs.get(id)).collect();
+        // Timestamps are RFC 3339 in UTC, so they compare as strings; an
+        // undated event loses to any dated one (None < Some).
+        let newest = recs.iter().max_by(|a, b| a.last.cmp(&b.last).then_with(|| a.id.cmp(&b.id)))?;
+        let same = recs.iter().filter(|r| r.reason == newest.reason);
+        let (count, series) = same.fold((0, false), |(c, s), r| (c + r.count, s || r.series));
+        Some(PodEvent {
+            key: pod.to_string(),
+            reason: newest.reason.clone(),
+            message: newest.message.clone(),
+            count,
+            last: newest.last.clone(),
+            series,
+        })
+    }
+
+    fn snapshot(&self) -> Vec<PodEvent> {
+        let mut out: Vec<PodEvent> = self.by_pod.keys().filter_map(|p| self.summary(p)).collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+}
+
+/// One summary per pod out of a raw event list.
+#[cfg(test)]
+fn newest_per_pod(items: &[serde_json::Value]) -> Vec<PodEvent> {
+    let mut idx = PodEventIndex::default();
+    for (i, v) in items.iter().enumerate() {
+        idx.upsert(event_id(v).unwrap_or_else(|| format!("#{i}")), v);
+    }
+    idx.snapshot()
+}
+
+/// How the Recent event watch paces itself; tests run it faster.
+#[derive(Clone, Copy)]
+pub struct EvWatchTiming {
+    /// At most one batch of changes to the screen this often: each one
+    /// rebuilds the display rows, and on a busy cluster something changes
+    /// every second.
+    pub flush: std::time::Duration,
+    /// Changes that arrive together go out together.
+    pub debounce: std::time::Duration,
+    pub backoff_min: std::time::Duration,
+    pub backoff_max: std::time::Duration,
+    /// How long the server holds each watch before it is re-opened.
+    pub watch_secs: u32,
+}
+
+pub const EV_TIMING: EvWatchTiming = EvWatchTiming {
+    flush: std::time::Duration::from_secs(10),
+    debounce: std::time::Duration::from_millis(500),
+    backoff_min: std::time::Duration::from_secs(5),
+    backoff_max: std::time::Duration::from_secs(60),
+    watch_secs: 290,
+};
+
+/// The selector the whole feature rests on. Only warnings, for two reasons.
+/// Events expire after an hour by default, so the Normal ones (Scheduled,
+/// Pulled, Started) are gone from every pod that has been up a while — a
+/// column of them would be blank for most of the list anyway, and
+/// arbitrarily so. And the column is for the pod that did NOT come up:
+/// FailedScheduling, FailedMount, Unhealthy, BackOff. An empty cell then
+/// means "nothing is wrong", which is what makes it worth scanning.
+const POD_WARNINGS: &str = "involvedObject.kind=Pod,type=Warning";
+
+fn events_base(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(ns) if !ns.is_empty() => format!("/api/v1/namespaces/{ns}/events"),
+        _ => "/api/v1/events".to_string(),
+    }
+}
+
+/// Every warning event, page by page. A single page of 500 was what this
+/// once read, and on a cluster with a few thousand warnings that left most
+/// pods' warnings out — alphabetically by namespace, so whole teams saw none.
+/// resourceVersion=0 serves the first page from the API server's watch cache
+/// rather than a quorum read out of etcd.
+async fn list_pod_warnings(
+    client: &Client,
+    base: &str,
+) -> Result<(Vec<serde_json::Value>, String), String> {
+    let fields = urlencode(POD_WARNINGS);
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    let mut rv = String::new();
+    loop {
+        let url = match &token {
+            None => format!("{base}?fieldSelector={fields}&limit=500&resourceVersion=0"),
+            Some(t) => format!("{base}?fieldSelector={fields}&limit=500&continue={}", urlencode(t)),
+        };
+        let req = http::Request::get(&url)
+            .header(http::header::ACCEPT, "application/json")
+            .body(Vec::new())
+            .map_err(err)?;
+        let mut page: serde_json::Value = client.request(req).await.map_err(err)?;
+        if let Some(a) = page.get_mut("items").and_then(|a| a.as_array_mut()) {
+            items.append(a);
+        }
+        if let Some(v) = page.pointer("/metadata/resourceVersion").and_then(|v| v.as_str()) {
+            rv = v.to_string();
+        }
+        token = page
+            .pointer("/metadata/continue")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(String::from);
+        if token.is_none() || items.len() > 500_000 {
+            break;
+        }
+    }
+    Ok((items, rv))
+}
+
+/// What changed since the last batch, as the screen wants it.
+fn ev_flush(
+    idx: &PodEventIndex,
+    sent: &mut std::collections::HashMap<String, PodEvent>,
+    dirty: &mut std::collections::HashSet<String>,
+) -> Option<serde_json::Value> {
+    let mut events = Vec::new();
+    let mut removed = Vec::new();
+    for pod in dirty.drain() {
+        match idx.summary(&pod) {
+            Some(s) if sent.get(&pod) != Some(&s) => {
+                sent.insert(pod, s.clone());
+                events.push(s);
+            }
+            Some(_) => {}
+            None => {
+                if sent.remove(&pod).is_some() {
+                    removed.push(pod);
+                }
+            }
+        }
+    }
+    if events.is_empty() && removed.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "type": "DELTA", "events": events, "removed": removed }))
+}
+
+/// The Recent event column's feed for one pod list: the whole warning list
+/// once, then only what changes, for as long as the list is open.
+///
+/// Sends SNAPSHOT (everything, replacing what was there), DELTA (changed and
+/// removed pods) and ERROR. Everything it asks of the API server goes through
+/// the cluster's gate, and a broken credential ends it: re-opening the watch
+/// would run the credential helper again, which can open a browser.
+async fn run_pod_events_watch(
+    client: Client,
+    gate: std::sync::Arc<CredGate>,
+    namespace: Option<String>,
+    t: EvWatchTiming,
+    out: impl Fn(serde_json::Value) -> bool,
+) {
+    use futures::AsyncBufReadExt;
+    use futures::StreamExt;
+    let base = events_base(namespace.as_deref());
+    let fields = urlencode(POD_WARNINGS);
+    let mut backoff = t.backoff_min;
+    // Says so and reports whether to carry on: never after a broken
+    // credential, nor once nobody is listening.
+    let failed = |e: String| -> bool {
+        let cred = is_credential_failure(&e);
+        out(serde_json::json!({ "type": "ERROR", "error": e })) && !cred
+    };
+    'relist: loop {
+        let (items, mut rv) = match in_background(gate.clone(), list_pod_warnings(&client, &base)).await {
+            Ok(x) => x,
+            Err(e) => {
+                if !failed(e) {
+                    return;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(t.backoff_max);
+                continue 'relist;
+            }
+        };
+        let mut idx = PodEventIndex::default();
+        for (i, v) in items.iter().enumerate() {
+            idx.upsert(event_id(v).unwrap_or_else(|| format!("#{i}")), v);
+        }
+        drop(items);
+        let snapshot = idx.snapshot();
+        let mut sent: std::collections::HashMap<String, PodEvent> =
+            snapshot.iter().map(|e| (e.key.clone(), e.clone())).collect();
+        if !out(serde_json::json!({ "type": "SNAPSHOT", "events": snapshot })) {
+            return;
+        }
+        backoff = t.backoff_min;
+        let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dirty_since: Option<tokio::time::Instant> = None;
+        let mut last_flush = tokio::time::Instant::now();
+        loop {
+            let url = format!(
+                "{base}?watch=1&fieldSelector={fields}&resourceVersion={}&timeoutSeconds={}&allowWatchBookmarks=true",
+                urlencode(&rv),
+                t.watch_secs
+            );
+            let req = match http::Request::get(&url)
+                .header(http::header::ACCEPT, "application/json")
+                .body(Vec::new())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    failed(err(e));
+                    return;
+                }
+            };
+            let stream = match in_background(gate.clone(), async { client.request_stream(req).await.map_err(err) }).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !failed(e) {
+                        return;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(t.backoff_max);
+                    continue 'relist;
+                }
+            };
+            let mut lines = Box::pin(stream).lines();
+            loop {
+                let deadline = dirty_since.map(|d| (d + t.debounce).max(last_flush + t.flush));
+                tokio::select! {
+                    line = lines.next() => {
+                        let Some(Ok(line)) = line else { break }; // closed: re-open from rv
+                        let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                        let obj = &ev["object"];
+                        if let Some(v) = obj.pointer("/metadata/resourceVersion").and_then(|v| v.as_str()) {
+                            if !v.is_empty() {
+                                rv = v.to_string();
+                            }
+                        }
+                        let touched = match ev["type"].as_str().unwrap_or_default() {
+                            "ADDED" | "MODIFIED" => match event_id(obj) {
+                                Some(id) => idx.upsert(id, obj),
+                                None => Vec::new(),
+                            },
+                            "DELETED" => event_id(obj).and_then(|id| idx.remove(&id)).into_iter().collect(),
+                            // Usually 410 Gone: too far behind to resume. Start over;
+                            // the fresh SNAPSHOT replaces whatever was shown.
+                            "ERROR" => continue 'relist,
+                            _ => Vec::new(), // BOOKMARK: only the version moves
+                        };
+                        if !touched.is_empty() {
+                            dirty.extend(touched);
+                            dirty_since.get_or_insert_with(tokio::time::Instant::now);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                        if let Some(msg) = ev_flush(&idx, &mut sent, &mut dirty) {
+                            if !out(msg) {
+                                return;
+                            }
+                        }
+                        dirty_since = None;
+                        last_flush = tokio::time::Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Start the Recent event feed for a pod list; stop it with watch_stop.
+pub async fn pod_events_watch(
+    state: &AppState,
+    context: String,
+    namespace: Option<String>,
+    channel: Channel<serde_json::Value>,
+) -> Result<u32, String> {
+    let client = client(state, &context).await?;
+    let gate = cred_gate(state, &context);
+    let ns = namespace.filter(|n| !n.is_empty());
+    let task = tokio::spawn(run_pod_events_watch(client, gate, ns, EV_TIMING, move |v| {
+        channel.send(v).is_ok()
+    }));
+    let id = state.next_exec.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.watches.write().await.insert(id, task.abort_handle());
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -3651,6 +3959,93 @@ mod pod_event_tests {
             v["lastTimestamp"] = json!(t);
         }
         v
+    }
+
+    fn obj(name: &str, pod: &str, reason: &str, message: &str, count: i64, last: &str) -> serde_json::Value {
+        json!({
+            "metadata": {"name": name, "namespace": "sre"},
+            "involvedObject": {"kind": "Pod", "name": pod, "namespace": "sre"},
+            "reason": reason, "message": message, "count": count, "lastTimestamp": last,
+        })
+    }
+
+    /// Seen on a real cluster: one pod, one reason, a dozen objects — a new
+    /// one whenever the message changes — each counting from one again.
+    #[test]
+    fn a_reason_split_across_objects_counts_them_all() {
+        let out = newest_per_pod(&[
+            obj("e1", "a", "FailedScheduling", "0/50 nodes are available", 95_553, "2026-11-09T02:00:00Z"),
+            obj("e2", "a", "FailedScheduling", "0/51 nodes are available", 11_642, "2026-11-09T02:58:00Z"),
+            obj("e3", "a", "FailedScheduling", "0/52 nodes are available", 7, "2026-11-09T02:57:00Z"),
+            obj("e4", "a", "FailedMount", "volume not attached", 3, "2026-11-09T01:00:00Z"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reason, "FailedScheduling");
+        assert_eq!(out[0].count, 95_553 + 11_642 + 7, "not the newest object's own count");
+        assert_eq!(out[0].message, "0/51 nodes are available", "the newest object's message");
+        assert_eq!(out[0].last.as_deref(), Some("2026-11-09T02:58:00Z"));
+    }
+
+    #[test]
+    fn the_newest_reason_decides_and_only_its_count_counts() {
+        let out = newest_per_pod(&[
+            obj("e1", "a", "FailedScheduling", "m", 500, "2026-11-09T01:00:00Z"),
+            obj("e2", "a", "BackOff", "m", 4, "2026-11-09T02:00:00Z"),
+        ]);
+        assert_eq!((out[0].reason.as_str(), out[0].count), ("BackOff", 4));
+    }
+
+    #[test]
+    fn the_index_follows_changes_and_removals() {
+        let mut idx = super::PodEventIndex::default();
+        let e1 = obj("e1", "a", "Unhealthy", "probe", 3, "2026-11-09T01:00:00Z");
+        assert_eq!(idx.upsert("sre/e1".into(), &e1), vec!["sre/a".to_string()]);
+        let e1b = obj("e1", "a", "Unhealthy", "probe", 9, "2026-11-09T01:05:00Z");
+        idx.upsert("sre/e1".into(), &e1b);
+        assert_eq!(idx.summary("sre/a").unwrap().count, 9, "a MODIFIED replaces, it does not add");
+        assert_eq!(idx.remove("sre/e1"), Some("sre/a".to_string()));
+        assert!(idx.summary("sre/a").is_none());
+        assert!(idx.snapshot().is_empty());
+    }
+
+    /// What the scheduler writes for a pod it keeps failing to place.
+    fn series_ev(ns: &str, name: &str, first: &str, count: i64, last: &str) -> serde_json::Value {
+        json!({
+            "involvedObject": {"kind": "Pod", "name": name, "namespace": ns},
+            "reason": "FailedScheduling",
+            "message": "0/50 nodes are available: insufficient cpu.",
+            "eventTime": first,
+            "series": {"count": count, "lastObservedTime": last},
+        })
+    }
+
+    #[test]
+    fn a_series_reads_its_count_and_latest_time() {
+        let out = newest_per_pod(&[series_ev(
+            "sre", "a", "2026-11-09T01:00:00.000000Z", 14, "2026-11-09T02:30:00.000000Z",
+        )]);
+        assert_eq!(out[0].count, 14, "not the 1 the empty `count` field implies");
+        assert_eq!(out[0].last.as_deref(), Some("2026-11-09T02:30:00.000000Z"), "not when it first happened");
+        assert!(out[0].series);
+    }
+
+    #[test]
+    fn a_new_style_event_that_happened_once_is_still_one() {
+        let mut v = series_ev("sre", "a", "2026-11-09T01:00:00.000000Z", 0, "");
+        v.as_object_mut().unwrap().remove("series");
+        let out = newest_per_pod(&[v]);
+        assert_eq!((out[0].count, out[0].series), (1, false));
+        assert_eq!(out[0].last.as_deref(), Some("2026-11-09T01:00:00.000000Z"));
+    }
+
+    #[test]
+    fn a_series_competes_by_its_latest_time() {
+        // First seen long ago, still going: newer than a one-off from in between.
+        let out = newest_per_pod(&[
+            series_ev("sre", "a", "2026-11-09T00:00:00.000000Z", 30, "2026-11-09T03:00:00.000000Z"),
+            ev("sre", "a", "FailedMount", Some("2026-11-09T01:00:00Z")),
+        ]);
+        assert_eq!(out[0].reason, "FailedScheduling");
     }
 
     #[test]
@@ -5842,6 +6237,221 @@ mod extras_tests {
     }
 }
 
+#[cfg(test)]
+mod events_feed_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const FAST: EvWatchTiming = EvWatchTiming {
+        flush: std::time::Duration::from_millis(200),
+        debounce: std::time::Duration::from_millis(50),
+        backoff_min: std::time::Duration::from_millis(50),
+        backoff_max: std::time::Duration::from_millis(200),
+        watch_secs: 5,
+    };
+
+    fn ev(name: &str, pod: &str, reason: &str, count: i64, last: &str, rv: &str) -> serde_json::Value {
+        json!({
+            "metadata": {"name": name, "namespace": "sre", "resourceVersion": rv},
+            "involvedObject": {"kind": "Pod", "name": pod, "namespace": "sre"},
+            "reason": reason, "message": format!("{reason} on {pod}"), "count": count,
+            "lastTimestamp": last, "type": "Warning",
+        })
+    }
+
+    /// One watch answer: the lines it streams, then whether it closes.
+    struct Watch {
+        lines: Vec<serde_json::Value>,
+        close: bool,
+    }
+
+    /// Answers event lists page by page (continue tokens "p1", "p2", …) and
+    /// event watches from a script. Logs every request path.
+    async fn fake_api(pages: Vec<Vec<serde_json::Value>>, watches: Vec<Watch>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pages = Arc::new(pages);
+        let watches = Arc::new(Mutex::new(watches.into_iter()));
+        let lg = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let (pages, watches, lg) = (pages.clone(), watches.clone(), lg.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = s.read(&mut b).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&b[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    lg.lock().unwrap().push(path.clone());
+                    if path.contains("watch=1") {
+                        let next = watches.lock().unwrap().next();
+                        let Some(w) = next else { return };
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n").await;
+                        for line in w.lines {
+                            let data = format!("{line}\n");
+                            let _ = s.write_all(format!("{:x}\r\n{data}\r\n", data.len()).as_bytes()).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        if w.close {
+                            let _ = s.write_all(b"0\r\n\r\n").await;
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        }
+                        return;
+                    }
+                    let page = path.split("continue=p").nth(1).and_then(|r| r.split('&').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+                    let next = if page + 1 < pages.len() { format!("p{}", page + 1) } else { String::new() };
+                    let body = json!({"kind": "EventList", "metadata": {"resourceVersion": "100", "continue": next}, "items": pages.get(page).cloned().unwrap_or_default()}).to_string();
+                    let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    /// Run the feed against `server` for `for_ms`, returning what it sent.
+    async fn run_feed(server: &str, for_ms: u64) -> Vec<serde_json::Value> {
+        let client = kube::Client::try_from(kube::Config::new(server.parse().unwrap())).unwrap();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let run = run_pod_events_watch(client, Arc::new(CredGate::default()), None, FAST, move |v| {
+            g.lock().unwrap().push(v);
+            true
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(for_ms), run).await;
+        let out = got.lock().unwrap().clone();
+        out
+    }
+
+    fn keep_open() -> Vec<Watch> {
+        (0..3).map(|_| Watch { lines: vec![], close: false }).collect()
+    }
+
+    /// Against a real cluster, by hand: the feed exactly as the app runs it.
+    /// PEYE_LIVE_CONTEXT=<kube context> [PEYE_LIVE_SECS=45]
+    /// cargo test --lib live_feed -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn live_feed() {
+        let Ok(ctx) = std::env::var("PEYE_LIVE_CONTEXT") else { return };
+        let secs: u64 = std::env::var("PEYE_LIVE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(45);
+        let opts = kube::config::KubeConfigOptions { context: Some(ctx.clone()), ..Default::default() };
+        let client = kube::Client::try_from(kube::Config::from_kubeconfig(&opts).await.unwrap()).unwrap();
+        let t0 = std::time::Instant::now();
+        let got: Arc<Mutex<Vec<(f64, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let run = run_pod_events_watch(client, Arc::new(CredGate::default()), None, EV_TIMING, move |v| {
+            g.lock().unwrap().push((t0.elapsed().as_secs_f64(), v));
+            true
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), run).await;
+        let got = got.lock().unwrap().clone();
+        for (at, m) in &got {
+            let n = m["events"].as_array().map(|a| a.len()).unwrap_or(0);
+            let r = m["removed"].as_array().map(|a| a.len()).unwrap_or(0);
+            eprintln!("{at:6.1}s  {:8}  pods {n:5}  removed {r:3}  {}", m["type"].as_str().unwrap_or(""), m["error"].as_str().unwrap_or(""));
+        }
+        if let Some((_, snap)) = got.iter().find(|(_, m)| m["type"] == "SNAPSHOT") {
+            let mut evs: Vec<&serde_json::Value> = snap["events"].as_array().unwrap().iter().collect();
+            evs.sort_by_key(|e| -e["count"].as_i64().unwrap_or(0));
+            for e in evs.iter().take(5) {
+                eprintln!("  top: {:60} {:18} x{}", e["key"].as_str().unwrap(), e["reason"].as_str().unwrap(), e["count"]);
+            }
+            std::fs::write(std::env::temp_dir().join(format!("peye-live-{ctx}.json")), snap.to_string()).unwrap();
+        }
+    }
+
+    /// The bug this replaces: one page of 500 left most pods out.
+    #[tokio::test]
+    async fn the_first_answer_covers_every_page() {
+        let pages: Vec<Vec<serde_json::Value>> = [500, 500, 200]
+            .iter()
+            .enumerate()
+            .map(|(p, n)| (0..*n).map(|i| ev(&format!("e{p}-{i}"), &format!("pod-{p}-{i}"), "Unhealthy", 1, "2026-11-09T01:00:00Z", "1")).collect())
+            .collect();
+        let (server, log) = fake_api(pages, keep_open()).await;
+        let got = run_feed(&server, 800).await;
+        assert_eq!(got[0]["type"], "SNAPSHOT");
+        assert_eq!(got[0]["events"].as_array().unwrap().len(), 1200, "every pod from every page");
+        let log = log.lock().unwrap().clone();
+        assert!(log[0].contains("resourceVersion=0") && log[0].contains("limit=500"), "{log:?}");
+        assert!(log[1].contains("continue=p1") && log[2].contains("continue=p2"), "{log:?}");
+        assert!(log[3].contains("watch=1") && log[3].contains("resourceVersion=100"), "watch from the list's version: {log:?}");
+    }
+
+    /// While the list sits open only what changed is sent, in one batch.
+    #[tokio::test]
+    async fn changes_arrive_together_and_only_what_changed() {
+        let page = vec![
+            ev("e1", "a", "Unhealthy", 1, "2026-11-09T01:00:00Z", "1"),
+            ev("e3", "c", "FailedMount", 2, "2026-11-09T01:00:00Z", "1"),
+            ev("e4", "d", "BackOff", 9, "2026-11-09T01:00:00Z", "1"),
+        ];
+        let watch = Watch {
+            lines: vec![
+                json!({"type": "MODIFIED", "object": ev("e1", "a", "Unhealthy", 5, "2026-11-09T01:01:00Z", "101")}),
+                json!({"type": "ADDED", "object": ev("e2", "b", "FailedScheduling", 1, "2026-11-09T01:02:00Z", "102")}),
+                json!({"type": "DELETED", "object": ev("e3", "c", "FailedMount", 2, "2026-11-09T01:00:00Z", "103")}),
+                json!({"type": "MODIFIED", "object": ev("e1", "a", "Unhealthy", 6, "2026-11-09T01:03:00Z", "104")}),
+                // a resend of what is already shown: nothing to send for d
+                json!({"type": "MODIFIED", "object": ev("e4", "d", "BackOff", 9, "2026-11-09T01:00:00Z", "105")}),
+            ],
+            close: false,
+        };
+        let (server, _) = fake_api(vec![page], vec![watch]).await;
+        let got = run_feed(&server, 1500).await;
+        assert_eq!(got.len(), 2, "one snapshot, then one batch: {got:#?}");
+        let d = &got[1];
+        assert_eq!(d["type"], "DELTA");
+        let mut keys: Vec<(String, i64)> = d["events"].as_array().unwrap().iter()
+            .map(|e| (e["key"].as_str().unwrap().to_string(), e["count"].as_i64().unwrap())).collect();
+        keys.sort();
+        assert_eq!(keys, vec![("sre/a".to_string(), 6), ("sre/b".to_string(), 1)]);
+        assert_eq!(d["removed"], json!(["sre/c"]));
+    }
+
+    /// The server closes every watch after a while; it re-opens from where it
+    /// was, without fetching the whole list again.
+    #[tokio::test]
+    async fn a_closed_watch_reopens_where_it_left_off() {
+        let page = vec![ev("e1", "a", "Unhealthy", 1, "2026-11-09T01:00:00Z", "1")];
+        let watches = vec![
+            Watch { lines: vec![json!({"type": "BOOKMARK", "object": {"metadata": {"resourceVersion": "150"}}})], close: true },
+            Watch { lines: vec![], close: false },
+        ];
+        let (server, log) = fake_api(vec![page], watches).await;
+        let got = run_feed(&server, 800).await;
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.iter().filter(|p| !p.contains("watch=1")).count(), 1, "listed once: {log:?}");
+        let w: Vec<&String> = log.iter().filter(|p| p.contains("watch=1")).collect();
+        assert!(w.len() >= 2 && w[1].contains("resourceVersion=150"), "{log:?}");
+        assert_eq!(got.len(), 1, "nothing new to send: {got:?}");
+    }
+
+    /// Too far behind to resume (410 Gone): start over with a fresh list.
+    #[tokio::test]
+    async fn gone_starts_over() {
+        let page = vec![ev("e1", "a", "Unhealthy", 1, "2026-11-09T01:00:00Z", "1")];
+        let watches = vec![
+            Watch { lines: vec![json!({"type": "ERROR", "object": {"kind": "Status", "code": 410, "reason": "Expired"}})], close: true },
+            Watch { lines: vec![], close: false },
+        ];
+        let (server, log) = fake_api(vec![page], watches).await;
+        let got = run_feed(&server, 800).await;
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.iter().filter(|p| !p.contains("watch=1")).count(), 2, "listed again: {log:?}");
+        assert_eq!(got.iter().filter(|m| m["type"] == "SNAPSHOT").count(), 2);
+    }
+}
+
 /// What an expired SSO session does to the cluster's credential command.
 ///
 /// A kubeconfig exec helper like `aws-vault exec … -- aws eks get-token` opens
@@ -6042,6 +6652,29 @@ current-context: x
         Channel::new(|_| Ok(()))
     }
 
+    pub(super) const FAST: EvWatchTiming = EvWatchTiming {
+        flush: std::time::Duration::from_millis(200),
+        debounce: std::time::Duration::from_millis(50),
+        backoff_min: std::time::Duration::from_millis(50),
+        backoff_max: std::time::Duration::from_millis(200),
+        watch_secs: 5,
+    };
+
+    /// Run the Recent event feed until it stops — a broken credential ends
+    /// it — or a few seconds pass, and return what it sent.
+    async fn feed(state: &AppState, ns: Option<String>) -> Vec<serde_json::Value> {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let g = got.clone();
+        let client = client(state, "x").await.unwrap();
+        let run = run_pod_events_watch(client, cred_gate(state, "x"), ns, FAST, move |v| {
+            g.lock().unwrap().push(v);
+            true
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+        let out = got.lock().unwrap().clone();
+        out
+    }
+
     /// Everything the app asks on its own, all at once, while the helper is
     /// out at a login page: one helper run between them, not one each — and
     /// nothing at all once the failure is known.
@@ -6050,19 +6683,24 @@ current-context: x
         let (client, runs) = expiring_client("0.5").await;
         let state = state_with(client).await;
         let (a, b, c, d, e, f) = tokio::join!(
-            pod_events(&state, "x".into(), None),
-            pod_events(&state, "x".into(), Some("app".into())),
+            feed(&state, None),
+            feed(&state, Some("app".into())),
             issues_once(&state, "x"),
             node_types(&state, "x".into()),
             pod_exits_refresh(&state, "x".into(), vec!["app/p".into()]),
             list_resources(&state, "x".into(), pods(), None, None, quiet_channel(), true),
         );
-        assert!(a.is_err() && b.is_err() && c.is_err() && d.is_err() && e.is_err() && f.is_err());
+        for f in [&a, &b] {
+            assert_eq!(f.len(), 1, "the feed reports once and stops: {f:?}");
+            assert_eq!(f[0]["type"], "ERROR");
+            assert!(f[0]["error"].as_str().unwrap().contains("auth exec"));
+        }
+        assert!(c.is_err() && d.is_err() && e.is_err() && f.is_err());
         assert_eq!(runs(), 1, "six background requests, one helper run");
 
-        // Known broken now: a later tick is answered without being sent.
-        let later = pod_events(&state, "x".into(), None).await;
-        assert!(later.err().unwrap().contains("auth exec"));
+        // Known broken now: a new feed is answered without anything sent.
+        let later = feed(&state, None).await;
+        assert!(later[0]["error"].as_str().unwrap().contains("auth exec"));
         let relist = list_resources(&state, "x".into(), pods(), None, None, quiet_channel(), true).await;
         assert!(relist.is_err());
         assert_eq!(runs(), 1, "nothing sent once the failure is known");
@@ -6078,11 +6716,11 @@ current-context: x
     async fn a_reconnect_opens_the_gate_again() {
         let (client, _) = expiring_client("0").await;
         let state = state_with(client).await;
-        assert!(pod_events(&state, "x".into(), None).await.is_err());
+        assert!(node_types(&state, "x".into()).await.is_err());
         disconnect(&state, "x".into()).await.unwrap();
         let (fresh, runs) = expiring_client("0").await;
         state.clients.write().await.insert("x".into(), fresh);
-        assert!(pod_events(&state, "x".into(), None).await.is_err());
+        assert!(node_types(&state, "x".into()).await.is_err());
         assert_eq!(runs(), 1, "the new client was asked, not answered from the old failure");
     }
 
@@ -6095,9 +6733,9 @@ current-context: x
             assert_eq!(issues_once(&state, "x").await.map(|v| v.len()), Ok(0));
         }
         // a Forbidden is not a broken credential: nothing latched
-        let e = pod_events(&state, "x".into(), None).await.err().unwrap();
+        let e = node_types(&state, "x".into()).await.err().unwrap();
         assert!(e.contains("Forbidden"), "{e}");
-        let e2 = pod_events(&state, "x".into(), None).await.err().unwrap();
+        let e2 = node_types(&state, "x".into()).await.err().unwrap();
         assert!(e2.contains("Forbidden"), "it was sent again, not answered from a latch: {e2}");
     }
 
