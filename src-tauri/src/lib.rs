@@ -129,8 +129,18 @@ async fn list_resources(
     namespace: Option<String>,
     field_selector: Option<String>,
     channel: Channel<serde_json::Value>,
+    background: Option<bool>,
 ) -> Result<ResourceTable, String> {
-    k8s::list_resources(&state, context, resource, namespace, field_selector, channel).await
+    k8s::list_resources(
+        &state,
+        context,
+        resource,
+        namespace,
+        field_selector,
+        channel,
+        background.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -550,6 +560,49 @@ async fn node_stats(
 }
 
 #[tauri::command]
+async fn pod_exits(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: Option<String>,
+) -> Result<Option<Vec<k8s::PodExit>>, String> {
+    k8s::pod_exits(&state, context, namespace).await
+}
+
+#[tauri::command]
+async fn pod_exits_refresh(
+    state: State<'_, AppState>,
+    context: String,
+    keys: Vec<String>,
+) -> Result<Vec<k8s::PodExit>, String> {
+    k8s::pod_exits_refresh(&state, context, keys).await
+}
+
+#[tauri::command]
+async fn node_types(
+    state: State<'_, AppState>,
+    context: String,
+) -> Result<Vec<k8s::NodeType>, String> {
+    k8s::node_types(&state, context).await
+}
+
+#[tauri::command]
+async fn node_rooms(
+    state: State<'_, AppState>,
+    context: String,
+) -> Result<Option<k8s::NodeRooms>, String> {
+    k8s::node_rooms(&state, context).await
+}
+
+#[tauri::command]
+async fn node_allocated(
+    state: State<'_, AppState>,
+    context: String,
+    node: String,
+) -> Result<k8s::NodeAllocated, String> {
+    k8s::node_allocated(&state, context, node).await
+}
+
+#[tauri::command]
 async fn ensure_index(state: State<'_, AppState>) -> Result<(), String> {
     k8s::ensure_index(&state).await
 }
@@ -872,6 +925,11 @@ pub fn run() {
             pod_stats,
             pod_events,
             node_stats,
+            pod_exits,
+            pod_exits_refresh,
+            node_types,
+            node_rooms,
+            node_allocated,
             ensure_index,
             filter_rows,
             list_namespaces,

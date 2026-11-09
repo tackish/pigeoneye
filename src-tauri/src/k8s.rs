@@ -46,7 +46,85 @@ pub struct AppState {
     /// user had open. This holds names only — a few hundred KB for a
     /// cluster whose pod list is 6.8MB — so it can just stay.
     pub names: RwLock<std::collections::HashMap<String, NameIndex>>,
+    /// The Issues sweep currently out for each context. A sweep that finds
+    /// one still running joins it rather than sending its own: while a
+    /// credential helper sits at a login page every request queues behind
+    /// it, and kube runs the helper once more per queued request when it
+    /// fails — a browser tab apiece, one a minute, for as long as the page
+    /// is left open.
+    pub issue_sweeps: tokio::sync::Mutex<std::collections::HashMap<String, IssueSweep>>,
+    /// Allocatable (cpu, memory, pods) per node, per context, as the node
+    /// list's metrics pass last read it — so the free-room columns that open
+    /// alongside don't fetch every node a second time.
+    pub node_alloc: RwLock<std::collections::HashMap<String, NodeAllocRead>>,
+    /// One per context: what the app asks on its own takes turns here.
+    pub gates: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<CredGate>>>,
 }
+
+/// Where a cluster's background requests — the ones nobody clicked for —
+/// take their turn, one at a time.
+///
+/// kube re-runs the credential helper for every request that finds the token
+/// expired, each in turn, and remembers no failure. So while a helper waits
+/// at a login page, every poller that fires queues another run behind it: a
+/// browser tab apiece, long after the user walked away. Here they wait
+/// outside kube instead, and once one of them finds the credential broken
+/// the rest are answered with that failure without being sent. A reconnect
+/// (the user signed in) starts a fresh gate. What the user does by hand
+/// doesn't come through here: they are at the keyboard, and a login page is
+/// the right answer to a click.
+#[derive(Default)]
+pub struct CredGate {
+    turn: tokio::sync::Mutex<()>,
+    broken: std::sync::Mutex<Option<String>>,
+}
+
+impl CredGate {
+    async fn enter(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        let turn = self.turn.lock().await;
+        if let Some(e) = self.broken.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Err(e);
+        }
+        Ok(turn)
+    }
+    fn saw<T>(&self, r: &Result<T, String>) {
+        if let Err(e) = r {
+            if is_credential_failure(e) {
+                *self.broken.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.clone());
+            }
+        }
+    }
+}
+
+fn cred_gate(state: &AppState, ctx: &str) -> std::sync::Arc<CredGate> {
+    state
+        .gates
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(ctx.to_string())
+        .or_default()
+        .clone()
+}
+
+/// A background request, through its cluster's gate.
+async fn in_background<T>(
+    gate: std::sync::Arc<CredGate>,
+    work: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let _turn = gate.enter().await?;
+    let r = work.await;
+    gate.saw(&r);
+    r
+}
+
+#[derive(Clone)]
+pub struct NodeAllocRead {
+    pub at: std::time::Instant,
+    pub nodes: std::collections::HashMap<String, (i64, i64, i64)>,
+}
+
+pub type IssueSweep =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<Vec<Issue>, String>>>;
 
 #[derive(Clone)]
 pub struct NameIndex {
@@ -123,6 +201,45 @@ pub struct SearchCache {
     /// builds the search index. Joined with live PodMetrics by
     /// pod_stats for the live CPU/MEM columns.
     pub pod_res: std::collections::HashMap<String, PodRes>,
+    /// Pod lists only, from the same pass: the node each pod runs on, whether
+    /// it has finished, and how its last container exit went.
+    pub pod_extra: std::collections::HashMap<String, PodExtra>,
+    /// Requests summed per node, from the last whole-cluster pod index of
+    /// each context. Unlike everything above this survives a list change:
+    /// it is what lets the node list show free room without fetching every
+    /// pod again, and only a pod list over all namespaces can refresh it.
+    pub node_req: std::collections::HashMap<String, NodeReqHarvest>,
+}
+
+#[derive(Clone, Default)]
+pub struct PodExtra {
+    pub node: String,
+    /// Succeeded or Failed: the pod holds no requests on its node any more.
+    pub done: bool,
+    pub exit: Option<PodExit>,
+}
+
+/// A pod's newest container termination — why it last restarted.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct PodExit {
+    pub key: String,
+    pub reason: String,
+    pub code: i64,
+    pub at: Option<String>,
+    pub container: String,
+}
+
+#[derive(Clone)]
+pub struct NodeReqHarvest {
+    pub at: std::time::Instant,
+    pub nodes: std::collections::HashMap<String, NodeReq>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub struct NodeReq {
+    pub cpu_r: i64,
+    pub mem_r: i64,
+    pub pods: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -860,6 +977,10 @@ pub async fn disconnect(state: &AppState, context: String) -> Result<(), String>
         }
     }
     state.clients.write().await.remove(&context);
+    // A sweep still out on the old client — stuck at a login page, say — is
+    // not one the reconnected cluster should wait on or share an answer with.
+    state.issue_sweeps.lock().await.remove(&context);
+    state.gates.lock().unwrap_or_else(|p| p.into_inner()).remove(&context);
     Ok(())
 }
 
@@ -1313,6 +1434,7 @@ async fn seed_search_from_rows(
     s.keys = rows.iter().map(row_key).collect();
     s.blobs = rows.iter().map(basic_blob).collect();
     s.pod_res.clear();
+    s.pod_extra.clear();
     s.indexed = false;
     s.source = Some((
         context.to_string(),
@@ -1525,8 +1647,17 @@ fn status_col_index(table: &serde_json::Value) -> Option<usize> {
     })
 }
 
-async fn issues_for_context(state: &AppState, ctx: &str) -> Result<Vec<Issue>, String> {
-    let client = client(state, ctx).await?;
+/// Whether a request failed because the credential itself is broken — the
+/// helper could not produce a token, or the server rejected the one it had.
+/// Retrying either runs the helper again, which can open a browser.
+/// Forbidden is not here: the token worked, the account just may not list
+/// that, and a cluster-scoped list being off limits is ordinary.
+fn is_credential_failure(msg: &str) -> bool {
+    msg.contains("auth exec") || msg.contains("exec auth") || msg.contains("Unauthorized")
+}
+
+async fn issues_with(client: Client, ctx: String) -> Result<Vec<Issue>, String> {
+    let ctx = ctx.as_str();
     let mut out = vec![];
     let core = |kind: &str, plural: &str, namespaced: bool| ResourceType {
         group: String::new(),
@@ -1539,9 +1670,17 @@ async fn issues_for_context(state: &AppState, ctx: &str) -> Result<Vec<Issue>, S
     };
     // Pods across every namespace, filtered to problem statuses.
     let pod_rt = core("Pod", "pods", true);
-    if let Ok(table) =
-        fetch_table_page(&client, &pod_rt, None, "Metadata", None, None, None).await
-    {
+    let pods = fetch_table_page(&client, &pod_rt, None, "Metadata", None, None, None).await;
+    // A broken credential is the one failure the caller must hear about: it
+    // is what parks the cluster out of the sweep. Swallowing it, as this
+    // once did, re-ran the helper on every sweep forever — and asking for
+    // nodes as well would run it a second time.
+    if let Err(e) = &pods {
+        if is_credential_failure(e) {
+            return Err(e.clone());
+        }
+    }
+    if let Ok(table) = pods {
         if let Some(si) = status_col_index(&table) {
             for r in rows_from_page(&table, None) {
                 let s = r.cells.get(si).and_then(|c| c.as_str()).unwrap_or("");
@@ -1559,9 +1698,13 @@ async fn issues_for_context(state: &AppState, ctx: &str) -> Result<Vec<Issue>, S
     }
     // Nodes that aren't Ready.
     let node_rt = core("Node", "nodes", false);
-    if let Ok(table) =
-        fetch_table_page(&client, &node_rt, None, "Metadata", None, None, None).await
-    {
+    let nodes = fetch_table_page(&client, &node_rt, None, "Metadata", None, None, None).await;
+    if let Err(e) = &nodes {
+        if is_credential_failure(e) {
+            return Err(e.clone());
+        }
+    }
+    if let Ok(table) = nodes {
         if let Some(si) = status_col_index(&table) {
             for r in rows_from_page(&table, None) {
                 let s = r.cells.get(si).and_then(|c| c.as_str()).unwrap_or("");
@@ -1592,7 +1735,7 @@ pub async fn aggregate_issues(
     futures::stream::iter(contexts.into_iter().map(|ctx| {
         let channel = channel.clone();
         async move {
-            let batch = match issues_for_context(state, &ctx).await {
+            let batch = match issues_once(state, &ctx).await {
                 Ok(issues) => IssueBatch {
                     context: ctx,
                     issues,
@@ -1611,6 +1754,33 @@ pub async fn aggregate_issues(
     .collect::<Vec<()>>()
     .await;
     Ok(())
+}
+
+/// One Issues sweep per context at a time — see `AppState::issue_sweeps`.
+/// Every caller gets the same answer, so a sweep that overlaps the one before
+/// it costs nothing extra, and when a stuck helper finally fails the newest
+/// sweep hears it too and can park the cluster.
+async fn issues_once(state: &AppState, ctx: &str) -> Result<Vec<Issue>, String> {
+    use futures::FutureExt;
+    let client = client(state, ctx).await?;
+    let gate = cred_gate(state, ctx);
+    let sweep = {
+        let mut sweeps = state.issue_sweeps.lock().await;
+        sweeps
+            .entry(ctx.to_string())
+            .or_insert_with(|| {
+                in_background(gate, issues_with(client, ctx.to_string())).boxed().shared()
+            })
+            .clone()
+    };
+    let out = sweep.clone().await;
+    // Finished: the next sweep asks afresh. Only if the entry is still this
+    // one — a disconnect drops it, and a reconnect may have started another.
+    let mut sweeps = state.issue_sweeps.lock().await;
+    if sweeps.get(ctx).is_some_and(|s| s.ptr_eq(&sweep)) {
+        sweeps.remove(ctx);
+    }
+    out
 }
 
 /// Fold a list the user already loaded into the name index — the rows are
@@ -1766,8 +1936,17 @@ pub async fn list_resources(
     namespace: Option<String>,
     field_selector: Option<String>,
     channel: Channel<serde_json::Value>,
+    background: bool,
 ) -> Result<ResourceTable, String> {
     let client = client(state, &context).await?;
+    // A re-list nobody asked for (the server closed the watch) waits its turn
+    // and stands down if the credential is already known broken. Only the
+    // first page: once that answered, the token is good.
+    let gate = background.then(|| cred_gate(state, &context));
+    let turn = match &gate {
+        Some(g) => Some(g.enter().await?),
+        None => None,
+    };
     // Measured on a 3.6k-pod cluster: cells-only is 167KB/0.16s while
     // Metadata is 6.8MB/1.1s. We only need the object when the view
     // shows data the printer doesn't carry: the namespace column for
@@ -1799,8 +1978,14 @@ pub async fn list_resources(
                 .await
                 .map_err(|e2| format!("{e2} (after field selector was rejected: {e})"))?
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            if let Some(g) = &gate {
+                g.saw::<()>(&Err(e.clone()));
+            }
+            return Err(e);
+        }
     };
+    drop(turn);
 
     let truncated = table
         .pointer("/metadata/continue")
@@ -1894,6 +2079,7 @@ pub async fn list_resources(
         s.keys = rows.iter().map(row_key).collect();
         s.blobs = blobs;
         s.pod_res.clear();
+        s.pod_extra.clear();
         s.indexed = !is_table; // the plain-list fallback is already full
         s.source = Some((
             context.clone(),
@@ -2232,6 +2418,8 @@ async fn build_index(
     let is_pod = rt.group.is_empty() && rt.kind == "Pod";
     let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut pod_res: std::collections::HashMap<String, PodRes> = std::collections::HashMap::new();
+    let mut pod_extra: std::collections::HashMap<String, PodExtra> =
+        std::collections::HashMap::new();
     // Page the object projection until the server's `continue` is
     // exhausted, so the index and pod requests/limits cover the WHOLE
     // list. (Previously this stopped at a snapshot of keys.len() taken
@@ -2262,7 +2450,8 @@ async fn build_index(
         for part in rows_json.chunks(chunk) {
             let part: Vec<serde_json::Value> = part.to_vec();
             tasks.push(tokio::task::spawn_blocking(move || {
-                let mut out: Vec<(String, String, Option<PodRes>)> = Vec::with_capacity(part.len());
+                let mut out: Vec<(String, String, Option<(PodRes, PodExtra)>)> =
+                    Vec::with_capacity(part.len());
                 for r in &part {
                     let obj = &r["object"];
                     let key = format!(
@@ -2274,7 +2463,7 @@ async fn build_index(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                     );
-                    let res = if is_pod { Some(pod_resources(obj)) } else { None };
+                    let res = is_pod.then(|| (pod_resources(obj), pod_extra_of(obj, &key)));
                     let mut blob = String::new();
                     flatten_for_search(obj, &mut blob);
                     out.push((key, blob, res));
@@ -2285,8 +2474,9 @@ async fn build_index(
         for t in tasks {
             let Ok(part) = t.await else { continue };
             for (key, blob, res) in part {
-                if let Some(r) = res {
+                if let Some((r, x)) = res {
                     pod_res.insert(key.clone(), r);
+                    pod_extra.insert(key.clone(), x);
                 }
                 by_key.insert(key, blob);
             }
@@ -2315,7 +2505,17 @@ async fn build_index(
     }
     s.keys = keys;
     if is_pod {
+        // Only a pass over every pod can say what each node has committed.
+        let whole = namespace.filter(|n| !n.is_empty()).is_none()
+            && field_selector.filter(|f| !f.is_empty()).is_none();
+        if whole {
+            if let Some((ctx, ..)) = s.source.clone() {
+                let nodes = node_requests(&pod_res, &pod_extra);
+                s.node_req.insert(ctx, NodeReqHarvest { at: std::time::Instant::now(), nodes });
+            }
+        }
         s.pod_res = pod_res;
+        s.pod_extra = pod_extra;
     }
     s.indexed = true;
     Ok(())
@@ -3178,6 +3378,70 @@ fn parse_mem(s: &str) -> i64 {
     s.parse::<f64>().unwrap_or(0.0) as i64
 }
 
+fn pod_extra_of(obj: &serde_json::Value, key: &str) -> PodExtra {
+    let phase = obj.pointer("/status/phase").and_then(|v| v.as_str()).unwrap_or("");
+    PodExtra {
+        node: obj
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        done: phase == "Succeeded" || phase == "Failed",
+        exit: last_exit(obj, key),
+    }
+}
+
+/// The newest container termination a pod records. `lastState.terminated`
+/// stays until the next restart, so it still says why long after the event
+/// that reported it has expired. Restartable init containers (sidecars)
+/// count: they restart like any other.
+fn last_exit(obj: &serde_json::Value, key: &str) -> Option<PodExit> {
+    let mut best: Option<PodExit> = None;
+    for list in ["/status/containerStatuses", "/status/initContainerStatuses"] {
+        for c in obj.pointer(list).and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(t) = c.pointer("/lastState/terminated") else {
+                continue;
+            };
+            let at = t.get("finishedAt").and_then(|v| v.as_str()).map(String::from);
+            // RFC 3339 in UTC sorts as text; an undated exit never beats a dated one.
+            let newer = match (&best, &at) {
+                (None, _) => true,
+                (Some(b), Some(a)) => b.at.as_deref().is_none_or(|bt| a.as_str() > bt),
+                (Some(_), None) => false,
+            };
+            if newer {
+                best = Some(PodExit {
+                    key: key.to_string(),
+                    reason: t.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    code: t.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(0),
+                    at,
+                    container: c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+        }
+    }
+    best
+}
+
+/// What each node has committed to the pods still running on it.
+fn node_requests(
+    res: &std::collections::HashMap<String, PodRes>,
+    extra: &std::collections::HashMap<String, PodExtra>,
+) -> std::collections::HashMap<String, NodeReq> {
+    let mut out: std::collections::HashMap<String, NodeReq> = std::collections::HashMap::new();
+    for (key, x) in extra {
+        if x.done || x.node.is_empty() {
+            continue; // finished, or not scheduled anywhere yet
+        }
+        let r = res.get(key).copied().unwrap_or_default();
+        let n = out.entry(x.node.clone()).or_default();
+        n.cpu_r += r.cpu_r;
+        n.mem_r += r.mem_r;
+        n.pods += 1;
+    }
+    out
+}
+
 fn pod_resources(obj: &serde_json::Value) -> PodRes {
     let mut r = PodRes::default();
     for c in obj
@@ -3323,7 +3587,9 @@ pub async fn pod_events(
         .header(http::header::ACCEPT, "application/json")
         .body(Vec::new())
         .map_err(err)?;
-    let list: serde_json::Value = client.request(req).await.map_err(err)?;
+    let list: serde_json::Value =
+        in_background(cred_gate(state, &context), async { client.request(req).await.map_err(err) })
+            .await?;
     Ok(newest_per_pod(list["items"].as_array().map(|v| &v[..]).unwrap_or(&[])))
 }
 
@@ -3476,17 +3742,18 @@ pub async fn node_stats(state: &AppState, context: String) -> Result<Vec<NodeSta
     let nodes: Api<DynamicObject> = Api::all_with(client.clone(), &node_ar);
     let mut alloc: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
     if let Ok(list) = nodes.list(&ListParams::default()).await {
+        let mut read = std::collections::HashMap::new();
         for n in &list.items {
             let name = n.metadata.name.clone().unwrap_or_default();
             let v = serde_json::to_value(n).unwrap_or_default();
-            let ca = parse_cpu(
-                v.pointer("/status/allocatable/cpu").and_then(|x| x.as_str()).unwrap_or(""),
-            );
-            let ma = parse_mem(
-                v.pointer("/status/allocatable/memory").and_then(|x| x.as_str()).unwrap_or(""),
-            );
-            alloc.insert(name, (ca, ma));
+            let (ca, ma, pa) = allocatable_of(&v);
+            alloc.insert(name.clone(), (ca, ma));
+            read.insert(name, (ca, ma, pa));
         }
+        state.node_alloc.write().await.insert(
+            context.clone(),
+            NodeAllocRead { at: std::time::Instant::now(), nodes: read },
+        );
     }
     let nm_ar = KubeApiResource {
         group: "metrics.k8s.io".into(),
@@ -3574,6 +3841,273 @@ pub async fn pod_stats(
             }
         })
         .collect())
+}
+
+fn allocatable_of(node: &serde_json::Value) -> (i64, i64, i64) {
+    let q = |k: &str| {
+        node.pointer(&format!("/status/allocatable/{k}"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+    };
+    (parse_cpu(q("cpu")), parse_mem(q("memory")), q("pods").parse().unwrap_or(0))
+}
+
+/// The pod list's restart reasons, straight from the background index — no
+/// request of its own. None until that index has finished for this list.
+pub async fn pod_exits(
+    state: &AppState,
+    context: String,
+    namespace: Option<String>,
+) -> Result<Option<Vec<PodExit>>, String> {
+    let s = state.search.read().await;
+    let Some((ctx, rt, ns, _)) = &s.source else {
+        return Ok(None);
+    };
+    let norm = |n: &Option<String>| n.clone().filter(|x| !x.is_empty());
+    let same = ctx == &context && rt.group.is_empty() && rt.kind == "Pod" && norm(ns) == norm(&namespace);
+    if !same || !s.indexed {
+        return Ok(None);
+    }
+    Ok(Some(s.pod_extra.values().filter_map(|x| x.exit.clone()).collect()))
+}
+
+/// Re-read just the pods whose restart count went up since the index saw
+/// them — one GET each, a handful at a time. Stops at the first broken
+/// credential: every further GET would run the helper again.
+pub async fn pod_exits_refresh(
+    state: &AppState,
+    context: String,
+    keys: Vec<String>,
+) -> Result<Vec<PodExit>, String> {
+    let client = client(state, &context).await?;
+    in_background(cred_gate(state, &context), refresh_exits(state, client, context, keys)).await
+}
+
+async fn refresh_exits(
+    state: &AppState,
+    client: Client,
+    context: String,
+    keys: Vec<String>,
+) -> Result<Vec<PodExit>, String> {
+    let mut out = Vec::new();
+    for key in keys.into_iter().take(20) {
+        let Some((ns, name)) = key.split_once('/') else {
+            continue;
+        };
+        let api: Api<K8sPod> = Api::namespaced(client.clone(), ns);
+        match api.get_opt(name).await {
+            Ok(Some(p)) => {
+                let v = serde_json::to_value(&p).map_err(err)?;
+                let exit = last_exit(&v, &key);
+                // Keep the index in step, so the next read of it agrees.
+                let mut s = state.search.write().await;
+                if s.source.as_ref().is_some_and(|src| src.0 == context) {
+                    if let Some(x) = s.pod_extra.get_mut(&key) {
+                        x.exit = exit.clone();
+                    }
+                }
+                drop(s);
+                out.extend(exit);
+            }
+            Ok(None) => {} // gone since; the list will drop it
+            Err(e) => {
+                let msg = err(e);
+                if is_credential_failure(&msg) {
+                    return Err(msg);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What kind of machine a node is, from the labels the cloud and the
+/// autoscaler put on it. Empty fields where a cluster sets none.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct NodeType {
+    pub name: String,
+    pub instance: String,
+    /// "spot", "on-demand", … — one spelling whichever label carried it.
+    pub capacity: String,
+    pub zone: String,
+    pub pool: String,
+}
+
+fn node_type(name: &str, labels: &std::collections::BTreeMap<String, String>) -> NodeType {
+    let first = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| labels.get(*k).filter(|v| !v.is_empty()))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let is = |k: &str, v: &str| labels.get(k).is_some_and(|x| x.eq_ignore_ascii_case(v));
+    let capacity = if let Some(c) = labels.get("karpenter.sh/capacity-type") {
+        c.clone()
+    } else if let Some(c) = labels.get("eks.amazonaws.com/capacityType") {
+        c.to_ascii_lowercase().replace('_', "-") // SPOT, ON_DEMAND
+    } else if is("cloud.google.com/gke-spot", "true") || is("kubernetes.azure.com/scalesetpriority", "spot") {
+        "spot".into()
+    } else if is("cloud.google.com/gke-preemptible", "true") {
+        "preemptible".into()
+    } else {
+        String::new()
+    };
+    NodeType {
+        name: name.to_string(),
+        instance: first(&["node.kubernetes.io/instance-type", "beta.kubernetes.io/instance-type"]),
+        capacity,
+        zone: first(&["topology.kubernetes.io/zone", "failure-domain.beta.kubernetes.io/zone"]),
+        pool: first(&[
+            "karpenter.sh/nodepool",
+            "karpenter.sh/provisioner-name",
+            "eks.amazonaws.com/nodegroup",
+            "cloud.google.com/gke-nodepool",
+            "kubernetes.azure.com/agentpool",
+            "agentpool",
+        ]),
+    }
+}
+
+/// Every node's type, for the pod list. Metadata only — labels are all this
+/// needs, and they are a small fraction of a node object.
+pub async fn node_types(state: &AppState, context: String) -> Result<Vec<NodeType>, String> {
+    let client = client(state, &context).await?;
+    let api: Api<k8s_openapi::api::core::v1::Node> = Api::all(client);
+    let list = in_background(cred_gate(state, &context), async {
+        api.list_metadata(&ListParams::default()).await.map_err(err)
+    })
+    .await?;
+    Ok(list
+        .items
+        .iter()
+        .map(|n| {
+            let labels = n.metadata.labels.clone().unwrap_or_default();
+            node_type(&n.metadata.name.clone().unwrap_or_default(), &labels)
+        })
+        .collect())
+}
+
+#[derive(Serialize)]
+pub struct NodeRoom {
+    pub name: String,
+    pub cpu_alloc: i64,
+    pub mem_alloc: i64,
+    pub pods_alloc: i64,
+    pub cpu_r: i64,
+    pub mem_r: i64,
+    pub pods: u32,
+}
+
+#[derive(Serialize)]
+pub struct NodeRooms {
+    /// How old the pod pass behind the sums is.
+    pub age_secs: u64,
+    pub nodes: Vec<NodeRoom>,
+}
+
+/// Requested vs allocatable per node, for the node list. The requests come
+/// from the last whole-cluster pod index rather than a fetch of their own —
+/// summing them fresh would mean pulling every pod object, which on a large
+/// cluster is the one request this app exists to avoid. None when there is
+/// no such index yet, and then not a single request is made.
+pub async fn node_rooms(state: &AppState, context: String) -> Result<Option<NodeRooms>, String> {
+    let Some(h) = state.search.read().await.node_req.get(&context).cloned() else {
+        return Ok(None);
+    };
+    let fresh = state
+        .node_alloc
+        .read()
+        .await
+        .get(&context)
+        .filter(|r| r.at.elapsed().as_secs() < 300)
+        .cloned();
+    let alloc = match fresh {
+        Some(r) => r.nodes,
+        None => {
+            let client = client(state, &context).await?;
+            let api: Api<k8s_openapi::api::core::v1::Node> = Api::all(client);
+            let list = in_background(cred_gate(state, &context), async {
+                api.list(&ListParams::default()).await.map_err(err)
+            })
+            .await?;
+            let mut read = std::collections::HashMap::new();
+            for n in &list.items {
+                let v = serde_json::to_value(n).unwrap_or_default();
+                read.insert(n.metadata.name.clone().unwrap_or_default(), allocatable_of(&v));
+            }
+            state.node_alloc.write().await.insert(
+                context.clone(),
+                NodeAllocRead { at: std::time::Instant::now(), nodes: read.clone() },
+            );
+            read
+        }
+    };
+    let nodes = alloc
+        .iter()
+        .map(|(name, &(cpu_alloc, mem_alloc, pods_alloc))| {
+            let r = h.nodes.get(name).copied().unwrap_or_default();
+            NodeRoom {
+                name: name.clone(),
+                cpu_alloc,
+                mem_alloc,
+                pods_alloc,
+                cpu_r: r.cpu_r,
+                mem_r: r.mem_r,
+                pods: r.pods,
+            }
+        })
+        .collect();
+    Ok(Some(NodeRooms { age_secs: h.at.elapsed().as_secs(), nodes }))
+}
+
+#[derive(Serialize)]
+pub struct NodeAllocated {
+    pub cpu_alloc: i64,
+    pub mem_alloc: i64,
+    pub pods_alloc: i64,
+    pub cpu_r: i64,
+    pub cpu_l: i64,
+    pub mem_r: i64,
+    pub mem_l: i64,
+    pub pods: u32,
+}
+
+/// `kubectl describe node`'s "Allocated resources", for one node: its pods
+/// only, so it is exact and current at the cost of one small list.
+pub async fn node_allocated(
+    state: &AppState,
+    context: String,
+    node: String,
+) -> Result<NodeAllocated, String> {
+    let client = client(state, &context).await?;
+    let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
+    let n = nodes.get(&node).await.map_err(err)?;
+    let (cpu_alloc, mem_alloc, pods_alloc) =
+        allocatable_of(&serde_json::to_value(&n).unwrap_or_default());
+    let pods: Api<K8sPod> = Api::all(client);
+    let lp = ListParams::default().fields(&format!(
+        "spec.nodeName={node},status.phase!=Succeeded,status.phase!=Failed"
+    ));
+    let list = pods.list(&lp).await.map_err(err)?;
+    let mut out = NodeAllocated {
+        cpu_alloc,
+        mem_alloc,
+        pods_alloc,
+        cpu_r: 0,
+        cpu_l: 0,
+        mem_r: 0,
+        mem_l: 0,
+        pods: 0,
+    };
+    for p in &list.items {
+        let r = pod_resources(&serde_json::to_value(p).unwrap_or_default());
+        out.cpu_r += r.cpu_r;
+        out.cpu_l += r.cpu_l;
+        out.mem_r += r.mem_r;
+        out.mem_l += r.mem_l;
+        out.pods += 1;
+    }
+    Ok(out)
 }
 
 pub async fn delete_resource(
@@ -5202,5 +5736,390 @@ mod proxy_tests {
                 .is_err(),
             "a client with no proxy_url still went to {addr}"
         );
+    }
+}
+
+#[cfg(test)]
+mod extras_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn exited(name: &str, reason: &str, code: i64, at: &str) -> serde_json::Value {
+        json!({"name": name, "lastState": {"terminated": {"reason": reason, "exitCode": code, "finishedAt": at}}})
+    }
+
+    #[test]
+    fn the_newest_exit_wins_across_containers() {
+        let pod = json!({"status": {"containerStatuses": [
+            exited("app", "Error", 1, "2026-11-09T01:00:00Z"),
+            exited("proxy", "OOMKilled", 137, "2026-11-09T02:00:00Z"),
+            {"name": "quiet", "lastState": {}},
+        ]}});
+        let e = last_exit(&pod, "ns/p").unwrap();
+        assert_eq!((e.reason.as_str(), e.code, e.container.as_str()), ("OOMKilled", 137, "proxy"));
+        assert_eq!(e.key, "ns/p");
+    }
+
+    #[test]
+    fn a_sidecar_restart_counts() {
+        let pod = json!({"status": {
+            "containerStatuses": [exited("app", "Error", 2, "2026-11-09T01:00:00Z")],
+            "initContainerStatuses": [exited("istio-proxy", "OOMKilled", 137, "2026-11-09T03:00:00Z")],
+        }});
+        assert_eq!(last_exit(&pod, "k").unwrap().container, "istio-proxy");
+    }
+
+    #[test]
+    fn a_pod_that_never_restarted_has_none() {
+        let pod = json!({"status": {"containerStatuses": [{"name": "app", "lastState": {}}]}});
+        assert_eq!(last_exit(&pod, "k"), None);
+        assert_eq!(last_exit(&json!({}), "k"), None);
+    }
+
+    #[test]
+    fn an_undated_exit_never_beats_a_dated_one() {
+        let pod = json!({"status": {"containerStatuses": [
+            exited("a", "Error", 1, "2026-11-09T01:00:00Z"),
+            {"name": "b", "lastState": {"terminated": {"reason": "Unknown", "exitCode": 255}}},
+        ]}});
+        assert_eq!(last_exit(&pod, "k").unwrap().container, "a");
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn karpenter_nodes_read_as_they_are_labelled() {
+        let t = node_type("n", &labels(&[
+            ("node.kubernetes.io/instance-type", "m6i.xlarge"),
+            ("karpenter.sh/capacity-type", "spot"),
+            ("karpenter.sh/nodepool", "default"),
+            ("topology.kubernetes.io/zone", "ap-northeast-2a"),
+        ]));
+        assert_eq!(
+            (t.instance.as_str(), t.capacity.as_str(), t.pool.as_str(), t.zone.as_str()),
+            ("m6i.xlarge", "spot", "default", "ap-northeast-2a")
+        );
+    }
+
+    #[test]
+    fn managed_node_groups_speak_the_same_capacity() {
+        let t = node_type("n", &labels(&[
+            ("eks.amazonaws.com/capacityType", "ON_DEMAND"),
+            ("eks.amazonaws.com/nodegroup", "ng-1"),
+        ]));
+        assert_eq!((t.capacity.as_str(), t.pool.as_str()), ("on-demand", "ng-1"));
+        let gke = node_type("n", &labels(&[("cloud.google.com/gke-spot", "true")]));
+        assert_eq!(gke.capacity, "spot");
+        let aks = node_type("n", &labels(&[("kubernetes.azure.com/scalesetpriority", "spot")]));
+        assert_eq!(aks.capacity, "spot");
+    }
+
+    #[test]
+    fn a_bare_node_has_no_type() {
+        let t = node_type("kind-control-plane", &labels(&[("kubernetes.io/hostname", "kind")]));
+        assert_eq!(t, NodeType { name: "kind-control-plane".into(), ..Default::default() });
+    }
+
+    #[test]
+    fn finished_and_unscheduled_pods_hold_nothing() {
+        let mut res = std::collections::HashMap::new();
+        let mut extra = std::collections::HashMap::new();
+        let mut add = |k: &str, node: &str, done: bool, cpu: i64, mem: i64| {
+            res.insert(k.to_string(), PodRes { cpu_r: cpu, mem_r: mem, ..Default::default() });
+            extra.insert(k.to_string(), PodExtra { node: node.into(), done, exit: None });
+        };
+        add("a/1", "n1", false, 500, 1 << 30);
+        add("a/2", "n1", false, 250, 1 << 29);
+        add("a/3", "n1", true, 4000, 1 << 33); // Completed job: frees its requests
+        add("a/4", "", false, 1000, 1 << 30); // Pending, no node yet
+        add("a/5", "n2", false, 100, 0);
+        let n = node_requests(&res, &extra);
+        assert_eq!(n["n1"], NodeReq { cpu_r: 750, mem_r: (1 << 30) + (1 << 29), pods: 2 });
+        assert_eq!(n["n2"], NodeReq { cpu_r: 100, mem_r: 0, pods: 1 });
+        assert_eq!(n.len(), 2);
+    }
+}
+
+/// What an expired SSO session does to the cluster's credential command.
+///
+/// A kubeconfig exec helper like `aws-vault exec … -- aws eks get-token` opens
+/// a BROWSER each time it runs without a live session, so every run counted
+/// here is a browser tab the user did not ask for. These stand a real kube
+/// client on a stand-in helper that counts its runs.
+#[cfg(all(test, unix))]
+mod cred_storm_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// A client whose helper hands out one token already inside kube's 60s
+    /// refresh window, then fails every later run after `hang` seconds — the
+    /// way it does once it has sent the user to a login page they never
+    /// finish. Returns the client and a count of the helper runs since it
+    /// was built.
+    async fn expiring_client(hang: &str) -> (kube::Client, impl Fn() -> u32) {
+        let dir = std::env::temp_dir().join(format!(
+            "peye-cred-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("helper.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+n=$(cat "$DIR/count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$DIR/count"
+if [ "$n" = 1 ]; then
+  printf '{"apiVersion":"client.authentication.k8s.io/v1beta1","kind":"ExecCredential","status":{"token":"t","expirationTimestamp":"%s"}}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  exit 0
+fi
+sleep "$HANG"
+echo "Error when retrieving token from sso: Token has expired and refresh failed" >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let yaml = format!(
+            r#"apiVersion: v1
+kind: Config
+clusters:
+- name: c
+  cluster:
+    server: https://127.0.0.1:1
+    insecure-skip-tls-verify: true
+users:
+- name: u
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: {script}
+      env:
+      - name: DIR
+        value: {dir}
+      - name: HANG
+        value: "{hang}"
+contexts:
+- name: x
+  context: {{cluster: c, user: u}}
+current-context: x
+"#,
+            script = script.display(),
+            dir = dir.display(),
+        );
+        let kc = kube::config::Kubeconfig::from_yaml(&yaml).unwrap();
+        let cfg = kube::Config::from_custom_kubeconfig(kc, &Default::default())
+            .await
+            .unwrap();
+        let client = kube::Client::try_from(cfg).unwrap();
+        let read = move || {
+            std::fs::read_to_string(dir.join("count"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        // Building the client runs the helper itself; count from here.
+        let built = read();
+        (client, move || read() - built)
+    }
+
+    async fn state_with(client: kube::Client) -> AppState {
+        let state = AppState::default();
+        state.clients.write().await.insert("x".into(), client);
+        state
+    }
+
+    /// The premise, measured: requests that queue while the helper is out at
+    /// a login page each run it again once it fails. kube does nothing to
+    /// stop a pile-up; the caller has to not build one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kube_reruns_a_failing_helper_once_per_queued_request() {
+        let (client, runs) = expiring_client("0.3").await;
+        let reqs = (0..5).map(|_| {
+            let c = client.clone();
+            async move {
+                let req = http::Request::get("/api").body(Vec::new()).unwrap();
+                c.request::<serde_json::Value>(req).await
+            }
+        });
+        let res = futures::future::join_all(reqs).await;
+        assert!(res.iter().all(|r| r.is_err()));
+        assert_eq!(runs(), 5, "one helper run per queued request");
+    }
+
+    /// The sweep used to swallow this and answer "no issues", so nothing ever
+    /// parked the cluster and every sweep — one a minute — ran the helper
+    /// twice (pods, then nodes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sweep_reports_a_broken_credential_and_stops_there() {
+        let (client, runs) = expiring_client("0").await;
+        let state = state_with(client).await;
+        let r = issues_once(&state, "x").await;
+        let e = r.map(|v| v.len()).expect_err("a broken credential must reach the caller, which parks on it");
+        assert!(e.contains("auth exec"), "{e}");
+        assert_eq!(runs(), 1, "nodes must not be asked once the pods request failed on the credential");
+    }
+
+    /// Sweeps that overlap a stuck helper join the one already out instead of
+    /// queueing their own behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_sweeps_share_one_helper_run() {
+        let (client, runs) = expiring_client("0.5").await;
+        let state = state_with(client).await;
+        let sweeps = (0..4).map(|_| issues_once(&state, "x"));
+        let res = futures::future::join_all(sweeps).await;
+        assert!(res.iter().all(|r| r.is_err()), "every sweep hears the failure");
+        assert_eq!(runs(), 1, "four overlapping sweeps, one helper run");
+        assert!(state.issue_sweeps.lock().await.is_empty(), "a finished sweep is not kept");
+    }
+
+    /// A plain client (no helper) on whatever `server` answers.
+    fn plain_client(server: &str) -> kube::Client {
+        kube::Client::try_from(kube::Config::new(server.parse().unwrap())).unwrap()
+    }
+
+    /// Answers every request with `status` and a Kubernetes Status body.
+    async fn answering(status: u16, reason: &'static str) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let body = format!(
+                        r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{reason}","reason":"{reason}","code":{status}}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// What must NOT change: a cluster the account may not list cluster-wide,
+    /// or one that is unreachable, still sweeps to an empty answer. Reporting
+    /// those would park a cluster whose credentials are fine.
+    #[tokio::test]
+    async fn forbidden_and_unreachable_still_sweep_quietly() {
+        let state = state_with(plain_client(&answering(403, "Forbidden").await)).await;
+        assert_eq!(issues_once(&state, "x").await.map(|v| v.len()), Ok(0), "403");
+        let state = state_with(plain_client("http://127.0.0.1:1")).await;
+        assert_eq!(issues_once(&state, "x").await.map(|v| v.len()), Ok(0), "refused");
+    }
+
+    /// A rejected token is a broken credential too.
+    #[tokio::test]
+    async fn unauthorized_is_reported() {
+        let state = state_with(plain_client(&answering(401, "Unauthorized").await)).await;
+        let e = issues_once(&state, "x").await.map(|v| v.len()).expect_err("401 must reach the caller");
+        assert!(e.contains("Unauthorized"), "{e}");
+    }
+
+    fn pods() -> ResourceType {
+        ResourceType {
+            group: String::new(),
+            version: "v1".into(),
+            kind: "Pod".into(),
+            plural: "pods".into(),
+            namespaced: true,
+            deletable: true,
+            editable: true,
+        }
+    }
+
+    fn quiet_channel() -> Channel<serde_json::Value> {
+        Channel::new(|_| Ok(()))
+    }
+
+    /// Everything the app asks on its own, all at once, while the helper is
+    /// out at a login page: one helper run between them, not one each — and
+    /// nothing at all once the failure is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn background_requests_share_one_helper_run() {
+        let (client, runs) = expiring_client("0.5").await;
+        let state = state_with(client).await;
+        let (a, b, c, d, e, f) = tokio::join!(
+            pod_events(&state, "x".into(), None),
+            pod_events(&state, "x".into(), Some("app".into())),
+            issues_once(&state, "x"),
+            node_types(&state, "x".into()),
+            pod_exits_refresh(&state, "x".into(), vec!["app/p".into()]),
+            list_resources(&state, "x".into(), pods(), None, None, quiet_channel(), true),
+        );
+        assert!(a.is_err() && b.is_err() && c.is_err() && d.is_err() && e.is_err() && f.is_err());
+        assert_eq!(runs(), 1, "six background requests, one helper run");
+
+        // Known broken now: a later tick is answered without being sent.
+        let later = pod_events(&state, "x".into(), None).await;
+        assert!(later.err().unwrap().contains("auth exec"));
+        let relist = list_resources(&state, "x".into(), pods(), None, None, quiet_channel(), true).await;
+        assert!(relist.is_err());
+        assert_eq!(runs(), 1, "nothing sent once the failure is known");
+
+        // A click still goes through: the user is there to answer the login.
+        let by_hand = list_resources(&state, "x".into(), pods(), None, None, quiet_channel(), false).await;
+        assert!(by_hand.is_err());
+        assert_eq!(runs(), 2, "what the user does is not held back");
+    }
+
+    /// Signing in again (a reconnect) opens the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reconnect_opens_the_gate_again() {
+        let (client, _) = expiring_client("0").await;
+        let state = state_with(client).await;
+        assert!(pod_events(&state, "x".into(), None).await.is_err());
+        disconnect(&state, "x".into()).await.unwrap();
+        let (fresh, runs) = expiring_client("0").await;
+        state.clients.write().await.insert("x".into(), fresh);
+        assert!(pod_events(&state, "x".into(), None).await.is_err());
+        assert_eq!(runs(), 1, "the new client was asked, not answered from the old failure");
+    }
+
+    /// What must not change: a healthy cluster's background requests all go
+    /// out — the gate takes turns, it never turns one away.
+    #[tokio::test]
+    async fn a_healthy_cluster_is_never_turned_away() {
+        let state = state_with(plain_client(&answering(403, "Forbidden").await)).await;
+        for _ in 0..3 {
+            assert_eq!(issues_once(&state, "x").await.map(|v| v.len()), Ok(0));
+        }
+        // a Forbidden is not a broken credential: nothing latched
+        let e = pod_events(&state, "x".into(), None).await.err().unwrap();
+        assert!(e.contains("Forbidden"), "{e}");
+        let e2 = pod_events(&state, "x".into(), None).await.err().unwrap();
+        assert!(e2.contains("Forbidden"), "it was sent again, not answered from a latch: {e2}");
+    }
+
+    /// After a reconnect the new client answers for itself: a sweep stuck on
+    /// the old one is dropped with it, not joined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reconnect_does_not_wait_on_the_old_sweep() {
+        let (client, _) = expiring_client("3").await;
+        let state = std::sync::Arc::new(state_with(client).await);
+        let s2 = state.clone();
+        let stuck = tokio::spawn(async move { issues_once(&s2, "x").await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        disconnect(&state, "x".into()).await.unwrap();
+        state
+            .clients
+            .write()
+            .await
+            .insert("x".into(), plain_client(&answering(403, "Forbidden").await));
+        let t = std::time::Instant::now();
+        let fresh = issues_once(&state, "x").await;
+        assert_eq!(fresh.map(|v| v.len()), Ok(0));
+        assert!(t.elapsed().as_secs_f32() < 1.5, "joined the stuck sweep: {:?}", t.elapsed());
+        stuck.abort();
     }
 }

@@ -33,10 +33,13 @@ dom.window.HTMLElement.prototype.scrollTo = function () {};
 const ctx = { name: "smoke", cluster: "c", user: "u", namespace: null, is_current: true, source: "", server: "https://s:6443" };
 const podType = { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, deletable: true, editable: true };
 const table = {
-  columns: ["Name", "Ready", "Status", "Restarts", "Age"].map((name) => ({ name, priority: 0 })),
+  columns: [
+    ...["Name", "Ready", "Status", "Restarts", "Age"].map((name) => ({ name, priority: 0 })),
+    { name: "Node", priority: 1 },
+  ],
   rows: [
-    { name: "pod-a", namespace: "ns", cells: ["pod-a", "2/2", "Running", "0", "5m"], labels: {} },
-    { name: "pod-b", namespace: "ns", cells: ["pod-b", "0/2", "Pending", "0", "6m"], labels: {} },
+    { name: "pod-a", namespace: "ns", cells: ["pod-a", "2/2", "Running", "2 (3m ago)", "5m", "n1"], labels: {} },
+    { name: "pod-b", namespace: "ns", cells: ["pod-b", "0/2", "Pending", "0", "6m", "<none>"], labels: {} },
   ],
   truncated: false, resource_version: "1", include: "Metadata",
 };
@@ -53,8 +56,12 @@ const warn = {
   last: new Date(Date.now() - 45_000).toISOString(), // recent, so it reads as live
 };
 
+const exit = { key: "ns/pod-a", reason: "OOMKilled", code: 137, at: new Date(Date.now() - 3 * 60_000).toISOString(), container: "app" };
+const ntype = { name: "n1", instance: "m6i.xlarge", capacity: "spot", zone: "ap-northeast-2a", pool: "default" };
+
 let fetched = [];
 let eventSweeps = 0;
+let exitReads = 0, typeFetches = 0;
 dom.window.localStorage.setItem("pigeoneye.session", JSON.stringify({ tabs: ["smoke"], active: "smoke" }));
 dom.window.__TAURI_INTERNALS__ = {
   invoke: (cmd, args) => {
@@ -67,6 +74,8 @@ dom.window.__TAURI_INTERNALS__ = {
       case "watch_start": return Promise.resolve(1);
       case "get_resource": fetched.push(args?.name); return Promise.resolve(detail(args?.name));
       case "pod_events": eventSweeps++; return Promise.resolve([warn]);
+      case "pod_exits": exitReads++; return Promise.resolve([exit]);
+      case "node_types": typeFetches++; return Promise.resolve([ntype]);
       case "pod_stats": return Promise.reject(new Error("no metrics"));
       default: return Promise.resolve([]);
     }
@@ -123,6 +132,21 @@ for (const [i, p] of panes.entries()) {
   ok(`pane ${i}: a healthy pod stays empty`, cellsOf(p, "pod-a")?.[ev] === "", JSON.stringify(cellsOf(p, "pod-a")));
 }
 ok("each pane sweeps for itself", eventSweeps >= 2, `${eventSweeps} sweeps`);
+
+// --- Restart reason and Node type, in BOTH panes ---
+for (const [i, p] of panes.entries()) {
+  const hs = headers(p);
+  const ex = hs.indexOf("RESTARTREASON");
+  ok(`pane ${i}: Restart reason sits after RESTARTS`, ex > 0 && ex === hs.indexOf("RESTARTS") + 1, hs.join(","));
+  ok(`pane ${i}: the OOM kill shows`, cellsOf(p, "pod-a")?.[ex] === "OOMKilled", JSON.stringify(cellsOf(p, "pod-a")));
+  ok(`pane ${i}: a pod that never restarted is empty`, cellsOf(p, "pod-b")?.[ex] === "", JSON.stringify(cellsOf(p, "pod-b")));
+  const nt = hs.indexOf("NODETYPE");
+  ok(`pane ${i}: Node type is present`, nt > 0, hs.join(","));
+  ok(`pane ${i}: the pod's node reads with its type`, cellsOf(p, "pod-a")?.[nt] === "m6i.xlarge · spot", JSON.stringify(cellsOf(p, "pod-a")));
+  ok(`pane ${i}: an unscheduled pod has none`, cellsOf(p, "pod-b")?.[nt] === "", JSON.stringify(cellsOf(p, "pod-b")));
+}
+ok("each pane reads its own restart reasons", exitReads >= 2, `${exitReads} reads`);
+ok("each pane fetches its own node types", typeFetches >= 2, `${typeFetches} fetches`);
 
 // --- `l` from the sidebar, with focus on the SECOND pane ---
 key("ArrowRight", { metaKey: true }); // focus pane 2

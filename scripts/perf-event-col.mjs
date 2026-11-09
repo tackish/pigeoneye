@@ -72,6 +72,10 @@ dom.window.__TAURI_INTERNALS__ = {
           setTimeout(() => r(MODE === "few" ? events.slice(0, 50) : events), RTT),
         );
       case "pod_stats": return Promise.reject(new Error("no metrics"));
+      // As the backend answers while the pod index is still building — which
+      // on a list this size it is, at first paint. What the restart reasons
+      // cost when they do land is perf:arrivals' to measure.
+      case "pod_exits": return Promise.resolve(null);
       default: return Promise.resolve([]);
     }
   },

@@ -2972,6 +2972,18 @@ kbd.key {
   font-size: 12px;
   margin: 2px 0 10px;
 }
+/* The node's requests against what it can hold, under "pods on this node". */
+.np-alloc {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  font-size: 12px;
+  color: var(--dim);
+  margin: 2px 0 8px;
+}
+.np-alloc .warn {
+  color: var(--warn);
+}
 .np-note.bad {
   color: var(--bad);
   white-space: pre-wrap;

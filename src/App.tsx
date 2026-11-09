@@ -135,8 +135,12 @@ interface TabState {
 interface DisplayRow {
   row: TableRow;
   cells: string[];
-  /// lowercase text of everything visible, precomputed for filtering
+  /// lowercase text of everything visible, precomputed for filtering: the
+  /// row's own part (cached per row, shared rather than copied) and the
+  /// cells a column added on top. Searching looks in both; keeping them
+  /// apart is what lets a column arrive without re-stringing every row.
   hay: string;
+  hayX: string;
 }
 
 interface PodStat {
@@ -164,6 +168,54 @@ interface NodeStat {
   mem: number;
   cpu_pct: number;
   mem_pct: number;
+}
+
+/// A pod's newest container exit — the Restart reason column.
+interface PodExit {
+  key: string;
+  reason: string;
+  code: number;
+  at: string | null;
+  container: string;
+}
+
+/// What machine a node is — the pod list's Node type column.
+interface NodeType {
+  name: string;
+  instance: string;
+  capacity: string;
+  zone: string;
+  pool: string;
+}
+
+/// Requested vs allocatable for one node (cpu in millicores, memory in bytes).
+interface NodeRoom {
+  name: string;
+  cpu_alloc: number;
+  mem_alloc: number;
+  pods_alloc: number;
+  cpu_r: number;
+  mem_r: number;
+  pods: number;
+}
+
+/// The node list's free-room columns, as of the pod pass they were summed from.
+interface NodeRooms {
+  fetchedAt: number;
+  ageSecs: number;
+  map: Map<string, NodeRoom>;
+}
+
+/// `kubectl describe node`'s "Allocated resources", for the open node.
+interface NodeAllocated {
+  cpu_alloc: number;
+  mem_alloc: number;
+  pods_alloc: number;
+  cpu_r: number;
+  cpu_l: number;
+  mem_r: number;
+  mem_l: number;
+  pods: number;
 }
 
 interface Issue {
@@ -681,6 +733,105 @@ const POD_STAT_COLS = ["CPU", "%CPU/R", "%CPU/L", "MEM", "%MEM/R", "%MEM/L"];
 /// about an hour, so a Running pod can carry a warning that is long over.
 const POD_EVENT_COL = "Recent event";
 const NODE_STAT_COLS = ["CPU", "%CPU", "MEM", "%MEM"];
+/// Why the pod last restarted, next to the count that says it did.
+const POD_EXIT_COL = "Restart reason";
+/// The machine under the pod, next to the Node column that names it.
+const POD_NODETYPE_COL = "Node type";
+/// Room left on each node: allocatable minus what its pods request, in the
+/// units the CPU and MEM columns already use (millicores, Mi).
+const NODE_ROOM_COLS = ["CPU free", "MEM free"];
+
+/// The Restart reason cell, one word wide: the reason, plus the exit code
+/// where the reason alone doesn't say it — "Error 137" is a kill (often a
+/// failed liveness probe), "Error 1" the app giving up. Empty for a pod that
+/// never restarted, so the rows with text are the ones to look at.
+function exitText(e: PodExit | undefined): string {
+  if (!e) return "";
+  if (e.reason === "OOMKilled" || e.reason === "Completed") return e.reason;
+  return `${e.reason || "Exit"} ${e.code}`;
+}
+
+/// A restart counts as live while another could follow it: a crash-looping
+/// container waits at most five minutes between tries, plus however long it
+/// runs before it falls over again.
+const EXIT_HOT_MS = 10 * 60_000;
+function exitHot(e: PodExit | undefined, nowMs: number): boolean {
+  if (!e?.at) return true;
+  const ms = nowMs - new Date(e.at).getTime();
+  return !Number.isFinite(ms) || ms <= EXIT_HOT_MS;
+}
+
+function exitTitle(e: PodExit | undefined, nowMs: number): string | undefined {
+  if (!e) return undefined;
+  const ago = e.at
+    ? ` · ${fmtAgeSeconds(Math.max(0, Math.floor((nowMs - new Date(e.at).getTime()) / 1000)))} ago`
+    : "";
+  return `${e.container}: ${e.reason || "exited"} (exit ${e.code})${ago}`;
+}
+
+/// Red while another restart could still follow, muted once it is history —
+/// the same reading as the Recent event column. A clean exit (0) is no alarm.
+function exitClass(e: PodExit | undefined, cell: string, nowMs: number): string {
+  if (!cell || !e || e.code === 0) return "cell";
+  return exitHot(e, nowMs) ? "cell bad" : "cell stale";
+}
+
+/// What a display row owes to the row alone: its printed cells (namespace
+/// spliced in) and their lowercased text plus labels, for search. Every
+/// column whose data lands after the list — events, metrics, restart
+/// reasons, node types — rebuilds all display rows, and building this part
+/// is most of that work: on 20k rows it is what made each arrival a visible
+/// hitch. Kept per row object, so a rebuild only splices in its own cells;
+/// a watch replaces a changed row with a new object, which starts afresh.
+const rowBase = new WeakMap<TableRow, { cells: string[]; hay: string }>();
+function baseOf(r: TableRow, namespaced: boolean): { cells: string[]; hay: string } {
+  let b = rowBase.get(r);
+  if (!b) {
+    let cells = r.cells.map((c) => String(c ?? ""));
+    if (namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+    const labels = Object.entries(r.labels)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    b = { cells, hay: (cells.join(" ") + " " + labels).toLowerCase() };
+    rowBase.set(r, b);
+  }
+  return b;
+}
+
+/// A row's printed value under the named column of its table.
+function cellOf(t: ResourceTable | null | undefined, row: TableRow, name: string): string {
+  const i = t ? t.columns.findIndex((c) => c.name === name) : -1;
+  return i >= 0 ? String(row.cells[i] ?? "") : "";
+}
+
+function nodeTypeText(n: NodeType | undefined): string {
+  return n ? [n.instance, n.capacity].filter(Boolean).join(" · ") : "";
+}
+
+function nodeTypeTitle(n: NodeType | undefined): string | undefined {
+  if (!n) return undefined;
+  const parts = [n.zone, n.pool && `pool ${n.pool}`].filter(Boolean);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function roomCells(r: NodeRoom | undefined): string[] {
+  if (!r || !r.cpu_alloc) return ["-", "-"];
+  return [fmtCpu(r.cpu_alloc - r.cpu_r), fmtMem(r.mem_alloc - r.mem_r)];
+}
+
+const cores = (m: number) => (m / 1000).toFixed(1).replace(/\.0$/, "");
+const gib = (b: number) => (b / 2 ** 30).toFixed(1).replace(/\.0$/, "");
+
+function roomTitle(rooms: NodeRooms | null, node: string, nowMs: number): string | undefined {
+  const r = rooms?.map.get(node);
+  if (!rooms || !r || !r.cpu_alloc) return undefined;
+  const age = fmtAgeSeconds(rooms.ageSecs + Math.floor((nowMs - rooms.fetchedAt) / 1000));
+  return (
+    `${cores(r.cpu_r)} of ${cores(r.cpu_alloc)} cores requested (${pct(r.cpu_r, r.cpu_alloc)}%) · ` +
+    `${gib(r.mem_r)} of ${gib(r.mem_alloc)} GiB (${pct(r.mem_r, r.mem_alloc)}%) · ` +
+    `${r.pods} of ${r.pods_alloc} pods — summed from the pod list as indexed ${age} ago`
+  );
+}
 
 /// Resource aliases for the `:` command.
 const KIND_ALIASES: Record<string, string> = {
@@ -1518,6 +1669,10 @@ function App() {
       string,
       NodeStat
     > | null>(null);
+    const [podExits, setPodExits] = createSignal<Map<string, PodExit> | null>(null);
+    const [nodeTypes, setNodeTypes] = createSignal<Map<string, NodeType> | null>(null);
+    const [nodeRooms, setNodeRooms] = createSignal<NodeRooms | null>(null);
+    const [nodeAlloc, setNodeAlloc] = createSignal<NodeAllocated | null>(null);
     const [pane, setPane] = createSignal<"sidebar" | "table">("sidebar");
     const [customView, setCustomView] = createSignal<"issues" | null>(null);
     const [indexing, setIndexing] = createSignal(false);
@@ -1543,6 +1698,14 @@ function App() {
       setPodEvents,
       nodeStats,
       setNodeStats,
+      podExits,
+      setPodExits,
+      nodeTypes,
+      setNodeTypes,
+      nodeRooms,
+      setNodeRooms,
+      nodeAlloc,
+      setNodeAlloc,
       pane,
       setPane,
       customView,
@@ -1718,7 +1881,7 @@ function App() {
           panes[0].active() === ctx &&
           !authPaused().has(ctx)
         )
-          void refreshList();
+          void refreshList(true);
         return;
       }
       const incoming = ev.rows ?? [];
@@ -2344,6 +2507,9 @@ function App() {
   const podStats = () => P().podStats();
   const podEvents = () => P().podEvents();
   const nodeStats = () => P().nodeStats();
+  const podExits = () => P().podExits();
+  const nodeTypes = () => P().nodeTypes();
+  const nodeRooms = () => P().nodeRooms();
   async function loadNodeStats(ctx: string, pane = panes[0]) {
     const s0 = pane;
     try {
@@ -2354,6 +2520,51 @@ function App() {
       }
     } catch {
       /* metrics API not installed — columns just show "-" */
+    }
+    // After the metrics pass, which has just read every node's allocatable
+    // and left it for this to reuse.
+    void loadNodeRooms(ctx, s0);
+  }
+
+  /// The credential itself is broken — the helper produced no token, or the
+  /// server rejected the one it had — so retrying would run the helper again.
+  /// Narrower than isCredError on purpose: a Forbidden list (an account that
+  /// may not read nodes, say) is the token working, and must not park the
+  /// cluster's background updates.
+  const isCredFailure = (msg: string) => /auth exec|exec auth|Unauthorized|\b401\b/i.test(msg);
+
+  /// Free room per node, summed from the last whole-cluster pod index. No
+  /// such index yet (pods never opened across all namespaces), no columns —
+  /// and no request either.
+  async function loadNodeRooms(ctx: string, pane = panes[0]) {
+    try {
+      const r = await invoke<{ age_secs: number; nodes: NodeRoom[] } | null>("node_rooms", {
+        context: ctx,
+      });
+      const sel = pane.selected();
+      if (!r || pane.active() !== ctx || sel?.group !== "" || sel?.kind !== "Node") return;
+      pane.setNodeRooms({
+        fetchedAt: Date.now(),
+        ageSecs: r.age_secs,
+        map: new Map(r.nodes.map((n) => [n.name, n])),
+      });
+    } catch (e) {
+      if (isCredFailure(String(e))) pauseAuth(ctx);
+    }
+  }
+
+  /// The open node's requests against what it can hold: its own pods only,
+  /// so exact and current for one small list.
+  async function loadNodeAllocated(node: string, key: string) {
+    const pane = P();
+    const ctx = pane.active();
+    pane.setNodeAlloc(null);
+    if (!ctx) return;
+    try {
+      const a = await invoke<NodeAllocated>("node_allocated", { context: ctx, node });
+      if (pane.detailKey() === key) pane.setNodeAlloc(a);
+    } catch (e) {
+      if (isCredFailure(String(e))) pauseAuth(ctx);
     }
   }
   const sortCol = () => P().sortCol();
@@ -3116,7 +3327,7 @@ function App() {
   // streams the fresh page, and restarts the watch — the loading spinner and
   // the cursor reset that sSelect does are NOT wanted here (that flicker on
   // every resync is exactly what this avoids).
-  async function sRefreshList() {
+  async function sRefreshList(background = false) {
     const rt = sSel();
     const ctx = sCtx();
     if (!rt || !ctx) return;
@@ -3137,6 +3348,7 @@ function App() {
         namespace: ns,
         fieldSelector: null,
         channel: chan,
+        background,
       });
       S1.setStreaming(t.truncated);
       if (sCtx() === ctx && sSel() === rt) {
@@ -3171,7 +3383,7 @@ function App() {
         // Same credential guard as pane 1: a paused context must not be
         // re-listed, because that re-runs the browser-opening exec helper.
         if (sSel() === rt && sCtx() === ctx && !authPaused().has(ctx))
-          void sRefreshList();
+          void sRefreshList(true);
         return;
       }
       const del = ev.type === "DELETED";
@@ -4613,6 +4825,10 @@ function App() {
     s0.setPodStats(null);
     s0.setPodEvents(null);
     s0.setNodeStats(null);
+    s0.setPodExits(null);
+    s0.setNodeTypes(null);
+    s0.setNodeRooms(null);
+    extrasScope.delete(s0);
     s0.setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
     s0.setColFilters({});
@@ -4764,9 +4980,187 @@ function App() {
   /// around. Hence the signature: nothing is published unless the warnings
   /// actually changed, so a healthy cluster costs one small request and zero
   /// rebuilds no matter how long it is left open.
+  /// What the pod list carries beyond its own printed columns: the type of
+  /// node under each pod, and why each pod last restarted. Loaded once per
+  /// pane and scope, not on every stats retry; the tick keeps them current.
+  const extrasScope = new Map<object, string>();
+  const isPodListOn = (pane: (typeof panes)[number], ctx: string) =>
+    pane.active() === ctx && pane.selected()?.group === "" && pane.selected()?.kind === "Pod";
+  function loadPodExtras(ctx: string, ns: string | null, pane = panes[0]) {
+    const scope = `${ctx}|${ns ?? ""}`;
+    if (extrasScope.get(pane) === scope) return;
+    extrasScope.set(pane, scope);
+    void loadNodeTypes(ctx, pane);
+    void waitForExits(ctx, ns, pane, scope);
+  }
+
+  /// The restart reasons come out of the background index, which finishes
+  /// some time after the list paints — on a big cluster, a while. Reading
+  /// it costs no request, so ask once a second until it is there.
+  async function waitForExits(
+    ctx: string,
+    ns: string | null,
+    pane: (typeof panes)[number],
+    scope: string,
+  ) {
+    for (let i = 0; i < 120; i++) {
+      if (extrasScope.get(pane) !== scope || !isPodListOn(pane, ctx)) return;
+      let ex: PodExit[] | null;
+      try {
+        ex = await invoke<PodExit[] | null>("pod_exits", { context: ctx, namespace: ns });
+      } catch {
+        return;
+      }
+      if (ex) {
+        if (extrasScope.get(pane) !== scope || !isPodListOn(pane, ctx)) return;
+        publishExits(pane, new Map(ex.map((e) => [e.key, e])));
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  /// Restart counts as of the last read, per pane — only for pods that have
+  /// restarted; one missing here has a count of 0. A count going up is the
+  /// one sign a pod's last exit changed, so only those pods are re-read.
+  const restartsSeen = new Map<object, Map<string, number>>();
+  const exitsOut = new Set<object>();
+  // The rows array each check last walked. A watch flush hands over a new
+  // array only when something changed, so an unchanged one means nothing
+  // to look at — the settled list's tick costs one comparison.
+  const exitsWalked = new Map<object, TableRow[]>();
+  const typesWalked = new Map<object, TableRow[]>();
+  /// A row's restart count, cheaply: most pods never restart, and a "0" is
+  /// recognised without parsing or building a key.
+  const restartsOf = (r: TableRow, ri: number) => {
+    const c = r.cells[ri];
+    return c === "0" || c === 0 || c == null ? 0 : parseInt(String(c), 10) || 0;
+  };
+  function publishExits(pane: (typeof panes)[number], map: Map<string, PodExit>) {
+    const t = pane.table();
+    const seen = new Map<string, number>();
+    const ri = t ? t.columns.findIndex((c) => /^restarts$/i.test(c.name)) : -1;
+    if (t && ri >= 0)
+      for (const r of t.rows) {
+        const n = restartsOf(r, ri);
+        if (n) seen.set(`${r.namespace ?? ""}/${r.name}`, n);
+      }
+    restartsSeen.set(pane, seen);
+    if (t) exitsWalked.set(pane, t.rows);
+    pane.setPodExits(map);
+  }
+  function refreshExits(ctx: string, pane: (typeof panes)[number], t: ResourceTable) {
+    const seen = restartsSeen.get(pane);
+    if (!pane.podExits() || !seen || exitsOut.has(pane)) return;
+    if (exitsWalked.get(pane) === t.rows) return;
+    const ri = t.columns.findIndex((c) => /^restarts$/i.test(c.name));
+    if (ri < 0) return;
+    const due = new Map<string, number>();
+    for (const r of t.rows) {
+      const n = restartsOf(r, ri);
+      if (!n) continue;
+      const key = `${r.namespace ?? ""}/${r.name}`;
+      if (n > (seen.get(key) ?? 0)) {
+        due.set(key, n);
+        if (due.size >= 10) break; // the rest wait for the next tick
+      }
+    }
+    if (!due.size) {
+      exitsWalked.set(pane, t.rows);
+      return;
+    }
+    exitsOut.add(pane);
+    const keys = [...due.keys()];
+    void invoke<PodExit[]>("pod_exits_refresh", { context: ctx, keys })
+      .then((fresh) => {
+        if (!isPodListOn(pane, ctx)) return;
+        const cur = pane.podExits();
+        if (!cur) return;
+        const got = new Map(fresh.map((e) => [e.key, e]));
+        // Seen once re-read, so a failure is retried on the next tick.
+        for (const [k, n] of due) seen.set(k, n);
+        const same = keys.every((k) => {
+          const a = cur.get(k);
+          const b = got.get(k);
+          return a?.at === b?.at && a?.reason === b?.reason && a?.code === b?.code;
+        });
+        if (same) return; // nothing new to show: no rebuild
+        const next = new Map(cur);
+        for (const k of keys) {
+          const e = got.get(k);
+          if (e) next.set(k, e);
+          else next.delete(k);
+        }
+        pane.setPodExits(next);
+      })
+      .catch((e) => {
+        if (isCredFailure(String(e))) pauseAuth(ctx);
+      })
+      .finally(() => exitsOut.delete(pane));
+  }
+
+  /// Node types for the pod list. One metadata list of the nodes — labels
+  /// are all this needs — fetched again only when a pod turns up on a node
+  /// it hasn't seen, and never twice for the same unknown node.
+  const nodeTypesOut = new Set<object>();
+  const nodeTypesSig = new Map<object, string>();
+  const typesMissed = new Map<object, Set<string>>();
+  async function loadNodeTypes(ctx: string, pane: (typeof panes)[number]) {
+    if (nodeTypesOut.has(pane)) return;
+    nodeTypesOut.add(pane);
+    try {
+      const nts = await invoke<NodeType[]>("node_types", { context: ctx });
+      if (!isPodListOn(pane, ctx)) return;
+      const sig = nts
+        .map((n) => `${n.name}=${n.instance}|${n.capacity}|${n.zone}|${n.pool}`)
+        .sort()
+        .join(",");
+      if (pane.nodeTypes() && nodeTypesSig.get(pane) === sig) return;
+      nodeTypesSig.set(pane, sig);
+      typesWalked.delete(pane);
+      pane.setNodeTypes(new Map(nts.map((n) => [n.name, n])));
+    } catch (e) {
+      // An account that may not list nodes just gets no column, as before.
+      if (isCredFailure(String(e))) pauseAuth(ctx);
+    } finally {
+      nodeTypesOut.delete(pane);
+    }
+  }
+  function checkNodeTypes(ctx: string, pane: (typeof panes)[number], t: ResourceTable) {
+    const nt = pane.nodeTypes();
+    if (!nt || nodeTypesOut.has(pane)) return;
+    if (typesWalked.get(pane) === t.rows) return;
+    const ni = t.columns.findIndex((c) => c.name === "Node");
+    if (ni < 0) return;
+    let missed = typesMissed.get(pane);
+    let fresh = false;
+    for (const r of t.rows) {
+      const n = r.cells[ni];
+      if (typeof n !== "string" || !n || n === "<none>" || nt.has(n)) continue;
+      if (!missed) typesMissed.set(pane, (missed = new Set()));
+      if (!missed.has(n)) {
+        missed.add(n);
+        fresh = true;
+      }
+    }
+    typesWalked.set(pane, t.rows);
+    if (fresh) void loadNodeTypes(ctx, pane);
+  }
+
   const podEventSig = new Map<object, string>();
+  /// The pod_events call still out per pane and cluster. While a credential
+  /// helper sits at a login page every request queues behind it, and kube
+  /// runs the helper once more per queued request when it fails — so a 20s
+  /// tick that kept firing left a browser tab behind for every tick the page
+  /// stayed open. The tick skips a view whose last call hasn't come back.
+  const podEventsOut = new Map<string, object>();
+  const podEventsKey = (pane: (typeof panes)[number], ctx: string) =>
+    `${panes.indexOf(pane)}|${ctx}`;
   async function loadPodEvents(ctx: string, ns: string | null, pane = panes[0]) {
     const s0 = pane;
+    const key = podEventsKey(s0, ctx);
+    const mine = {};
+    podEventsOut.set(key, mine);
     try {
       const evs = await invoke<PodEvent[]>("pod_events", {
         context: ctx,
@@ -4786,11 +5180,15 @@ function App() {
       // No permission to list events, or creds just broke. Leave the column
       // off rather than half-filled, and never let it drive the exec plugin.
       if (isCredError(String(e))) pauseAuth(ctx);
+    } finally {
+      // Only our own mark: a newer call (the list reopened) may own it now.
+      if (podEventsOut.get(key) === mine) podEventsOut.delete(key);
     }
   }
 
   async function loadPodStats(ctx: string, ns: string | null, pane = panes[0]) {
     void loadPodEvents(ctx, ns, pane);
+    loadPodExtras(ctx, ns, pane);
     // Whichever pane asked — never P(), which moves with focus while this
     // is in flight.
     const s0 = pane;
@@ -4846,12 +5244,17 @@ function App() {
         // the Event column refreshes on its own schedule rather than on the
         // stats burst's "pods appeared" trigger. It publishes nothing unless
         // the warnings changed, so a quiet cluster stays at zero rebuilds.
-        void loadPodEvents(
-          ctx,
-          rt.namespaced && pane.namespace() ? pane.namespace() : null,
-          pane,
-        );
+        if (!podEventsOut.has(podEventsKey(pane, ctx)))
+          void loadPodEvents(
+            ctx,
+            rt.namespaced && pane.namespace() ? pane.namespace() : null,
+            pane,
+          );
         const t = pane.table();
+        if (t) {
+          refreshExits(ctx, pane, t);
+          checkNodeTypes(ctx, pane, t);
+        }
         const stats = pane.podStats();
         if (!t || !stats) continue; // metrics not in play (e.g. no metrics-server)
         const si = t.columns.findIndex((c) => /^status$/i.test(c.name));
@@ -5204,7 +5607,10 @@ function App() {
     await showDetail(ns, podName);
   }
 
-  async function refreshList() {
+  /// `background`: the server closed the watch and nobody asked for this —
+  /// it then takes its turn behind the cluster's other background requests
+  /// and stands down if the credential is already known broken.
+  async function refreshList(background = false) {
     // Pane #0's list refresh — bound to panes[0], not P(), so a background
     // RESYNC while the other pane is focused can't overwrite it.
     const s0 = panes[0];
@@ -5232,6 +5638,7 @@ function App() {
         namespace: ns,
         fieldSelector: fsel(),
         channel: chan,
+        background,
       });
       s0.setStreaming(t.truncated);
       if (s0.active() === ctx && s0.selected() === rt) {
@@ -5517,6 +5924,7 @@ function App() {
       .catch(() => {});
     if (selected()?.group === "" && selected()?.kind === "Node") {
       void loadNodePods(name, key);
+      void loadNodeAllocated(name, key);
     }
     try {
       const d = await fetchDetail(namespace, name);
@@ -6063,9 +6471,26 @@ function App() {
   let dispCache = new Map<TableRow, DisplayRow>();
   let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
   let dispCachePevs: Map<string, PodEvent> | null = null;
+  let dispCacheExits: Map<string, PodExit> | null = null;
+  let dispCacheNtypes: Map<string, NodeType> | null = null;
+  let dispCacheRooms: NodeRooms | null = null;
   let dispCacheCustom: Map<string, Record<string, string>> | null = null;
   let dispCacheCcols: { name: string; path: string }[] | null = null;
+  /// The row pipeline each rendered pane builds for itself. The App-scope one
+  /// below serves the focused pane's keyboard navigation, column menus and
+  /// the like — the same rows from the same inputs — so it reads that pane's
+  /// result rather than building all 20k rows (and filtering and sorting
+  /// them) a second time on every change. Only while no pane is rendered
+  /// does it compute its own.
+  type PanePipe = {
+    baseRows: () => { cols: string[]; rows: DisplayRow[] };
+    view: () => { cols: string[]; allCols: string[]; rows: DisplayRow[] };
+  };
+  const [panePipes, setPanePipes] = createSignal<(PanePipe | undefined)[]>([]);
+  const focusedPipe = () => panePipes()[focusedPaneIdx()];
   const baseRows = createMemo(() => {
+    const mine = focusedPipe();
+    if (mine) return mine.baseRows();
     const t = table();
     const rt = selected();
     if (!t || !rt) return { cols: [] as string[], rows: [] as DisplayRow[] };
@@ -6082,17 +6507,40 @@ function App() {
       evAt = si >= 0 ? si + 1 : cols.length;
       cols = [...cols.slice(0, evAt), POD_EVENT_COL, ...cols.slice(evAt)];
     }
+    // Why the pod last restarted, beside the count — read from the objects
+    // the background index already fetched, so no request of its own.
+    const exits = isPodList ? podExits() : null;
+    let exAt = -1;
+    if (exits) {
+      const ri = cols.findIndex((c) => /^restarts$/i.test(c));
+      exAt = ri >= 0 ? ri + 1 : cols.length;
+      cols = [...cols.slice(0, exAt), POD_EXIT_COL, ...cols.slice(exAt)];
+    }
     const stats = isPodList ? podStats() : null;
     let statAt = -1;
     if (stats) {
-      const ri = cols.findIndex((c) => /^restarts$/i.test(c));
+      const ri = exAt >= 0 ? exAt : cols.findIndex((c) => /^restarts$/i.test(c));
       statAt = ri >= 0 ? ri + 1 : cols.length;
       cols = [...cols.slice(0, statAt), ...POD_STAT_COLS, ...cols.slice(statAt)];
+    }
+    // The machine under each pod, beside the Node column. Only once some node
+    // carries a type — a kind or minikube cluster has none, and a column of
+    // blanks would say nothing.
+    const ntypes = isPodList ? nodeTypes() : null;
+    const ntOn = !!ntypes && [...ntypes.values()].some((n) => n.instance || n.capacity);
+    const nodeSrc = t.columns.findIndex((c) => c.name === "Node");
+    let ntAt = -1;
+    if (ntOn) {
+      const ni = cols.indexOf("Node");
+      ntAt = ni >= 0 ? ni + 1 : cols.length;
+      cols = [...cols.slice(0, ntAt), POD_NODETYPE_COL, ...cols.slice(ntAt)];
     }
     const nodeView = rt.group === "" && rt.kind === "Node";
     const nstats = nodeView ? nodeStats() : null;
     if (nstats) cols = [...cols, ...NODE_STAT_COLS];
     if (nodeView) cols = [...cols, "AZ"];
+    const rooms = nodeView ? nodeRooms() : null;
+    if (rooms) cols = [...cols, ...NODE_ROOM_COLS];
     // User-defined columns, appended last. Label columns read straight
     // from the row's labels; other paths come from the backend eval.
     const ccols = myCustomCols();
@@ -6109,25 +6557,42 @@ function App() {
     const prev =
       dispCacheStats === activeStats &&
       dispCachePevs === pevs &&
+      dispCacheExits === exits &&
+      dispCacheNtypes === (ntOn ? ntypes : null) &&
+      dispCacheRooms === rooms &&
       dispCacheCustom === cdata &&
       dispCacheCcols === ccols
         ? dispCache
         : null;
+    // Whether this build adds cells to rows at all; if so each row gets one
+    // copy of its own cells to splice into, rather than an array per column.
+    const adds = !!(pevs || exits || stats || ntOn || nstats || nodeView || rooms || ccols.length);
+    // The row's ns/name key, built once — several columns look it up.
+    const keyed = !!(pevs || exits || stats || (ccols.length && needBackend));
     const rows: DisplayRow[] = t.rows.map((r) => {
       const hit = prev?.get(r);
       if (hit) return hit;
-      let cells = r.cells.map((c) => String(c ?? ""));
-      if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+      const base = baseOf(r, rt.namespaced);
+      const key = keyed ? `${r.namespace ?? ""}/${r.name}` : "";
+      const cells = adds ? base.cells.slice() : base.cells;
+      // What this build adds to the row, for search: only these are re-strung.
+      const extra: string[] = [];
       if (pevs) {
-        const e = pevs.get(`${r.namespace ?? ""}/${r.name}`);
+        const e = pevs.get(key);
         // Empty means nothing is wrong — the reading that makes the column
         // worth scanning. A repeat count rides along; the message is the
         // cell\'s tooltip, so the column stays one reason wide.
         const cell = e ? (e.count > 1 ? `${e.reason} ×${e.count}` : e.reason) : "";
-        cells = [...cells.slice(0, evAt), cell, ...cells.slice(evAt)];
+        cells.splice(evAt, 0, cell);
+        extra.push(cell);
+      }
+      if (exits) {
+        const x = exitText(exits.get(key));
+        cells.splice(exAt, 0, x);
+        extra.push(x);
       }
       if (stats) {
-        const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
+        const st = stats.get(key);
         const six = st
           ? [
               fmtCpu(st.cpu),
@@ -6138,46 +6603,57 @@ function App() {
               pct(st.mem, st.mem_l),
             ]
           : ["-", "-", "-", "-", "-", "-"];
-        cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
+        cells.splice(statAt, 0, ...six);
+        extra.push(...six);
+      }
+      if (ntOn) {
+        const x = nodeTypeText(ntypes!.get(String(r.cells[nodeSrc] ?? "")));
+        cells.splice(ntAt, 0, x);
+        extra.push(x);
       }
       if (nstats) {
         const ns = nstats.get(r.name);
-        cells = [
-          ...cells,
+        const four = [
           ns ? fmtCpu(ns.cpu) : "-",
           ns ? `${ns.cpu_pct}%` : "-",
           ns ? fmtMem(ns.mem) : "-",
           ns ? `${ns.mem_pct}%` : "-",
         ];
+        cells.push(...four);
+        extra.push(...four);
       }
-      if (nodeView) cells = [...cells, zoneOf(r.labels)];
+      if (nodeView) {
+        const z = zoneOf(r.labels);
+        cells.push(z);
+        extra.push(z);
+      }
+      if (rooms) {
+        const rc = roomCells(rooms.map.get(r.name));
+        cells.push(...rc);
+        extra.push(...rc);
+      }
       if (ccols.length) {
         const rec = needBackend
-          ? cdata?.get(`${r.namespace ?? ""}/${r.name}`)
+          ? cdata?.get(key)
           : undefined;
-        cells = [
-          ...cells,
-          ...ccols.map((c, i) => {
-            const lk = ccolKeys[i];
-            if (lk !== null) return r.labels?.[lk] ?? "";
-            return rec?.[c.path] ?? "";
-          }),
-        ];
+        const cc = ccols.map((c, i) => {
+          const lk = ccolKeys[i];
+          if (lk !== null) return r.labels?.[lk] ?? "";
+          return rec?.[c.path] ?? "";
+        });
+        cells.push(...cc);
+        extra.push(...cc);
       }
-      const hay = (
-        cells.join(" ") +
-        " " +
-        Object.entries(r.labels)
-          .map(([k, v]) => `${k}=${v}`)
-          .join(" ")
-      ).toLowerCase();
-      return { row: r, cells, hay };
+      return { row: r, cells, hay: base.hay, hayX: extra.length ? extra.join(" ").toLowerCase() : "" };
     });
     const next = new Map<TableRow, DisplayRow>();
     for (const d of rows) next.set(d.row, d);
     dispCache = next;
     dispCacheStats = activeStats;
     dispCachePevs = pevs;
+    dispCacheExits = exits;
+    dispCacheNtypes = ntOn ? ntypes : null;
+    dispCacheRooms = rooms;
     dispCacheCustom = cdata;
     dispCacheCcols = ccols;
     return { cols, rows };
@@ -6205,6 +6681,8 @@ function App() {
   /// Filter, then sort, then drop hidden columns. Only this part runs
   /// per keystroke, and it works on already-built rows.
   const view = createMemo(() => {
+    const mine = focusedPipe();
+    if (mine) return mine.view();
     const b = baseRows();
     if (!b.rows.length && !b.cols.length)
       return {
@@ -6225,14 +6703,14 @@ function App() {
       // keyed by namespace/name so they stay aligned through reordering.
       const { poss, res, negs } = parseQuery(raw);
       const extra = matched();
-      const passExtra = (h: string) =>
-        res.every((re) => re.test(h)) && !negs.some((n) => h.includes(n));
+      const has = (r: DisplayRow, x: string) => r.hay.includes(x) || r.hayX.includes(x);
+      const passExtra = (r: DisplayRow) =>
+        res.every((re) => re.test(r.hay) || re.test(r.hayX)) && !negs.some((n) => has(r, n));
       const nameHit = (r: DisplayRow) =>
         poss.every((x) => r.row.name.toLowerCase().includes(x));
-      const visibleHit = (r: DisplayRow) =>
-        poss.every((x) => r.hay.includes(x)) && passExtra(r.hay);
+      const visibleHit = (r: DisplayRow) => poss.every((x) => has(r, x)) && passExtra(r);
       const deepHit = (r: DisplayRow) =>
-        (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r.hay);
+        (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r);
       out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
       // Rank by why it matched: name first, then other visible fields,
       // then deep-field-only hits (which the user can't see, so they'd
@@ -9812,6 +10290,10 @@ function App() {
       const podStats = () => S.podStats();
       const podEvents = () => S.podEvents();
       const nodeStats = () => S.nodeStats();
+      const podExits = () => S.podExits();
+      const nodeTypes = () => S.nodeTypes();
+      const nodeRooms = () => S.nodeRooms();
+      const nodeAlloc = () => S.nodeAlloc();
       const customView = () => S.customView();
       const indexing = () => S.indexing();
       const deepReady = () => S.deepReady();
@@ -9854,6 +10336,9 @@ function App() {
       let dispCache = new Map<TableRow, DisplayRow>();
       let dispCacheStats: Map<string, PodStat> | Map<string, NodeStat> | null = null;
       let dispCachePevs: Map<string, PodEvent> | null = null;
+      let dispCacheExits: Map<string, PodExit> | null = null;
+      let dispCacheNtypes: Map<string, NodeType> | null = null;
+      let dispCacheRooms: NodeRooms | null = null;
       let dispCacheCustom: Map<string, Record<string, string>> | null = null;
       let dispCacheCcols: { name: string; path: string }[] | null = null;
       // Per-pane kind/field/region predicates. These derive from this
@@ -9937,17 +10422,40 @@ function App() {
           evAt = si >= 0 ? si + 1 : cols.length;
           cols = [...cols.slice(0, evAt), POD_EVENT_COL, ...cols.slice(evAt)];
         }
+        // Why the pod last restarted, beside the count — read from the objects
+        // the background index already fetched, so no request of its own.
+        const exits = isPodList ? podExits() : null;
+        let exAt = -1;
+        if (exits) {
+          const ri = cols.findIndex((c) => /^restarts$/i.test(c));
+          exAt = ri >= 0 ? ri + 1 : cols.length;
+          cols = [...cols.slice(0, exAt), POD_EXIT_COL, ...cols.slice(exAt)];
+        }
         const stats = isPodList ? podStats() : null;
         let statAt = -1;
         if (stats) {
-          const ri = cols.findIndex((c) => /^restarts$/i.test(c));
+          const ri = exAt >= 0 ? exAt : cols.findIndex((c) => /^restarts$/i.test(c));
           statAt = ri >= 0 ? ri + 1 : cols.length;
           cols = [...cols.slice(0, statAt), ...POD_STAT_COLS, ...cols.slice(statAt)];
+        }
+        // The machine under each pod, beside the Node column. Only once some node
+        // carries a type — a kind or minikube cluster has none, and a column of
+        // blanks would say nothing.
+        const ntypes = isPodList ? nodeTypes() : null;
+        const ntOn = !!ntypes && [...ntypes.values()].some((n) => n.instance || n.capacity);
+        const nodeSrc = t.columns.findIndex((c) => c.name === "Node");
+        let ntAt = -1;
+        if (ntOn) {
+          const ni = cols.indexOf("Node");
+          ntAt = ni >= 0 ? ni + 1 : cols.length;
+          cols = [...cols.slice(0, ntAt), POD_NODETYPE_COL, ...cols.slice(ntAt)];
         }
         const nodeView = rt.group === "" && rt.kind === "Node";
         const nstats = nodeView ? nodeStats() : null;
         if (nstats) cols = [...cols, ...NODE_STAT_COLS];
         if (nodeView) cols = [...cols, "AZ"];
+        const rooms = nodeView ? nodeRooms() : null;
+        if (rooms) cols = [...cols, ...NODE_ROOM_COLS];
         // User-defined columns, appended last. Label columns read straight
         // from the row's labels; other paths come from the backend eval.
         const ccols = myCustomCols();
@@ -9964,25 +10472,42 @@ function App() {
         const prev =
           dispCacheStats === activeStats &&
           dispCachePevs === pevs &&
+          dispCacheExits === exits &&
+          dispCacheNtypes === (ntOn ? ntypes : null) &&
+          dispCacheRooms === rooms &&
           dispCacheCustom === cdata &&
           dispCacheCcols === ccols
             ? dispCache
             : null;
+        // Whether this build adds cells to rows at all; if so each row gets one
+        // copy of its own cells to splice into, rather than an array per column.
+        const adds = !!(pevs || exits || stats || ntOn || nstats || nodeView || rooms || ccols.length);
+        // The row's ns/name key, built once — several columns look it up.
+        const keyed = !!(pevs || exits || stats || (ccols.length && needBackend));
         const rows: DisplayRow[] = t.rows.map((r) => {
           const hit = prev?.get(r);
           if (hit) return hit;
-          let cells = r.cells.map((c) => String(c ?? ""));
-          if (rt.namespaced) cells = [cells[0], r.namespace ?? "", ...cells.slice(1)];
+          const base = baseOf(r, rt.namespaced);
+          const key = keyed ? `${r.namespace ?? ""}/${r.name}` : "";
+          const cells = adds ? base.cells.slice() : base.cells;
+          // What this build adds to the row, for search: only these are re-strung.
+          const extra: string[] = [];
           if (pevs) {
-            const e = pevs.get(`${r.namespace ?? ""}/${r.name}`);
+            const e = pevs.get(key);
             // Empty means nothing is wrong — the reading that makes the column
             // worth scanning. A repeat count rides along; the message is the
             // cell\'s tooltip, so the column stays one reason wide.
             const cell = e ? (e.count > 1 ? `${e.reason} ×${e.count}` : e.reason) : "";
-            cells = [...cells.slice(0, evAt), cell, ...cells.slice(evAt)];
+            cells.splice(evAt, 0, cell);
+            extra.push(cell);
+          }
+          if (exits) {
+            const x = exitText(exits.get(key));
+            cells.splice(exAt, 0, x);
+            extra.push(x);
           }
           if (stats) {
-            const st = stats.get(`${r.namespace ?? ""}/${r.name}`);
+            const st = stats.get(key);
             const six = st
               ? [
                   fmtCpu(st.cpu),
@@ -9993,46 +10518,57 @@ function App() {
                   pct(st.mem, st.mem_l),
                 ]
               : ["-", "-", "-", "-", "-", "-"];
-            cells = [...cells.slice(0, statAt), ...six, ...cells.slice(statAt)];
+            cells.splice(statAt, 0, ...six);
+            extra.push(...six);
+          }
+          if (ntOn) {
+            const x = nodeTypeText(ntypes!.get(String(r.cells[nodeSrc] ?? "")));
+            cells.splice(ntAt, 0, x);
+            extra.push(x);
           }
           if (nstats) {
             const ns = nstats.get(r.name);
-            cells = [
-              ...cells,
+            const four = [
               ns ? fmtCpu(ns.cpu) : "-",
               ns ? `${ns.cpu_pct}%` : "-",
               ns ? fmtMem(ns.mem) : "-",
               ns ? `${ns.mem_pct}%` : "-",
             ];
+            cells.push(...four);
+            extra.push(...four);
           }
-          if (nodeView) cells = [...cells, zoneOf(r.labels)];
+          if (nodeView) {
+            const z = zoneOf(r.labels);
+            cells.push(z);
+            extra.push(z);
+          }
+          if (rooms) {
+            const rc = roomCells(rooms.map.get(r.name));
+            cells.push(...rc);
+            extra.push(...rc);
+          }
           if (ccols.length) {
             const rec = needBackend
-              ? cdata?.get(`${r.namespace ?? ""}/${r.name}`)
+              ? cdata?.get(key)
               : undefined;
-            cells = [
-              ...cells,
-              ...ccols.map((c, i) => {
-                const lk = ccolKeys[i];
-                if (lk !== null) return r.labels?.[lk] ?? "";
-                return rec?.[c.path] ?? "";
-              }),
-            ];
+            const cc = ccols.map((c, i) => {
+              const lk = ccolKeys[i];
+              if (lk !== null) return r.labels?.[lk] ?? "";
+              return rec?.[c.path] ?? "";
+            });
+            cells.push(...cc);
+            extra.push(...cc);
           }
-          const hay = (
-            cells.join(" ") +
-            " " +
-            Object.entries(r.labels)
-              .map(([k, v]) => `${k}=${v}`)
-              .join(" ")
-          ).toLowerCase();
-          return { row: r, cells, hay };
+          return { row: r, cells, hay: base.hay, hayX: extra.length ? extra.join(" ").toLowerCase() : "" };
         });
         const next = new Map<TableRow, DisplayRow>();
         for (const d of rows) next.set(d.row, d);
         dispCache = next;
         dispCacheStats = activeStats;
         dispCachePevs = pevs;
+        dispCacheExits = exits;
+        dispCacheNtypes = ntOn ? ntypes : null;
+        dispCacheRooms = rooms;
         dispCacheCustom = cdata;
         dispCacheCcols = ccols;
         return { cols, rows };
@@ -10080,14 +10616,14 @@ function App() {
           // keyed by namespace/name so they stay aligned through reordering.
           const { poss, res, negs } = parseQuery(raw);
           const extra = matched();
-          const passExtra = (h: string) =>
-            res.every((re) => re.test(h)) && !negs.some((n) => h.includes(n));
+          const has = (r: DisplayRow, x: string) => r.hay.includes(x) || r.hayX.includes(x);
+          const passExtra = (r: DisplayRow) =>
+            res.every((re) => re.test(r.hay) || re.test(r.hayX)) && !negs.some((n) => has(r, n));
           const nameHit = (r: DisplayRow) =>
             poss.every((x) => r.row.name.toLowerCase().includes(x));
-          const visibleHit = (r: DisplayRow) =>
-            poss.every((x) => r.hay.includes(x)) && passExtra(r.hay);
+          const visibleHit = (r: DisplayRow) => poss.every((x) => has(r, x)) && passExtra(r);
           const deepHit = (r: DisplayRow) =>
-            (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r.hay);
+            (extra?.has(rowKeyOf(r.row)) ?? false) && passExtra(r);
           out = b.rows.filter((r) => visibleHit(r) || deepHit(r));
           // Rank by why it matched: name first, then other visible fields,
           // then deep-field-only hits (which the user can't see, so they'd
@@ -10199,6 +10735,20 @@ function App() {
           rows: out.map((r) => ({ ...r, cells: keepIdx.map((i) => r.cells[i]) })),
         };
       });
+      // Lend this pane's pipeline to the App scope while it is rendered.
+      setPanePipes((m) => {
+        const n = m.slice();
+        n[pi] = { baseRows, view };
+        return n;
+      });
+      onCleanup(() =>
+        setPanePipes((m) => {
+          if (m[pi]?.baseRows !== baseRows) return m;
+          const n = m.slice();
+          n[pi] = undefined;
+          return n;
+        }),
+      );
       const rowCount = createMemo(() => view().rows.length);
       const dsCount = createMemo(() => {
         if (!isPod() || namespace()) return 0;
@@ -11317,14 +11867,35 @@ function App() {
                                               )?.hot === false
                                             ? "cell stale"
                                             : "cell bad"
-                                        : cellClass(cell)
+                                        : view().cols[i()] === POD_EXIT_COL
+                                          ? exitClass(
+                                              podExits()?.get(
+                                                `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                              ),
+                                              cell,
+                                              nowTick(),
+                                            )
+                                          : cellClass(cell)
                                   }
                                   title={
                                     view().cols[i()] === POD_EVENT_COL
                                       ? podEvents()?.get(
                                           `${vr.row.namespace ?? ""}/${vr.row.name}`,
                                         )?.message
-                                      : undefined
+                                      : view().cols[i()] === POD_EXIT_COL
+                                        ? exitTitle(
+                                            podExits()?.get(
+                                              `${vr.row.namespace ?? ""}/${vr.row.name}`,
+                                            ),
+                                            nowTick(),
+                                          )
+                                        : view().cols[i()] === POD_NODETYPE_COL
+                                          ? nodeTypeTitle(
+                                              nodeTypes()?.get(cellOf(table(), vr.row, "Node")),
+                                            )
+                                          : NODE_ROOM_COLS.includes(view().cols[i()])
+                                            ? roomTitle(nodeRooms(), vr.row.name, nowTick())
+                                            : undefined
                                   }
                                 >
                                   <Show when={i() === 0}>
@@ -11682,6 +12253,26 @@ function App() {
                           </span>
                         </Show>
                       </div>
+                      <Show when={nodeAlloc()}>
+                        {(a) => (
+                          <div
+                            class="np-alloc"
+                            title="what the pods on this node request, against what it can allocate"
+                          >
+                            <span classList={{ warn: a().cpu_r >= a().cpu_alloc * 0.9 }}>
+                              CPU {cores(a().cpu_r)} of {cores(a().cpu_alloc)} requested ·{" "}
+                              {cores(a().cpu_alloc - a().cpu_r)} free
+                            </span>
+                            <span classList={{ warn: a().mem_r >= a().mem_alloc * 0.9 }}>
+                              memory {gib(a().mem_r)} of {gib(a().mem_alloc)} GiB requested ·{" "}
+                              {gib(a().mem_alloc - a().mem_r)} GiB free
+                            </span>
+                            <span>
+                              {a().pods} of {a().pods_alloc} pods
+                            </span>
+                          </div>
+                        )}
+                      </Show>
                       <Show
                         when={!nodePodsLoading()}
                         fallback={<div class="dim np-note">loading pods…</div>}

@@ -28,15 +28,31 @@ global.ResizeObserver = class { observe() {} disconnect() {} };
 const ctx = { name: "smoke", cluster: "c", user: "u", namespace: null, is_current: true, source: "", server: "https://s:6443" };
 const podType = { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, deletable: true, editable: true };
 const AGES = ["5s", "17s", "45s", "1m", "3m", "12m", "59m", "2h", "3d"];
+// Spread over 300 nodes, one pod in 50 with restarts behind it: the Restart
+// reason and Node type columns have to be in play, and the tick that keeps
+// them current has to walk all of these rows without costing anything.
 const table = {
-  columns: ["Name", "Ready", "Status", "Restarts", "Age"].map((name) => ({ name, priority: 0 })),
+  columns: [
+    ...["Name", "Ready", "Status", "Restarts", "Age"].map((name) => ({ name, priority: 0 })),
+    { name: "Node", priority: 1 },
+  ],
   rows: Array.from({ length: N }, (_, i) => ({
     name: `pod-${String(i).padStart(6, "0")}`, namespace: `ns-${i % 50}`,
-    cells: [`pod-${String(i).padStart(6, "0")}`, "1/1", "Running", "0", AGES[i % AGES.length]],
+    cells: [
+      `pod-${String(i).padStart(6, "0")}`, "1/1", "Running", i % 50 ? "0" : "2 (3h ago)",
+      AGES[i % AGES.length], `ip-${i % 300}`,
+    ],
     labels: { app: `svc-${i % 100}` },
   })),
   truncated: false, resource_version: "1", include: "Metadata",
 };
+const exits = table.rows
+  .filter((_, i) => i % 50 === 0)
+  .map((r) => ({ key: `${r.namespace}/${r.name}`, reason: "OOMKilled", code: 137, at: "2026-10-27T01:00:00Z", container: "app" }));
+const nodeTypes = Array.from({ length: 300 }, (_, i) => ({
+  name: `ip-${i}`, instance: i % 2 ? "m6i.xlarge" : "c6i.2xlarge", capacity: i % 3 ? "spot" : "on-demand",
+  zone: "ap-northeast-2a", pool: "default",
+}));
 // Live metrics for every pod, so the stats map is in play like it is in anger.
 const stats = table.rows.map((r) => ({
   key: `${r.namespace}/${r.name}`, cpu: 12, mem: 340,
@@ -44,6 +60,7 @@ const stats = table.rows.map((r) => ({
 }));
 
 let podStatsCalls = 0, issueSweeps = 0, eventSweeps = 0;
+let exitReads = 0, exitRefreshes = 0, typeFetches = 0;
 // A fixed set of warnings: the Event column's sweep must notice they never
 // change and stop republishing its map, because republishing rebuilds all
 // 20k display rows.
@@ -64,6 +81,9 @@ dom.window.__TAURI_INTERNALS__ = {
       case "pod_stats": podStatsCalls++; return Promise.resolve(stats);
       case "pod_events": eventSweeps++; return Promise.resolve(warnings);
       case "aggregate_issues": issueSweeps++; return Promise.resolve(null);
+      case "pod_exits": exitReads++; return Promise.resolve(exits);
+      case "pod_exits_refresh": exitRefreshes++; return Promise.resolve([]);
+      case "node_types": typeFetches++; return Promise.resolve(nodeTypes);
       default: return Promise.resolve([]);
     }
   },
@@ -89,8 +109,13 @@ await wait(500);
 
 const statsAtStart = podStatsCalls, sweepsAtStart = issueSweeps;
 const eventsAtStart = eventSweeps;
+const exitReadsAtStart = exitReads, typesAtStart = typeFetches;
 if (!q("th").some((h) => /^recent event/i.test((h.textContent || "").trim())))
   fail("the Recent event column never appeared");
+if (!q("th").some((h) => /^restart reason/i.test((h.textContent || "").trim())))
+  fail("the Restart reason column never appeared");
+if (!q("th").some((h) => /^node type/i.test((h.textContent || "").trim())))
+  fail("the Node type column never appeared");
 const gaps = [];
 let last = performance.now();
 const id = setInterval(() => { const n = performance.now(); gaps.push(n - last); last = n; }, 50);
@@ -105,10 +130,16 @@ console.log(`  event-loop gap  p50 ${p(0.5).toFixed(0)}ms  p95 ${p(0.95).toFixed
 console.log(`  gaps >100ms: ${over(100)}   >250ms: ${over(250)}`);
 const evs = eventSweeps - eventsAtStart;
 console.log(`  background fetches while idle — pod_stats: ${podStatsCalls - statsAtStart}, issue sweeps: ${issueSweeps - sweepsAtStart}, event sweeps: ${evs}`);
+console.log(`  restart re-reads: ${exitRefreshes}, index reads: ${exitReads - exitReadsAtStart}, node type fetches: ${typeFetches - typesAtStart}`);
 
 if (over(250) > 0) fail(`${over(250)} stall(s) over 250ms while idle — a periodic job is doing heavy work`);
 // One per 20s tick and no more: the Event column must never land on a faster
 // timer, and must never retry.
 if (evs > Math.ceil(SECS / 20)) fail(`${evs} event sweeps in ${SECS}s — the Event column is polling too often`);
+// Nothing restarted and every pod's node is known: the tick must not ask
+// the cluster for anything.
+if (exitRefreshes) fail(`${exitRefreshes} restart re-read(s) while nothing restarted`);
+if (typeFetches !== typesAtStart) fail(`${typeFetches - typesAtStart} node type fetch(es) while every node was known`);
+if (exitReads !== exitReadsAtStart) fail(`${exitReads - exitReadsAtStart} index read(s) after the reasons had landed`);
 console.log("perf-idle ok");
 process.exit(0);
