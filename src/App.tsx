@@ -2373,6 +2373,7 @@ function App() {
     try {
       await invoke("disconnect", { context: name });
       tabCache.delete(name);
+      typesCache.delete(name);
       await setupContext(name);
       if (!tabs().includes(name)) setTabs([...tabs(), name]);
       setFailed(failed().filter((f) => f.name !== name));
@@ -3441,6 +3442,7 @@ function App() {
     setSLoading(true);
     const isPod = rt.group === "" && rt.kind === "Pod";
     const isNode = rt.group === "" && rt.kind === "Node";
+    if (isPod) primeNodeTypes(ctx, S1);
 
     // Same strategy as pane 1, which this used to skip: a cached snapshot
     // paints at once and the watch resumes from its version, so revisiting
@@ -4100,6 +4102,10 @@ function App() {
   };
 
   const tabCache = new Map<string, TabState>();
+  /// Each cluster's node types, kept once read so a pod list opened again
+  /// shows them with its first rows instead of a beat later. Nodes come and
+  /// go slowly; a pod on a node not in here still triggers a fresh read.
+  const typesCache = new Map<string, { map: Map<string, NodeType>; sig: string; at: number }>();
   const typeKey = (t: ResourceType) => `${t.group}/${t.kind}`;
 
   createEffect(() => {
@@ -4581,6 +4587,7 @@ function App() {
     if (isConnecting(name)) cancelConnect(name);
     void invoke("disconnect", { context: name }).catch(() => {});
     tabCache.delete(name);
+    typesCache.delete(name);
     const rest = tabs().filter((t) => t !== name);
     setTabs(rest);
     if (active() === name) {
@@ -4844,6 +4851,7 @@ function App() {
     s0.setNodeTypes(null);
     s0.setNodeRooms(null);
     extrasScope.delete(s0);
+    if (rt.group === "" && rt.kind === "Pod") primeNodeTypes(ctx, s0);
     s0.setSortCol(null);
     // Column filters are per-kind (columns differ), so clear on switch.
     s0.setColFilters({});
@@ -5005,7 +5013,7 @@ function App() {
     const scope = `${ctx}|${ns ?? ""}`;
     if (extrasScope.get(pane) === scope) return;
     extrasScope.set(pane, scope);
-    void loadNodeTypes(ctx, pane);
+    primeNodeTypes(ctx, pane);
     void waitForExits(ctx, ns, pane, scope);
   }
 
@@ -5117,33 +5125,75 @@ function App() {
   /// Node types for the pod list. One metadata list of the nodes — labels
   /// are all this needs — fetched again only when a pod turns up on a node
   /// it hasn't seen, and never twice for the same unknown node.
-  const nodeTypesOut = new Set<object>();
+  /// The cluster each pane's request is out for. Keyed by cluster, not just
+  /// pane: a request still out for the cluster the pane just left must not
+  /// hold off the one it moved to — that answer is thrown away on arrival,
+  /// and the column never came.
+  const nodeTypesOut = new Map<object, string>();
   const nodeTypesSig = new Map<object, string>();
   const typesMissed = new Map<object, Set<string>>();
+  /// The last failed read, so the tick can try again — except where the
+  /// account may not list nodes, which is not going to change.
+  const typesFailed = new Map<object, { ctx: string; at: number; forbidden: boolean }>();
+  /// A pod list is opening: put the cluster's known node types up with it,
+  /// and read them now — alongside the list, not after it — unless the copy
+  /// on hand is under a minute old. The list never waits for them.
+  function primeNodeTypes(ctx: string, pane: (typeof panes)[number]) {
+    const c = typesCache.get(ctx);
+    if (c && pane.nodeTypes() !== c.map) {
+      nodeTypesSig.set(pane, c.sig);
+      typesWalked.delete(pane);
+      pane.setNodeTypes(c.map);
+    } else if (!c && pane.nodeTypes()) {
+      pane.setNodeTypes(null); // another cluster's, from before
+    }
+    if (c && Date.now() - c.at <= 60_000) return;
+    // Nor straight after a failure: the tick tries again in a minute, and
+    // an account that may not list nodes is not asked again at all.
+    const f = typesFailed.get(pane);
+    if (f?.ctx === ctx && (f.forbidden || Date.now() - f.at < 60_000)) return;
+    void loadNodeTypes(ctx, pane);
+  }
   async function loadNodeTypes(ctx: string, pane: (typeof panes)[number]) {
-    if (nodeTypesOut.has(pane)) return;
-    nodeTypesOut.add(pane);
+    if (nodeTypesOut.get(pane) === ctx) return;
+    nodeTypesOut.set(pane, ctx);
     try {
       const nts = await invoke<NodeType[]>("node_types", { context: ctx });
-      if (!isPodListOn(pane, ctx)) return;
+      typesFailed.delete(pane);
       const sig = nts
         .map((n) => `${n.name}=${n.instance}|${n.capacity}|${n.zone}|${n.pool}`)
         .sort()
         .join(",");
+      // Kept even when the pane has moved on: it is this cluster's answer,
+      // and the next pod list there paints with it.
+      const had = typesCache.get(ctx);
+      const map = had?.sig === sig ? had.map : new Map(nts.map((n) => [n.name, n]));
+      typesCache.set(ctx, { map, sig, at: Date.now() });
+      if (!isPodListOn(pane, ctx)) return;
       if (pane.nodeTypes() && nodeTypesSig.get(pane) === sig) return;
       nodeTypesSig.set(pane, sig);
       typesWalked.delete(pane);
-      pane.setNodeTypes(new Map(nts.map((n) => [n.name, n])));
+      pane.setNodeTypes(map);
     } catch (e) {
       // An account that may not list nodes just gets no column, as before.
-      if (isCredFailure(String(e))) pauseAuth(ctx);
+      const msg = String(e);
+      if (isCredFailure(msg)) pauseAuth(ctx);
+      typesFailed.set(pane, { ctx, at: Date.now(), forbidden: /\b403\b|forbidden/i.test(msg) });
     } finally {
-      nodeTypesOut.delete(pane);
+      if (nodeTypesOut.get(pane) === ctx) nodeTypesOut.delete(pane);
     }
   }
   function checkNodeTypes(ctx: string, pane: (typeof panes)[number], t: ResourceTable) {
     const nt = pane.nodeTypes();
-    if (!nt || nodeTypesOut.has(pane)) return;
+    if (nodeTypesOut.has(pane)) return;
+    if (!nt) {
+      // Never arrived: the answer was for a cluster the pane had left, or
+      // the read failed. Ask again, no more than once a minute after a failure.
+      const f = typesFailed.get(pane);
+      if (f?.ctx === ctx && (f.forbidden || Date.now() - f.at < 60_000)) return;
+      void loadNodeTypes(ctx, pane);
+      return;
+    }
     if (typesWalked.get(pane) === t.rows) return;
     const ni = t.columns.findIndex((c) => c.name === "Node");
     if (ni < 0) return;

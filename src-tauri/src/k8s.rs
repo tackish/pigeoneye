@@ -3738,8 +3738,15 @@ fn events_base(namespace: Option<&str>) -> String {
 /// pods' warnings out — alphabetically by namespace, so whole teams saw none.
 /// resourceVersion=0 serves the first page from the API server's watch cache
 /// rather than a quorum read out of etcd.
+///
+/// Only the first page takes the cluster's gate. A big cluster has tens of
+/// thousands of warnings (prod-kr-a: 22k, 15s of pages), and holding the
+/// gate for all of them kept the node types and every other background
+/// request waiting behind it. Once the first page is answered the credential
+/// is known good; a later page that finds it broken still latches the gate.
 async fn list_pod_warnings(
     client: &Client,
+    gate: &std::sync::Arc<CredGate>,
     base: &str,
 ) -> Result<(Vec<serde_json::Value>, String), String> {
     let fields = urlencode(POD_WARNINGS);
@@ -3755,7 +3762,14 @@ async fn list_pod_warnings(
             .header(http::header::ACCEPT, "application/json")
             .body(Vec::new())
             .map_err(err)?;
-        let mut page: serde_json::Value = client.request(req).await.map_err(err)?;
+        let get = async { client.request::<serde_json::Value>(req).await.map_err(err) };
+        let mut page = if token.is_none() {
+            in_background(gate.clone(), get).await?
+        } else {
+            let r = get.await;
+            gate.saw(&r);
+            r?
+        };
         if let Some(a) = page.get_mut("items").and_then(|a| a.as_array_mut()) {
             items.append(a);
         }
@@ -3828,7 +3842,7 @@ async fn run_pod_events_watch(
         out(serde_json::json!({ "type": "ERROR", "error": e })) && !cred
     };
     'relist: loop {
-        let (items, mut rv) = match in_background(gate.clone(), list_pod_warnings(&client, &base)).await {
+        let (items, mut rv) = match list_pod_warnings(&client, &gate, &base).await {
             Ok(x) => x,
             Err(e) => {
                 if !failed(e) {
@@ -6367,6 +6381,71 @@ mod events_feed_tests {
             }
             std::fs::write(std::env::temp_dir().join(format!("peye-live-{ctx}.json")), snap.to_string()).unwrap();
         }
+    }
+
+    /// A list server whose later pages are slow; `fail` answers that page 401.
+    async fn slow_pages(delay_ms: u64, fail: Option<usize>) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut b = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = s.read(&mut b).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&b[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let page = path.split("continue=p").nth(1).and_then(|r| r.split('&').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+                    if page > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    let (status, body) = if fail == Some(page) {
+                        ("401 Unauthorized", json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "message": "Unauthorized", "reason": "Unauthorized", "code": 401}).to_string())
+                    } else {
+                        let next = if page < 2 { format!("p{}", page + 1) } else { String::new() };
+                        let items = vec![ev(&format!("e{page}"), &format!("pod-{page}"), "Unhealthy", 1, "2026-11-09T01:00:00Z", "1")];
+                        ("200 OK", json!({"kind": "EventList", "metadata": {"resourceVersion": "100", "continue": next}, "items": items}).to_string())
+                    };
+                    let _ = s.write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The node types queued behind every page of the warning list (16s on
+    /// prod-kr-a). Only the first page holds the gate now.
+    #[tokio::test]
+    async fn later_pages_do_not_hold_the_gate() {
+        let server = slow_pages(400, None).await;
+        let client = kube::Client::try_from(kube::Config::new(server.parse().unwrap())).unwrap();
+        let gate = Arc::new(CredGate::default());
+        let t0 = std::time::Instant::now();
+        let (c, g) = (client.clone(), gate.clone());
+        let list = tokio::spawn(async move { list_pod_warnings(&c, &g, &events_base(None)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let other = in_background(gate.clone(), async { Ok::<_, String>(t0.elapsed()) }).await.unwrap();
+        let (items, _) = list.await.unwrap().unwrap();
+        assert_eq!(items.len(), 3, "every page still read");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(800), "the later pages were slow");
+        assert!(other < std::time::Duration::from_millis(300), "another background request waited {other:?}");
+    }
+
+    /// A credential that breaks on a later page still stops the rest.
+    #[tokio::test]
+    async fn a_later_page_that_finds_the_credential_broken_latches_the_gate() {
+        let server = slow_pages(10, Some(1)).await;
+        let client = kube::Client::try_from(kube::Config::new(server.parse().unwrap())).unwrap();
+        let gate = Arc::new(CredGate::default());
+        let r = list_pod_warnings(&client, &gate, &events_base(None)).await;
+        let e = r.err().expect("the 401 page fails the list");
+        assert!(is_credential_failure(&e), "{e}");
+        let next = in_background(gate.clone(), async { Ok::<_, String>(()) }).await;
+        assert!(next.is_err(), "the next background request is answered without being sent");
     }
 
     /// The bug this replaces: one page of 500 left most pods out.

@@ -149,7 +149,9 @@ for (const [i, p] of panes.entries()) {
   ok(`pane ${i}: an unscheduled pod has none`, cellsOf(p, "pod-b")?.[nt] === "", JSON.stringify(cellsOf(p, "pod-b")));
 }
 ok("each pane reads its own restart reasons", exitReads >= 2, `${exitReads} reads`);
-ok("each pane fetches its own node types", typeFetches >= 2, `${typeFetches} fetches`);
+// Same cluster in both panes: the second shows what the first read a moment
+// ago (checked per pane above) rather than asking again.
+ok("the second pane reuses the first's node types", typeFetches === 1, `${typeFetches} fetches`);
 
 // --- `l` from the sidebar, with focus on the SECOND pane ---
 key("ArrowRight", { metaKey: true }); // focus pane 2
