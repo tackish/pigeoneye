@@ -3339,7 +3339,7 @@ pub async fn list_namespaces(state: &AppState, context: String) -> Result<Vec<St
 
 /// Kubernetes quantity → millicores ("250m" → 250, "1" → 1000,
 /// "12345678n" → 12).
-fn parse_cpu(s: &str) -> i64 {
+pub(crate) fn parse_cpu(s: &str) -> i64 {
     if s.is_empty() {
         return 0;
     }
@@ -3356,7 +3356,7 @@ fn parse_cpu(s: &str) -> i64 {
 }
 
 /// Kubernetes quantity → bytes ("128Mi", "1Gi", "500M", plain bytes).
-fn parse_mem(s: &str) -> i64 {
+pub(crate) fn parse_mem(s: &str) -> i64 {
     const UNITS: [(&str, f64); 11] = [
         ("Ki", 1024.0),
         ("Mi", 1_048_576.0),
@@ -5430,6 +5430,19 @@ pub async fn pf_stop(state: &AppState, id: u32) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A pod's environment per container, resolved from its spec. Secrets are
+/// read only when `reveal` is set, so opening a pod never touches them.
+pub async fn pod_env(
+    state: &AppState,
+    context: String,
+    namespace: String,
+    name: String,
+    reveal: bool,
+) -> Result<crate::podenv::PodEnv, String> {
+    let client = client(state, &context).await?;
+    crate::podenv::load(client, &namespace, &name, reveal).await
 }
 
 /// Decode a Secret's `data` map (base64) into (key, value) pairs, sorted

@@ -1,4 +1,5 @@
 mod k8s;
+mod podenv;
 
 use k8s::{AppState, ContextInfo, ResourceDetail, ResourceTable, ResourceType};
 use tauri::ipc::Channel;
@@ -236,6 +237,17 @@ async fn get_resource(
     name: String,
 ) -> Result<ResourceDetail, String> {
     k8s::get_resource(&state, context, resource, namespace, name).await
+}
+
+#[tauri::command]
+async fn pod_env(
+    state: State<'_, AppState>,
+    context: String,
+    namespace: String,
+    name: String,
+    reveal: bool,
+) -> Result<podenv::PodEnv, String> {
+    k8s::pod_env(&state, context, namespace, name, reveal).await
 }
 
 #[tauri::command]
@@ -909,6 +921,7 @@ pub fn run() {
             rollout_history,
             rollout_undo,
             can_i,
+            pod_env,
             patch_resource,
             trigger_cronjob,
             exec_start,

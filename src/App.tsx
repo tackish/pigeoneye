@@ -122,6 +122,36 @@ interface ResourceDetail {
   yaml: string;
 }
 
+/// One variable as the pod spec defines it (see src-tauri/src/podenv.rs).
+interface EnvVar {
+  name: string;
+  /// null: a Secret not revealed, a reference that could not be read, or a
+  /// value only the node knows — `note` says which.
+  value: string | null;
+  source: "value" | "configmap" | "secret" | "field" | "resource";
+  from: string | null;
+  secret: boolean;
+  note: string | null;
+  overrides: string | null;
+}
+/// An envFrom source whose keys aren't listed (a Secret not revealed).
+interface EnvPending {
+  kind: "configmap" | "secret";
+  name: string;
+  prefix: string | null;
+  note: string | null;
+}
+interface ContainerEnv {
+  name: string;
+  init: boolean;
+  vars: EnvVar[];
+  pending: EnvPending[];
+}
+interface PodEnv {
+  containers: ContainerEnv[];
+  revealed: boolean;
+}
+
 interface TabState {
   types: ResourceType[];
   namespaces: string[];
@@ -1669,6 +1699,12 @@ function App() {
     const [detail, setDetail] = createSignal<ResourceDetail | null>(null);
     const [detailKey, setDetailKey] = createSignal<string | null>(null);
     const [detailLoading, setDetailLoading] = createSignal(false);
+    // Pod only: the env section — resolved variables, the container shown,
+    // its name filter, and whether a fetch (reveal/hide) is in flight.
+    const [podEnv, setPodEnv] = createSignal<PodEnv | null>(null);
+    const [envCtr, setEnvCtr] = createSignal<string | null>(null);
+    const [envQ, setEnvQ] = createSignal("");
+    const [envBusy, setEnvBusy] = createSignal(false);
     const [yamlText, setYamlText] = createSignal("");
     const [scrollTop, setScrollTop] = createSignal(0);
     const [viewH, setViewH] = createSignal(600);
@@ -1785,6 +1821,14 @@ function App() {
       setDetailKey,
       detailLoading,
       setDetailLoading,
+      podEnv,
+      setPodEnv,
+      envCtr,
+      setEnvCtr,
+      envQ,
+      setEnvQ,
+      envBusy,
+      setEnvBusy,
       yamlText,
       setYamlText,
       scrollTop,
@@ -3755,6 +3799,59 @@ function App() {
     }
   }
 
+  /// Pod env: read the resolved variables for the open pod. Secrets are read
+  /// only when `reveal` is set — opening a pod never touches them — and the
+  /// API server decides, with the user's own credentials, which ones that
+  /// returns; the rest come back marked forbidden.
+  const podEnv = () => P().podEnv();
+  async function loadPodEnv(reveal: boolean) {
+    const p = P();
+    const d = p.detail();
+    const ctx = p.active();
+    const key = p.detailKey();
+    if (!d || !ctx || !d.namespace) return;
+    p.setEnvBusy(true);
+    try {
+      const pe = await invoke<PodEnv>("pod_env", {
+        context: ctx,
+        namespace: d.namespace,
+        name: d.name,
+        reveal,
+      });
+      if (p.detailKey() === key) p.setPodEnv(pe);
+    } catch (e) {
+      if (p.detailKey() === key && reveal)
+        setActionErr(`could not read env: ${prettyError(String(e))}`);
+    } finally {
+      if (p.detailKey() === key) p.setEnvBusy(false);
+    }
+  }
+  /// Hide revealed values at once, then re-read without Secrets so their
+  /// values don't stay in memory behind the mask.
+  function hidePodEnv() {
+    const p = P();
+    const pe = p.podEnv();
+    if (pe)
+      p.setPodEnv({
+        revealed: false,
+        containers: pe.containers.map((c) => ({
+          ...c,
+          vars: c.vars.map((v) => (v.secret ? { ...v, value: null } : v)),
+        })),
+      });
+    void loadPodEnv(false);
+  }
+  const [copiedEnv, setCopiedEnv] = createSignal<string | null>(null);
+  async function copyEnv(id: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedEnv(id);
+      setTimeout(() => setCopiedEnv((c) => (c === id ? null : c)), 1200);
+    } catch (e) {
+      setActionErr(`could not copy: ${String(e)}`);
+    }
+  }
+
   /// Which section of the open detail panel the keyboard is on.
   const [panelSec, setPanelSec] = createSignal<string>("meta");
   const [actionIdx, setActionIdx] = createSignal(0);
@@ -3922,6 +4019,7 @@ function App() {
       ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
       ...(relatedItems().length ? ["related"] : []),
       ...(d.containers?.length ? ["containers"] : []),
+      ...(podEnv()?.containers.length ? ["env"] : []),
       "meta",
       ...(Object.keys(d.labels).length ? ["labels"] : []),
       ...(Object.keys(d.annotations).length ? ["anno"] : []),
@@ -3968,6 +4066,7 @@ function App() {
   const SECTION_BUTTONS: Record<string, string> = {
     events: ".drawer [data-sec='events'] .ev-copyall",
     yaml: ".drawer [data-sec='yaml'] .copy-btn",
+    env: ".drawer [data-sec='env'] .env-btn",
   };
   function sectionButtons(sec: string): HTMLElement[] {
     const sel = SECTION_BUTTONS[sec];
@@ -4074,6 +4173,16 @@ function App() {
   /// Enter on the focused section: open folds, enter the editor.
   /// Focus the panel's find box, wherever focus currently sits.
   function focusFind() {
+    // On the env section, `/` filters its variables instead — searching
+    // where you are, the way `/` on the table searches the rows.
+    const envBox = focusedPaneRoot().querySelector<HTMLInputElement>(
+      ".drawer .env-filter",
+    );
+    if (panelSec() === "env" && envBox) {
+      envBox.focus();
+      envBox.select();
+      return;
+    }
     setPanelSec("meta");
     requestAnimationFrame(() => {
       findInputRef?.focus();
@@ -4090,6 +4199,10 @@ function App() {
     else if (sec === "status" && statusFoldRef)
       statusFoldRef.open = !statusFoldRef.open;
     else if (sec === "yaml") void openYaml();
+    else if (sec === "env")
+      focusedPaneRoot()
+        .querySelector<HTMLInputElement>(".drawer .env-filter")
+        ?.focus();
     else if (sec === "nodepods" && npRows().length) {
       setNpIdx(0);
       moveNodePod(0); // scrolls the first row into view
@@ -6026,6 +6139,9 @@ function App() {
     setSecBtn(-1);
     setNodePods(null);
     setNodePodsErr("");
+    P().setPodEnv(null); // env starts unrevealed on every open, like secrets
+    P().setEnvCtr(null);
+    P().setEnvQ("");
     resetDrainState(); // the "drained/stalled" chip belongs to one node view
     setDetailLoading(true);
     // Events (and, for a node, its pod list) don't depend on the detail
@@ -6058,6 +6174,8 @@ function App() {
         const ctx = active();
         if (ctx && d.links.length)
           queueMicrotask(() => void pruneDeadRefs(key, ctx, d.links));
+        if (selected()?.group === "" && selected()?.kind === "Pod")
+          void loadPodEnv(false);
       }
     } catch (e) {
       const msg = String(e);
@@ -6105,6 +6223,8 @@ function App() {
       if (nd) {
         setDetail(nd);
         setYamlText(nd.yaml);
+        if (selected()?.group === "" && selected()?.kind === "Pod")
+          void loadPodEnv(podEnv()?.revealed ?? false);
       }
     } catch {
       /* object may be gone after delete */
@@ -10421,6 +10541,8 @@ function App() {
       const nodePods = () => S.nodePods();
       const nodePodsLoading = () => S.nodePodsLoading();
       const nodePodsErr = () => S.nodePodsErr();
+      const podEnv = () => S.podEnv();
+      const envBusy = () => S.envBusy();
       const colFilters = () => S.colFilters();
       const colNumFilters = () => S.colNumFilters();
       const error = () => S.error();
@@ -12540,6 +12662,187 @@ function App() {
                         </For>
                       </div>
                     </div>
+                  </Show>
+                  <Show when={podEnv()?.containers.length ? podEnv() : null}>
+                    {(pe) => {
+                      // The container shown: the one picked, else the first
+                      // app container (init containers sort first).
+                      const cur = () =>
+                        pe().containers.find((c) => c.name === S.envCtr()) ??
+                        pe().containers.find((c) => !c.init) ??
+                        pe().containers[0];
+                      const q = () => S.envQ().toLowerCase().trim();
+                      const vars = () =>
+                        cur().vars.filter(
+                          (v) => !q() || v.name.toLowerCase().includes(q()),
+                        );
+                      const hasSecret = () =>
+                        pe().containers.some(
+                          (c) =>
+                            c.vars.some((v) => v.secret) ||
+                            c.pending.some((p) => p.kind === "secret"),
+                        );
+                      const src = (v: EnvVar) =>
+                        v.source === "value"
+                          ? ""
+                          : `${v.source === "configmap" ? "cm" : v.source === "resource" ? "res" : v.source} ${v.from ?? ""}`.trim();
+                      return (
+                        <div
+                          class="psec"
+                          data-sec="env"
+                          classList={{ cur: panelSec() === "env" }}
+                        >
+                          <div class="psec-title">
+                            env ({cur().vars.length}
+                            {pe().containers.length > 1 ? ` · ${cur().name}` : ""})
+                            <Show when={panelSec() === "env"}>
+                              <span class="env-hint">
+                                <kbd class="key">/</kbd> filter
+                                <Show when={pe().containers.length > 1 || hasSecret()}>
+                                  {" · "}
+                                  <kbd class="key">→</kbd>
+                                  {pe().containers.length > 1 ? " container" : ""}
+                                  {pe().containers.length > 1 && hasSecret() ? " / " : ""}
+                                  {hasSecret() ? "reveal" : ""}
+                                </Show>
+                              </span>
+                            </Show>
+                          </div>
+                          <div class="env-tools">
+                            <Show when={pe().containers.length > 1}>
+                              <For each={pe().containers}>
+                                {(c) => (
+                                  <button
+                                    class="btn sm env-btn"
+                                    classList={{ on: cur().name === c.name }}
+                                    title={c.init ? `init container ${c.name}` : c.name}
+                                    onClick={() => S.setEnvCtr(c.name)}
+                                  >
+                                    {c.init ? `init:${c.name}` : c.name}
+                                  </button>
+                                )}
+                              </For>
+                            </Show>
+                            <input
+                              autocomplete="off"
+                              autocorrect="off"
+                              autocapitalize="off"
+                              spellcheck={false}
+                              class="search env-filter"
+                              placeholder="filter by name…  /"
+                              value={S.envQ()}
+                              onInput={(e) => S.setEnvQ(e.currentTarget.value)}
+                              onFocus={() => setPanelSec("env")}
+                              onKeyDown={(e) => {
+                                // Esc clears; Enter / ↓ keep the filter. All
+                                // three hand the keys back to the panel.
+                                if (e.key === "Escape") S.setEnvQ("");
+                                if (
+                                  e.key === "Escape" ||
+                                  e.key === "Enter" ||
+                                  e.key === "ArrowDown"
+                                ) {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  e.currentTarget.blur();
+                                }
+                              }}
+                            />
+                            <Show when={hasSecret()}>
+                              <button
+                                class="btn sm env-btn env-reveal"
+                                classList={{ on: pe().revealed }}
+                                disabled={envBusy()}
+                                title={
+                                  pe().revealed
+                                    ? "hide Secret values"
+                                    : "read the referenced Secrets with your credentials and show their values"
+                                }
+                                onClick={() =>
+                                  pe().revealed ? hidePodEnv() : void loadPodEnv(true)
+                                }
+                              >
+                                {envBusy() ? "…" : pe().revealed ? "hide" : "reveal"}
+                              </button>
+                            </Show>
+                          </div>
+                          <div class="env-list">
+                            <For each={vars()}>
+                              {(v) => {
+                                const id = () => `${cur().name}/${v.name}`;
+                                return (
+                                  <div
+                                    class="env-row"
+                                    classList={{
+                                      hl: findMatches(v.name) || findMatches(v.value ?? ""),
+                                    }}
+                                  >
+                                    <span class="env-key" title={v.name}>
+                                      {v.name}
+                                    </span>
+                                    <span
+                                      class="env-val"
+                                      classList={{ dim: v.value == null || v.value === "" }}
+                                      title={v.note ?? undefined}
+                                    >
+                                      {v.value != null
+                                        ? v.value === ""
+                                          ? '""'
+                                          : v.value
+                                        : v.note && !(v.secret && !pe().revealed)
+                                          ? v.note
+                                          : "••••••••"}
+                                    </span>
+                                    <span
+                                      class="env-src"
+                                      classList={{ secret: v.secret }}
+                                      title={[
+                                        src(v),
+                                        v.overrides ? `overrides ${v.overrides}` : "",
+                                      ]
+                                        .filter(Boolean)
+                                        .join(" — ")}
+                                    >
+                                      {src(v)}
+                                      {v.overrides ? " ↺" : ""}
+                                    </span>
+                                    <button
+                                      class="btn sm"
+                                      title="copy NAME=value"
+                                      disabled={v.value == null}
+                                      onClick={() => void copyEnv(id(), `${v.name}=${v.value}`)}
+                                    >
+                                      {copiedEnv() === id() ? "✓" : "copy"}
+                                    </button>
+                                  </div>
+                                );
+                              }}
+                            </For>
+                            <For each={q() ? [] : cur().pending}>
+                              {(p) => (
+                                <div class="env-row">
+                                  <span class="env-key">{`${p.prefix ?? ""}*`}</span>
+                                  <span class="env-val dim">
+                                    {p.note ??
+                                      `every key of Secret ${p.name} — reveal to list`}
+                                  </span>
+                                  <span class="env-src" classList={{ secret: p.kind === "secret" }}>
+                                    {`${p.kind === "configmap" ? "cm" : p.kind} ${p.name}`}
+                                  </span>
+                                </div>
+                              )}
+                            </For>
+                            <Show when={!cur().vars.length && !cur().pending.length}>
+                              <div class="dim env-empty">no env set in the spec</div>
+                            </Show>
+                          </div>
+                          <div class="env-foot dim">
+                            from the pod spec — the image's own ENV and
+                            Kubernetes service variables are not listed
+                          </div>
+                        </div>
+                      );
+                    }}
                   </Show>
                   <div class="psec" data-sec="meta" classList={{ cur: panelSec() === "meta" }}>
                   <div class="meta-grid">

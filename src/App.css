@@ -4469,6 +4469,92 @@ details.fold[open] > summary::before {
   color: var(--fg);
 }
 
+/* Pod env: one row per variable — name, value, where it came from, copy. */
+.env-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.env-tools .btn.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+/* Reveal reads Secrets, so it looks unlike the container chips beside it;
+   once revealed it fills in, so a panel showing secrets reads as one. */
+.env-tools .btn.env-reveal {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.env-tools .btn.env-reveal.on {
+  background: color-mix(in srgb, var(--warn) 24%, transparent);
+  border-color: var(--warn);
+}
+.env-hint {
+  margin-left: 8px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.search.env-filter {
+  margin: 0;
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 3px 8px;
+  font-size: 11.5px;
+}
+.env-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 50vh;
+  overflow: auto;
+}
+.env-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.env-key {
+  color: var(--key);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  flex: 0 0 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.env-val {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.env-src {
+  flex: 0 1 auto;
+  max-width: 30%;
+  color: var(--dim);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.env-src.secret {
+  color: var(--warn);
+}
+.env-empty {
+  padding: 4px 0;
+  font-size: 12px;
+}
+.env-foot {
+  margin-top: 4px;
+  font-size: 10.5px;
+}
+
 .node-shell-info {
   margin-top: 12px;
   padding: 10px 12px;
