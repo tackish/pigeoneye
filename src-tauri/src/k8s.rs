@@ -1290,7 +1290,7 @@ fn basic_blob(row: &TableRow) -> String {
 }
 
 fn rough_age(created: Option<&str>) -> String {
-    let Some(ts) = created.and_then(|c| chrono_parse(c)) else {
+    let Some(ts) = created.and_then(chrono_parse) else {
         return "-".into();
     };
     let now = std::time::SystemTime::now()
@@ -2276,6 +2276,7 @@ pub async fn list_resources(
 /// The events come back in the same Table projection the list used, so
 /// a changed row arrives already printed with the server's columns —
 /// no second rendering path, and no re-listing on every change.
+#[allow(clippy::too_many_arguments)] // one argument per field the UI sends
 pub async fn watch_start(
     state: &AppState,
     context: String,
@@ -2405,6 +2406,10 @@ pub async fn watch_stop(state: &AppState, id: u32) -> Result<(), String> {
 }
 
 
+/// One indexed object: its `namespace/name` key, its search blob and, for
+/// a pod, its resources and extras.
+type IndexedRow = (String, String, Option<(PodRes, PodExtra)>);
+
 /// Fetch full objects and upgrade the row blobs to a full-text index
 /// (and, for pods, harvest requests/limits).
 async fn build_index(
@@ -2450,8 +2455,7 @@ async fn build_index(
         for part in rows_json.chunks(chunk) {
             let part: Vec<serde_json::Value> = part.to_vec();
             tasks.push(tokio::task::spawn_blocking(move || {
-                let mut out: Vec<(String, String, Option<(PodRes, PodExtra)>)> =
-                    Vec::with_capacity(part.len());
+                let mut out: Vec<IndexedRow> = Vec::with_capacity(part.len());
                 for r in &part {
                     let obj = &r["object"];
                     let key = format!(
@@ -2597,8 +2601,8 @@ pub async fn filter_rows(state: &AppState, query: String) -> Result<Vec<String>,
                 let end = ((w + 1) * chunk).min(n);
                 scope.spawn(move || {
                     let mut local = Vec::new();
-                    for i in start..end {
-                        if terms.iter().all(|t| blobs[i].contains(t.as_str())) {
+                    for (i, blob) in blobs.iter().enumerate().take(end).skip(start) {
+                        if terms.iter().all(|t| blob.contains(t.as_str())) {
                             if let Some(k) = keys.get(i) {
                                 local.push(k.clone());
                             }
@@ -3173,6 +3177,7 @@ fn scan_refs(
 /// the user makes after seeing the conflict, not a side effect of
 /// saving. `resource_version` is sent as a precondition so an editor
 /// left open cannot overwrite a newer change.
+#[allow(clippy::too_many_arguments)] // one argument per field the UI sends
 pub async fn apply_resource(
     state: &AppState,
     context: String,
@@ -4698,7 +4703,7 @@ pub async fn rollout_history(
             })
         })
         .collect();
-    out.sort_by(|a, b| b.revision.cmp(&a.revision));
+    out.sort_by_key(|r| std::cmp::Reverse(r.revision));
     Ok(out)
 }
 
@@ -4883,6 +4888,7 @@ pub async fn trigger_cronjob(
 
 /// Wire an attached TTY to the webview: stdout bytes stream out over a
 /// Tauri channel, stdin/resize come back in via exec_stdin/exec_resize.
+#[allow(clippy::too_many_arguments)] // one argument per field the UI sends
 async fn start_exec_session(
     state: &AppState,
     client: Client,
@@ -5531,6 +5537,7 @@ fn dns_label(s: &str) -> String {
 /// pinned to the node, then nsenter into the host's namespaces. The
 /// helper pod is deleted when the session closes. Image, namespace and
 /// resource limits are user-configurable.
+#[allow(clippy::too_many_arguments)] // one argument per field the UI sends
 pub async fn node_shell_start(
     state: &AppState,
     context: String,
@@ -5716,6 +5723,7 @@ pub async fn exec_stop(state: &AppState, id: u32) -> Result<(), String> {
 ///   - kubectl paths start with `.`; JSONPath wants a `$` root.
 ///   - kubectl filters read `[?(@.type=="Ready")]`; RFC 9535 has no
 ///     inner parens: `[?@.type=="Ready"]`.
+///
 /// Bracket-quoted keys (`['node.kubernetes.io/instance-type']`) already
 /// match, so dotted label keys work when written that way.
 fn parse_kubectl_path(p: &str) -> Result<serde_json_path::JsonPath, String> {
@@ -6455,7 +6463,7 @@ mod events_feed_tests {
         let client = kube::Client::try_from(kube::Config::new(server.parse().unwrap())).unwrap();
         let gate = Arc::new(CredGate::default());
         let r = list_pod_warnings(&client, &gate, &events_base(None)).await;
-        let e = r.err().expect("the 401 page fails the list");
+        let e = r.expect_err("the 401 page fails the list");
         assert!(is_credential_failure(&e), "{e}");
         let next = in_background(gate.clone(), async { Ok::<_, String>(()) }).await;
         assert!(next.is_err(), "the next background request is answered without being sent");

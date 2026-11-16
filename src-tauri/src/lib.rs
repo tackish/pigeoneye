@@ -251,6 +251,7 @@ async fn pod_env(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // one argument per field the UI sends
 async fn apply_resource(
     state: State<'_, AppState>,
     context: String,
