@@ -1573,6 +1573,28 @@ function App() {
   const [theme, setTheme] = createSignal<"dark" | "light">(
     (localStorage.getItem("pigeoneye.theme") as "dark" | "light") ?? "dark",
   );
+  // The pod panel's env section: whether it is open, and whether it shows
+  // the Source column. Both are one choice for every pod, container and
+  // pane, kept across launches — someone comparing env from pod to pod
+  // should not have to set them again each time.
+  const [envOpen, setEnvOpenRaw] = createSignal(
+    localStorage.getItem("pigeoneye.envopen") === "1",
+  );
+  const setEnvOpen = (v: boolean) => {
+    setEnvOpenRaw(v);
+    localStorage.setItem("pigeoneye.envopen", v ? "1" : "0");
+  };
+  // Source is off unless asked for: where a value came from matters when
+  // tracing one, and otherwise only takes width from the names. The name's
+  // tooltip carries it either way.
+  const [envSrc, setEnvSrcRaw] = createSignal(
+    localStorage.getItem("pigeoneye.envsrc") === "1",
+  );
+  const setEnvSrc = (v: boolean) => {
+    setEnvSrcRaw(v);
+    localStorage.setItem("pigeoneye.envsrc", v ? "1" : "0");
+  };
+
   // Browser-style UI zoom (⌘/Ctrl +/−, ⌘/Ctrl 0 resets). Native webview
   // zoom scales everything — including popover positions — cleanly, and
   // the factor is restored on launch.
@@ -3826,6 +3848,16 @@ function App() {
       if (p.detailKey() === key) p.setEnvBusy(false);
     }
   }
+  /// Read the open pod's env once its section is open — on opening it, or on
+  /// opening a pod while it is open. Nobody who keeps it folded pays for it.
+  createEffect(() => {
+    if (!envOpen()) return;
+    const p = P();
+    const d = p.detail();
+    if (!d || p.podEnv() || untrack(p.envBusy)) return;
+    if (!(selected()?.group === "" && selected()?.kind === "Pod")) return;
+    untrack(() => void loadPodEnv(false));
+  });
   /// Hide revealed values at once, then re-read without Secrets so their
   /// values don't stay in memory behind the mask.
   function hidePodEnv() {
@@ -4016,15 +4048,18 @@ function App() {
       // row reaches it, matching where it is on screen.
       "share",
       "actions",
-      ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
-      ...(relatedItems().length ? ["related"] : []),
-      ...(d.containers?.length ? ["containers"] : []),
-      ...(podEnv()?.containers.length ? ["env"] : []),
+      // Then what you opened the panel for, most diagnostic first: what is
+      // happening to it, where it is, the ways into it, and the reference
+      // detail (env, labels, status) last.
+      ...(events().length ? ["events"] : []),
       "meta",
+      ...(isNodeKind && (nodePods()?.rows.length ?? 0) > 0 ? ["nodepods"] : []),
+      ...(d.containers?.length ? ["containers"] : []),
+      ...(relatedItems().length ? ["related"] : []),
+      ...(selected()?.group === "" && selected()?.kind === "Pod" ? ["env"] : []),
       ...(Object.keys(d.labels).length ? ["labels"] : []),
       ...(Object.keys(d.annotations).length ? ["anno"] : []),
       ...(d.status != null ? ["status"] : []),
-      ...(events().length ? ["events"] : []),
       "yaml",
       ...(canEdit() ? ["apply"] : []),
     ];
@@ -4071,6 +4106,9 @@ function App() {
   function sectionButtons(sec: string): HTMLElement[] {
     const sel = SECTION_BUTTONS[sec];
     if (!sel) return [];
+    // A folded env hides its buttons; → must not land on one you can't see.
+    if (sec === "env" && !focusedPaneRoot().querySelector(".drawer [data-sec='env'] details[open]"))
+      return [];
     return [...focusedPaneRoot().querySelectorAll<HTMLElement>(`${sel}:not(:disabled)`)];
   }
   function paintSecBtn(sec: string, idx: number) {
@@ -4178,9 +4216,17 @@ function App() {
     const envBox = focusedPaneRoot().querySelector<HTMLInputElement>(
       ".drawer .env-filter",
     );
+    if (panelSec() === "env" && !envBox) {
+      setEnvOpen(true); // not read yet: opening it reads it
+      return;
+    }
     if (panelSec() === "env" && envBox) {
-      envBox.focus();
-      envBox.select();
+      // Folded, the box is hidden: open the section first.
+      if (!envOpen()) setEnvOpen(true);
+      requestAnimationFrame(() => {
+        envBox.focus();
+        envBox.select();
+      });
       return;
     }
     setPanelSec("meta");
@@ -4199,10 +4245,7 @@ function App() {
     else if (sec === "status" && statusFoldRef)
       statusFoldRef.open = !statusFoldRef.open;
     else if (sec === "yaml") void openYaml();
-    else if (sec === "env")
-      focusedPaneRoot()
-        .querySelector<HTMLInputElement>(".drawer .env-filter")
-        ?.focus();
+    else if (sec === "env") setEnvOpen(!envOpen());
     else if (sec === "nodepods" && npRows().length) {
       setNpIdx(0);
       moveNodePod(0); // scrolls the first row into view
@@ -6174,8 +6217,8 @@ function App() {
         const ctx = active();
         if (ctx && d.links.length)
           queueMicrotask(() => void pruneDeadRefs(key, ctx, d.links));
-        if (selected()?.group === "" && selected()?.kind === "Pod")
-          void loadPodEnv(false);
+        // Env is read when its section is open (the effect by loadPodEnv),
+        // not on every pod opened: it costs a ConfigMap read per reference.
       }
     } catch (e) {
       const msg = String(e);
@@ -6223,8 +6266,8 @@ function App() {
       if (nd) {
         setDetail(nd);
         setYamlText(nd.yaml);
-        if (selected()?.group === "" && selected()?.kind === "Pod")
-          void loadPodEnv(podEnv()?.revealed ?? false);
+        if (selected()?.group === "" && selected()?.kind === "Pod" && podEnv())
+          void loadPodEnv(podEnv()!.revealed);
       }
     } catch {
       /* object may be gone after delete */
@@ -12463,6 +12506,133 @@ function App() {
                       }
                     }}
                   />
+                  <Show when={events().length > 0}>
+                    <div
+                      class="psec"
+                      data-sec="events"
+                      classList={{ cur: panelSec() === "events" }}
+                    >
+                      {/* Events start open every time — they're usually why
+                          the panel was opened. `true` is a constant (no
+                          reactive dep), so it only sets the initial state;
+                          the user can still collapse it with v / Enter / click. */}
+                      <details
+                        class="fold"
+                        ref={regEl("event")}
+                        open={true}
+                      >
+                        <summary class="section-title">
+                          Events ({events().length})
+                          <Show when={events().some((e) => e.type_ === "Warning")}>
+                            <span class="ev-warnbadge">
+                              {events().filter((e) => e.type_ === "Warning").length}{" "}
+                              warning
+                            </span>
+                          </Show>
+                          <button
+                            class="btn sm copy-btn ev-copyall"
+                            title="copy every event to the clipboard"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              void copyAllEvents();
+                            }}
+                          >
+                            {copiedAll() ? "copied ✓" : "copy all"}
+                          </button>
+                        </summary>
+                        <div class="ev-list">
+                          <For each={events()}>
+                            {(ev) => (
+                              <div
+                                class="ev"
+                                classList={{
+                                  warn: ev.type_ === "Warning",
+                                  hl: findMatches(`${ev.reason} ${ev.message}`),
+                                }}
+                              >
+                                <div class="ev-head">
+                                  <span class="ev-reason">{ev.reason}</span>
+                                  <span
+                                    class="dim"
+                                    title={
+                                      ev.count > 1
+                                        ? `seen ${ev.count} times, last ${age(ev.last)} ago`
+                                        : undefined
+                                    }
+                                  >
+                                    {age(ev.last)}
+                                    {ev.count > 1 ? ` · ${ev.count} times` : ""}
+                                    {ev.source ? ` · ${ev.source}` : ""}
+                                  </span>
+                                  <button
+                                    class="ev-copy"
+                                    title="copy this event"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void copyEvent(ev);
+                                    }}
+                                  >
+                                    {copiedEv() === ev ? "✓" : "copy"}
+                                  </button>
+                                </div>
+                                <div class="ev-msg">{ev.message}</div>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </details>
+                    </div>
+                  </Show>
+
+                  <div class="psec" data-sec="meta" classList={{ cur: panelSec() === "meta" }}>
+                  <div class="meta-grid">
+                    <Show when={detail()!.namespace}>
+                      <span class="meta-key">namespace</span>
+                      <span class="meta-val">{detail()!.namespace}</span>
+                    </Show>
+                    <span class="meta-key">age</span>
+                    <span class="meta-val">
+                      {age(detail()!.created)}
+                      <span class="dim"> · {detail()!.created}</span>
+                    </span>
+                  </div>
+                  </div>
+
+                  <Show when={(detail()!.secret_data?.length ?? 0) > 0}>
+                    <div class="psec">
+                      <div class="section-title">
+                        Data
+                        <button
+                          class="btn sm"
+                          onClick={() => setSecretShown(!secretShown())}
+                        >
+                          {secretShown() ? "hide" : "reveal"}
+                        </button>
+                        <span class="dim"> — base64-decoded</span>
+                      </div>
+                      <div class="secret-data">
+                        <For each={detail()!.secret_data}>
+                          {([k, v]) => (
+                            <div class="secret-row">
+                              <span class="secret-key">{k}</span>
+                              <span class="secret-val">
+                                {secretShown() ? v : "•".repeat(Math.min(v.length, 24))}
+                              </span>
+                              <button
+                                class="btn sm"
+                                title="copy the decoded value"
+                                onClick={() => void copySecret(k, v)}
+                              >
+                                {copiedSecret() === k ? "copied ✓" : "copy"}
+                              </button>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
+
                   <Show when={isNode()}>
                     <div
                       class="psec"
@@ -12602,31 +12772,7 @@ function App() {
                       </Show>
                     </div>
                   </Show>
-                  <Show when={relatedItems().length}>
-                    <div
-                      class="psec"
-                      data-sec="related"
-                      classList={{ cur: panelSec() === "related" }}
-                    >
-                      <div class="psec-title">
-                        related
-                        <span class="dim"> ({relatedItems().length})</span>
-                      </div>
-                      <div class="rel-list">
-                        <For each={relatedItems()}>
-                          {(r) => (
-                            <button class="rel-row" onClick={() => r.run()}>
-                              <span class="rel-kind">{r.kind}</span>
-                              <span class="rel-name" title={r.name ?? r.note}>
-                                {r.name ?? r.note ?? ""}
-                              </span>
-                              <span class="rel-arrow">→</span>
-                            </button>
-                          )}
-                        </For>
-                      </div>
-                    </div>
-                  </Show>
+
                   <Show when={detail()!.containers?.length}>
                     <div
                       class="psec"
@@ -12663,6 +12809,64 @@ function App() {
                       </div>
                     </div>
                   </Show>
+
+                  <Show when={relatedItems().length}>
+                    <div
+                      class="psec"
+                      data-sec="related"
+                      classList={{ cur: panelSec() === "related" }}
+                    >
+                      <div class="psec-title">
+                        related
+                        <span class="dim"> ({relatedItems().length})</span>
+                      </div>
+                      <div class="rel-list">
+                        <For each={relatedItems()}>
+                          {(r) => (
+                            <button class="rel-row" onClick={() => r.run()}>
+                              <span class="rel-kind">{r.kind}</span>
+                              <span class="rel-name" title={r.name ?? r.note}>
+                                {r.name ?? r.note ?? ""}
+                              </span>
+                              <span class="rel-arrow">→</span>
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  </Show>
+
+                  <Show
+                    when={
+                      selected()?.group === "" &&
+                      selected()?.kind === "Pod" &&
+                      !podEnv()?.containers.length
+                    }
+                  >
+                    <div
+                      class="psec"
+                      data-sec="env"
+                      classList={{ cur: panelSec() === "env" }}
+                    >
+                      <details
+                        class="fold"
+                        open={envOpen()}
+                        onToggle={(e) => {
+                          if (e.currentTarget.open !== envOpen())
+                            setEnvOpen(e.currentTarget.open);
+                        }}
+                      >
+                        <summary class="section-title">Env</summary>
+                        <div class="dim env-empty">
+                          {envBusy()
+                            ? "reading…"
+                            : podEnv()
+                              ? "no env set in the spec"
+                              : "could not read env"}
+                        </div>
+                      </details>
+                    </div>
+                  </Show>
                   <Show when={podEnv()?.containers.length ? podEnv() : null}>
                     {(pe) => {
                       // The container shown: the one picked, else the first
@@ -12682,6 +12886,13 @@ function App() {
                             c.vars.some((v) => v.secret) ||
                             c.pending.some((p) => p.kind === "secret"),
                         );
+                      const keyChars = () =>
+                        Math.max(8, ...cur().vars.map((v) => v.name.length)) + 1;
+                      const findHitsEnv = () =>
+                        !!findQ().trim() &&
+                        pe().containers.some((c) =>
+                          c.vars.some((v) => findMatches(v.name) || findMatches(v.value ?? "")),
+                        );
                       const src = (v: EnvVar) =>
                         v.source === "value"
                           ? ""
@@ -12692,22 +12903,34 @@ function App() {
                           data-sec="env"
                           classList={{ cur: panelSec() === "env" }}
                         >
-                          <div class="psec-title">
-                            env ({cur().vars.length}
+                          {/* Folded by default: it is reference detail, and a
+                              long env pushed everything below it off screen.
+                              Opened once, it stays open from pod to pod — and
+                              a find that hits a variable opens it too. */}
+                          <details
+                            class="fold"
+                            open={envOpen() || findHitsEnv()}
+                            onToggle={(e) => {
+                              if (e.currentTarget.open !== envOpen() && !findHitsEnv())
+                                setEnvOpen(e.currentTarget.open);
+                            }}
+                          >
+                          <summary class="section-title">
+                            Env ({cur().vars.length}
                             {pe().containers.length > 1 ? ` · ${cur().name}` : ""})
-                            <Show when={panelSec() === "env"}>
+                            <Show when={panelSec() === "env" && (envOpen() || findHitsEnv())}>
                               <span class="env-hint">
-                                <kbd class="key">/</kbd> filter
-                                <Show when={pe().containers.length > 1 || hasSecret()}>
-                                  {" · "}
-                                  <kbd class="key">→</kbd>
-                                  {pe().containers.length > 1 ? " container" : ""}
-                                  {pe().containers.length > 1 && hasSecret() ? " / " : ""}
-                                  {hasSecret() ? "reveal" : ""}
-                                </Show>
+                                <kbd class="key">/</kbd> filter · <kbd class="key">→</kbd>{" "}
+                                {[
+                                  pe().containers.length > 1 ? "container" : "",
+                                  hasSecret() ? "reveal" : "",
+                                  "source",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" / ")}
                               </span>
                             </Show>
-                          </div>
+                          </summary>
                           <div class="env-tools">
                             <Show when={pe().containers.length > 1}>
                               <For each={pe().containers}>
@@ -12765,8 +12988,33 @@ function App() {
                                 {envBusy() ? "…" : pe().revealed ? "hide" : "reveal"}
                               </button>
                             </Show>
+                            <button
+                              class="btn sm env-btn env-srcbtn"
+                              classList={{ on: envSrc() }}
+                              title={
+                                envSrc()
+                                  ? "hide the Source column to give names more room"
+                                  : "show where each value comes from"
+                              }
+                              onClick={() => setEnvSrc(!envSrc())}
+                            >
+                              source
+                            </button>
                           </div>
-                          <div class="env-list">
+                          <div
+                            class="env-list"
+                            classList={{ "no-src": !envSrc() }}
+                            style={
+                              envSrc()
+                                ? undefined
+                                : {
+                                    // Names get what the longest one needs
+                                    // (the font is monospace, so ch is
+                                    // exact), up to 60%; values get the rest.
+                                    "--env-key-w": `min(${keyChars()}ch, 60%)`,
+                                  }
+                            }
+                          >
                             <For each={vars()}>
                               {(v) => {
                                 const id = () => `${cur().name}/${v.name}`;
@@ -12777,7 +13025,14 @@ function App() {
                                       hl: findMatches(v.name) || findMatches(v.value ?? ""),
                                     }}
                                   >
-                                    <span class="env-key" title={v.name}>
+                                    <span
+                                      class="env-key"
+                                      title={
+                                        envSrc() || !src(v)
+                                          ? v.name
+                                          : `${v.name}\n${src(v)}${v.overrides ? ` — overrides ${v.overrides}` : ""}`
+                                      }
+                                    >
                                       {v.name}
                                     </span>
                                     <span
@@ -12793,6 +13048,7 @@ function App() {
                                           ? v.note
                                           : "••••••••"}
                                     </span>
+                                    <Show when={envSrc()}>
                                     <span
                                       class="env-src"
                                       classList={{ secret: v.secret }}
@@ -12806,6 +13062,7 @@ function App() {
                                       {src(v)}
                                       {v.overrides ? " ↺" : ""}
                                     </span>
+                                    </Show>
                                     <button
                                       class="btn sm"
                                       title="copy NAME=value"
@@ -12826,9 +13083,11 @@ function App() {
                                     {p.note ??
                                       `every key of Secret ${p.name} — reveal to list`}
                                   </span>
-                                  <span class="env-src" classList={{ secret: p.kind === "secret" }}>
-                                    {`${p.kind === "configmap" ? "cm" : p.kind} ${p.name}`}
-                                  </span>
+                                  <Show when={envSrc()}>
+                                    <span class="env-src" classList={{ secret: p.kind === "secret" }}>
+                                      {`${p.kind === "configmap" ? "cm" : p.kind} ${p.name}`}
+                                    </span>
+                                  </Show>
                                 </div>
                               )}
                             </For>
@@ -12840,56 +13099,10 @@ function App() {
                             from the pod spec — the image's own ENV and
                             Kubernetes service variables are not listed
                           </div>
+                          </details>
                         </div>
                       );
                     }}
-                  </Show>
-                  <div class="psec" data-sec="meta" classList={{ cur: panelSec() === "meta" }}>
-                  <div class="meta-grid">
-                    <Show when={detail()!.namespace}>
-                      <span class="meta-key">namespace</span>
-                      <span class="meta-val">{detail()!.namespace}</span>
-                    </Show>
-                    <span class="meta-key">age</span>
-                    <span class="meta-val">
-                      {age(detail()!.created)}
-                      <span class="dim"> · {detail()!.created}</span>
-                    </span>
-                  </div>
-                  </div>
-
-                  <Show when={(detail()!.secret_data?.length ?? 0) > 0}>
-                    <div class="psec">
-                      <div class="section-title">
-                        Data
-                        <button
-                          class="btn sm"
-                          onClick={() => setSecretShown(!secretShown())}
-                        >
-                          {secretShown() ? "hide" : "reveal"}
-                        </button>
-                        <span class="dim"> — base64-decoded</span>
-                      </div>
-                      <div class="secret-data">
-                        <For each={detail()!.secret_data}>
-                          {([k, v]) => (
-                            <div class="secret-row">
-                              <span class="secret-key">{k}</span>
-                              <span class="secret-val">
-                                {secretShown() ? v : "•".repeat(Math.min(v.length, 24))}
-                              </span>
-                              <button
-                                class="btn sm"
-                                title="copy the decoded value"
-                                onClick={() => void copySecret(k, v)}
-                              >
-                                {copiedSecret() === k ? "copied ✓" : "copy"}
-                              </button>
-                            </div>
-                          )}
-                        </For>
-                      </div>
-                    </div>
                   </Show>
 
                   <Show when={Object.keys(detail()!.labels).length > 0}>
@@ -12956,85 +13169,6 @@ function App() {
                       </summary>
                       <StatusView value={detail()!.status} />
                     </details>
-                    </div>
-                  </Show>
-
-                  <Show when={events().length > 0}>
-                    <div
-                      class="psec"
-                      data-sec="events"
-                      classList={{ cur: panelSec() === "events" }}
-                    >
-                      {/* Events start open every time — they're usually why
-                          the panel was opened. `true` is a constant (no
-                          reactive dep), so it only sets the initial state;
-                          the user can still collapse it with v / Enter / click. */}
-                      <details
-                        class="fold"
-                        ref={regEl("event")}
-                        open={true}
-                      >
-                        <summary class="section-title">
-                          Events ({events().length})
-                          <Show when={events().some((e) => e.type_ === "Warning")}>
-                            <span class="ev-warnbadge">
-                              {events().filter((e) => e.type_ === "Warning").length}{" "}
-                              warning
-                            </span>
-                          </Show>
-                          <button
-                            class="btn sm copy-btn ev-copyall"
-                            title="copy every event to the clipboard"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              void copyAllEvents();
-                            }}
-                          >
-                            {copiedAll() ? "copied ✓" : "copy all"}
-                          </button>
-                        </summary>
-                        <div class="ev-list">
-                          <For each={events()}>
-                            {(ev) => (
-                              <div
-                                class="ev"
-                                classList={{
-                                  warn: ev.type_ === "Warning",
-                                  hl: findMatches(`${ev.reason} ${ev.message}`),
-                                }}
-                              >
-                                <div class="ev-head">
-                                  <span class="ev-reason">{ev.reason}</span>
-                                  <span
-                                    class="dim"
-                                    title={
-                                      ev.count > 1
-                                        ? `seen ${ev.count} times, last ${age(ev.last)} ago`
-                                        : undefined
-                                    }
-                                  >
-                                    {age(ev.last)}
-                                    {ev.count > 1 ? ` · ${ev.count} times` : ""}
-                                    {ev.source ? ` · ${ev.source}` : ""}
-                                  </span>
-                                  <button
-                                    class="ev-copy"
-                                    title="copy this event"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      void copyEvent(ev);
-                                    }}
-                                  >
-                                    {copiedEv() === ev ? "✓" : "copy"}
-                                  </button>
-                                </div>
-                                <div class="ev-msg">{ev.message}</div>
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                      </details>
                     </div>
                   </Show>
 

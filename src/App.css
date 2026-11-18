@@ -3819,6 +3819,47 @@ kbd.key {
 .st-val {
   font-family: var(--font-ui);
   word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Copy sits after the value, out of the way until the row is hovered. */
+.st-copy {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: none;
+  color: var(--dim);
+  font-size: 10px;
+  cursor: pointer;
+  user-select: none;
+  visibility: hidden;
+}
+.st-val:hover .st-copy {
+  visibility: visible;
+}
+.st-copy:hover {
+  color: var(--fg);
+}
+.st-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0 6px;
+  border-bottom: 1px solid var(--border);
+}
+.st-card:last-child {
+  border-bottom: none;
+}
+.st-card-title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--key);
+}
+.st-card .st-grid {
+  padding-left: 8px;
+}
+.st-card .st-sub {
+  padding-left: 8px;
 }
 
 .st-group {
@@ -3859,6 +3900,12 @@ kbd.key {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.st-table td.st-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: none;
 }
 
 .st-table td.good {
@@ -4528,7 +4575,9 @@ details.fold[open] > summary::before {
   color: var(--key);
   font-family: var(--font-mono);
   font-size: 12px;
-  flex: 0 0 34%;
+  /* 34% beside the Source column; with it hidden, what the longest name
+     needs (set on the list as --env-key-w), up to 60%. */
+  flex: 0 0 var(--env-key-w, 34%);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4549,6 +4598,9 @@ details.fold[open] > summary::before {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.env-tools .btn.env-srcbtn:not(.on) {
+  color: var(--dim);
 }
 .env-src.secret {
   color: var(--warn);

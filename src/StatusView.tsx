@@ -1,4 +1,4 @@
-import { For, Show, createMemo, type JSX } from "solid-js";
+import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
 
 /// Render a resource's `status` the way an operator reads it — not as
 /// a JSON tree. Conditions become a table, quantities a key/value
@@ -25,13 +25,45 @@ function label(k: string): string {
   // camelCase → "camel case", so keys read like prose
   return k
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/^./, (c) => c.toUpperCase());
+    .replace(/^./, (c) => c.toUpperCase())
+    .replace(/\b(Ip|Id)\b/g, (w) => w.toUpperCase()); // "ip" alone reads "IP"
 }
 
 function fmt(v: unknown): string {
   if (v === null || v === undefined) return "-";
   if (typeof v === "boolean") return v ? "true" : "false";
   return String(v);
+}
+
+const isTimeKey = (k: string) => /^(.*Time|.*Timestamp|startedAt|finishedAt)$/.test(k);
+
+/// A value shown in full — wrapped, never cut — with a copy button on hover.
+/// The full text is what gets copied, not the relative age shown beside it.
+function Val(props: { k: string; v: unknown }) {
+  const [done, setDone] = createSignal(false);
+  const text = () => fmt(props.v);
+  const shown = () =>
+    isTimeKey(props.k) && relAge(props.v) ? `${relAge(props.v)} ago · ${text()}` : text();
+  const copy = async (e: MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text());
+      setDone(true);
+      setTimeout(() => setDone(false), 1200);
+    } catch {
+      /* clipboard refused: nothing to do */
+    }
+  };
+  return (
+    <span class="st-val">
+      {shown()}
+      <Show when={props.v !== null && props.v !== undefined && text() !== ""}>
+        <button class="st-copy" title="copy" onClick={copy}>
+          {done() ? "✓" : "copy"}
+        </button>
+      </Show>
+    </span>
+  );
 }
 
 /// True/False/Unknown → the same colours the tables use.
@@ -64,7 +96,7 @@ function Conditions(props: { rows: Record<string, unknown>[] }) {
               <td class={condClass(c.status, String(c.type ?? ""))}>
                 {fmt(c.status)}
               </td>
-              <td title={fmt(c.message)}>
+              <td class="st-wrap">
                 {fmt(c.reason ?? "")}
                 <Show when={c.message}>
                   <span class="st-msg"> — {fmt(c.message)}</span>
@@ -81,7 +113,81 @@ function Conditions(props: { rows: Record<string, unknown>[] }) {
   );
 }
 
-/// A list of same-shaped objects (container statuses, addresses…)
+/// The key that names an object in a list, if it has one.
+const TITLE_KEYS = ["name", "type"];
+
+/// A list of same-shaped objects (container statuses, addresses, IPs…).
+/// A short list reads one card per object, every value whole and copyable —
+/// a table in a panel this narrow cut image and container IDs to "ghcr.io/…".
+/// A one-field list (host IPs) is a single line; a long one (a node's
+/// images) stays a table, or the panel would be all cards.
+function ObjectList(props: { rows: Record<string, unknown>[] }) {
+  const keys = createMemo(() => {
+    const seen: string[] = [];
+    for (const r of props.rows) for (const k of Object.keys(r)) if (!seen.includes(k)) seen.push(k);
+    return seen;
+  });
+  const single = createMemo(() => {
+    const k = keys();
+    return k.length === 1 && props.rows.every((r) => isScalar(r[k[0]])) ? k[0] : null;
+  });
+  return (
+    <Show
+      when={single() === null}
+      fallback={
+        <div class="st-grid">
+          <For each={props.rows}>
+            {(r) => (
+              <>
+                <span class="st-key">{label(single()!)}</span>
+                <Val k={single()!} v={r[single()!]} />
+              </>
+            )}
+          </For>
+        </div>
+      }
+    >
+      <Show when={props.rows.length <= 12} fallback={<ObjectTable rows={props.rows} />}>
+        <For each={props.rows}>
+          {(r) => {
+            const titleKey = TITLE_KEYS.find((k) => isScalar(r[k]) && r[k] !== "");
+            const scalars = Object.entries(r).filter(([k, v]) => k !== titleKey && isScalar(v));
+            const nested = Object.entries(r).filter(([, v]) => !isScalar(v));
+            return (
+              <div class="st-card">
+                <Show when={titleKey}>
+                  <div class="st-card-title">{fmt(r[titleKey!])}</div>
+                </Show>
+                <Show when={scalars.length}>
+                  <div class="st-grid">
+                    <For each={scalars}>
+                      {([k, v]) => (
+                        <>
+                          <span class="st-key">{label(k)}</span>
+                          <Val k={k} v={v} />
+                        </>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                <For each={nested}>
+                  {([k, v]) => (
+                    <details class="st-sub">
+                      <summary>{label(k)}</summary>
+                      <StatusView value={v} />
+                    </details>
+                  )}
+                </For>
+              </div>
+            );
+          }}
+        </For>
+      </Show>
+    </Show>
+  );
+}
+
+/// A long list of same-shaped objects, as a table.
 function ObjectTable(props: { rows: Record<string, unknown>[] }) {
   const cols = createMemo(() => {
     const seen: string[] = [];
@@ -163,11 +269,7 @@ export default function StatusView(props: { value: unknown }): JSX.Element {
               {([k, val]) => (
                 <>
                   <span class="st-key">{label(k)}</span>
-                  <span class="st-val">
-                    {/^(.*Time|.*Timestamp)$/.test(k) && relAge(val)
-                      ? `${relAge(val)} ago · ${fmt(val)}`
-                      : fmt(val)}
-                  </span>
+                  <Val k={k} v={val} />
                 </>
               )}
             </For>
@@ -197,7 +299,7 @@ export default function StatusView(props: { value: unknown }): JSX.Element {
                     <Show
                       when={k === "conditions"}
                       fallback={
-                        <ObjectTable rows={val as Record<string, unknown>[]} />
+                        <ObjectList rows={val as Record<string, unknown>[]} />
                       }
                     >
                       <Conditions rows={val as Record<string, unknown>[]} />
