@@ -70,6 +70,9 @@ interface ResourceType {
   namespaced: boolean;
   deletable: boolean;
   editable: boolean;
+  /// The server's own short names (`svc`, `cm`, a CRD's `vs`), from
+  /// aggregated discovery. Absent on servers that don't serve it.
+  short_names?: string[];
 }
 
 interface RefLink {
@@ -894,7 +897,27 @@ const KIND_ALIASES: Record<string, string> = {
   crd: "apiextensions.k8s.io/CustomResourceDefinition", crds: "apiextensions.k8s.io/CustomResourceDefinition",
   hpa: "autoscaling/HorizontalPodAutoscaler",
   pdb: "policy/PodDisruptionBudget",
+  // kubectl's own short names. Discovery says these itself on a 1.30+
+  // server; an older one doesn't, and they should work there too.
+  ep: "/Endpoints", cs: "/ComponentStatus", limits: "/LimitRange",
+  quota: "/ResourceQuota", rc: "/ReplicationController",
+  csr: "certificates.k8s.io/CertificateSigningRequest",
+  pc: "scheduling.k8s.io/PriorityClass",
 };
+
+/// Whether `token` (lower-cased) is a name kubectl would accept for this
+/// kind as typed: its alias, a short name the server gave it, its kind, or
+/// its plural — `svc`, `service`, `services`.
+function namesKind(t: ResourceType, token: string): boolean {
+  if (!token) return false;
+  const alias = KIND_ALIASES[token];
+  if (alias && alias.toLowerCase() === `${t.group}/${t.kind}`.toLowerCase()) return true;
+  return (
+    t.kind.toLowerCase() === token ||
+    t.plural === token ||
+    (t.short_names ?? []).some((n) => n.toLowerCase() === token)
+  );
+}
 
 const SESSION_KEY = "pigeoneye.session";
 const KUBECONFIG_KEY = "pigeoneye.kubeconfigs";
@@ -4393,6 +4416,156 @@ function App() {
     ...nsFiltered(),
   ]);
   const [nsIdx, setNsIdx] = createSignal(0);
+
+  // ── keeping the namespace list current ─────────────────
+  //
+  // The list was read once, when the cluster connected, so a namespace
+  // created after that — here or with kubectl — never reached the picker,
+  // `:ns`, or the New dialog until the app reconnected. It is read again
+  // when one of those opens, and taken straight from the Namespace list
+  // whenever that is on screen, since its watch already has the answer.
+  /// When the palette last asked, per cluster. Its own clock: the picker
+  /// having just asked says nothing about what changed since.
+  const nsAskedByPalette = new Map<string, number>();
+  function publishNamespaces(ctx: string, names: string[]) {
+    const sorted = [...names].sort();
+    const st = tabCache.get(ctx);
+    if (st) st.namespaces = sorted;
+    for (const p of panes) {
+      if (p.active() !== ctx) continue;
+      const cur = p.namespaces();
+      if (cur.length !== sorted.length || cur.some((n, i) => n !== sorted[i]))
+        p.setNamespaces(sorted);
+    }
+  }
+  /// Re-read a cluster's namespaces. A cluster parked on a broken
+  /// credential is left alone: asking would run the helper, which can open
+  /// a browser.
+  function refreshNamespaces(ctx: string | null) {
+    if (!ctx || !tabCache.has(ctx) || authPaused().has(ctx)) return;
+    void invoke<string[]>("list_namespaces", { context: ctx })
+      .then((ns) => publishNamespaces(ctx, ns))
+      .catch(() => {
+        /* keep the list we have */
+      });
+  }
+  createEffect(() => {
+    if (nsOpen() || newOpen()) untrack(() => refreshNamespaces(active()));
+  });
+  // The palette opens far more often than the picker; once in a while is
+  // plenty for `:ns` and a kind's namespace argument.
+  createEffect(() => {
+    if (!cmdOpen()) return;
+    untrack(() => {
+      const ctx = active();
+      if (!ctx || Date.now() - (nsAskedByPalette.get(ctx) ?? 0) < 10_000) return;
+      nsAskedByPalette.set(ctx, Date.now());
+      refreshNamespaces(ctx);
+    });
+  });
+  for (const p of panes)
+    createEffect(() => {
+      const rt = p.selected();
+      const t = p.table();
+      const ctx = p.active();
+      if (!ctx || !t || !rt || rt.group !== "" || rt.kind !== "Namespace") return;
+      // A partial list would look like namespaces had vanished.
+      if (t.truncated || p.streaming()) return;
+      untrack(() => publishNamespaces(ctx, t.rows.map((r) => r.name)));
+    });
+
+  // ── keeping the kind list current ──────────────────────
+  //
+  // Same story for kinds: discovery ran once, at connect, so a CRD
+  // installed afterwards (Argo, Istio, an operator) was in neither the
+  // sidebar nor `:` until the app reconnected. It is asked again when a
+  // kind is looked for and isn't there, and when the CRD list on screen
+  // shows one discovery hasn't served.
+  const [typesBusy, setTypesBusy] = createSignal<Set<string>>(new Set());
+  /// Fold a fresh discovery into the cluster's kinds. A kind that was
+  /// already known keeps its object — views compare kinds by identity, so
+  /// a new copy would read as "a different kind" to the one on screen.
+  function publishTypes(ctx: string, next: ResourceType[]) {
+    const st = tabCache.get(ctx);
+    if (!st) return;
+    const old = new Map(st.types.map((t) => [typeKey(t), t]));
+    const merged = next.map((t) => {
+      const o = old.get(typeKey(t));
+      if (!o) return t;
+      o.short_names = t.short_names;
+      return o;
+    });
+    const same =
+      merged.length === st.types.length && merged.every((t, i) => t === st.types[i]);
+    if (same) return;
+    st.types = merged;
+    for (const p of panes) if (p.active() === ctx) p.setTypes(merged);
+  }
+  function refreshTypes(ctx: string | null) {
+    if (!ctx || !tabCache.has(ctx) || authPaused().has(ctx) || typesBusy().has(ctx)) return;
+    setTypesBusy(new Set([...typesBusy(), ctx]));
+    void invoke<ResourceType[]>("discover", { context: ctx })
+      .then((ts) => publishTypes(ctx, ts))
+      .catch(() => {
+        /* keep the kinds we have */
+      })
+      .finally(() => {
+        const s = new Set(typesBusy());
+        s.delete(ctx);
+        setTypesBusy(s);
+      });
+  }
+  /// A kind looked for and not found: worth asking, but typing fires this
+  /// on every keystroke, so once in a while per cluster.
+  const typesAskedOnMiss = new Map<string, number>();
+  function refreshTypesOnMiss(ctx: string | null) {
+    if (!ctx || Date.now() - (typesAskedOnMiss.get(ctx) ?? 0) < 15_000) return;
+    typesAskedOnMiss.set(ctx, Date.now());
+    refreshTypes(ctx);
+  }
+  createEffect(() => {
+    if (!cmdOpen()) return;
+    const q = cmdText().trim().toLowerCase();
+    const head = q.split(/\s+/)[0] ?? "";
+    // The palette's own verbs, which are not kinds.
+    if (head.length < 2 || q === "0" || q.startsWith("ns") || q.startsWith("ctx") || q.startsWith("context"))
+      return;
+    untrack(() => {
+      if (!resolveKinds(head).length) refreshTypesOnMiss(active());
+    });
+  });
+  // The CRD list on screen names what discovery should serve
+  // (`rollouts.argoproj.io`). One that isn't served yet is asked for — again
+  // a few seconds on, since a new CRD takes a moment to be established —
+  // and once only, so a CRD that never serves can't loop. One that went
+  // away takes its kind with it.
+  const crdAsked = new Map<string, Set<string>>();
+  const crdSeen = new Map<string, Set<string>>();
+  for (const p of panes)
+    createEffect(() => {
+      const rt = p.selected();
+      const t = p.table();
+      const ctx = p.active();
+      if (!ctx || !t || !rt || rt.group !== "apiextensions.k8s.io" || rt.kind !== "CustomResourceDefinition")
+        return;
+      if (t.truncated || p.streaming()) return;
+      const names = t.rows.map((r) => r.name);
+      untrack(() => {
+        const served = new Set((tabCache.get(ctx)?.types ?? []).map((k) => `${k.plural}.${k.group}`));
+        let asked = crdAsked.get(ctx);
+        if (!asked) crdAsked.set(ctx, (asked = new Set()));
+        const fresh = names.filter((n) => !served.has(n) && !asked.has(n));
+        const prev = crdSeen.get(ctx);
+        const now = new Set(names);
+        const gone = !!prev && [...prev].some((n) => !now.has(n));
+        crdSeen.set(ctx, now);
+        if (fresh.length) {
+          for (const n of fresh) asked.add(n);
+          refreshTypes(ctx);
+          window.setTimeout(() => refreshTypes(ctx), 5_000);
+        } else if (gone) refreshTypes(ctx);
+      });
+    });
   const scrollNsCursor = () =>
     requestAnimationFrame(() =>
       document
@@ -6407,7 +6580,12 @@ function App() {
         setNewBusy(false);
         setNewOpen(false);
         setActionMsg(`created ${rt.kind}/${name} ✓`);
-        await refreshList();
+        // The list the user made it from. refreshList is pane 1's alone, so
+        // one created from the second pane waited on that pane's watch —
+        // and never came without one.
+        if (focusedPaneIdx() === 1 && sSel() === rt && sCtx() === ctx) await sRefreshList();
+        else await refreshList();
+        if (rt.group === "" && rt.kind === "Namespace") refreshNamespaces(ctx);
       })
       .catch((e) => {
         setNewBusy(false);
@@ -6628,13 +6806,25 @@ function App() {
     const f = filter().toLowerCase();
     const byGroup = new Map<string, ResourceType[]>();
     for (const t of types()) {
-      if (f && !t.kind.toLowerCase().includes(f) && !t.group.includes(f))
+      if (
+        f &&
+        !t.kind.toLowerCase().includes(f) &&
+        !t.group.includes(f) &&
+        !namesKind(t, f.trim())
+      )
         continue;
       const key = t.group || "core";
       if (!byGroup.has(key)) byGroup.set(key, []);
       byGroup.get(key)!.push(t);
     }
     return [...byGroup.entries()];
+  });
+
+  // A kind filtered for and not there may be a CRD installed since connect.
+  createEffect(() => {
+    const f = filter().trim();
+    if (f.length < 2 || filteredGroups().length) return;
+    untrack(() => refreshTypesOnMiss(active()));
   });
 
   /// Exactly the kinds the sidebar is showing, in visual order, so the
@@ -7372,6 +7562,9 @@ function App() {
       const t = byKey.get(alias.toLowerCase());
       if (t) hits.push(t);
     }
+    // Then anything the token names outright — a server short name (a
+    // CRD's `vs`, `ro`), a kind, a plural — before guessing by prefix.
+    for (const t of types()) if (!hits.includes(t) && namesKind(t, token)) hits.push(t);
     for (const t of types())
       if (!hits.includes(t) && t.kind.toLowerCase().startsWith(token)) hits.push(t);
     for (const t of types())
@@ -7592,6 +7785,20 @@ function App() {
     const head = (parts[0] ?? "").toLowerCase();
     const rest = parts.slice(1).join(" ").trim();
     const kinds = resolveKinds(head);
+    // Nothing by that name — it may have been installed since connect,
+    // and the cluster is being asked. Say so rather than show nothing.
+    if (!kinds.length) {
+      const busy = typesBusy().has(active() ?? "");
+      return [
+        {
+          label: `no kind "${head}" here`,
+          hint: busy ? "asking the cluster for new kinds…" : "↵ to ask the cluster again",
+          busy,
+          keepOpen: true,
+          run: () => refreshTypes(active()),
+        },
+      ];
+    }
     const items = [
       ...kinds.slice(0, CMD_LIST_MAX).map((t) => kindItem(t, rest)),
       ...moreRow(Math.min(kinds.length, CMD_LIST_MAX), kinds.length),
@@ -7600,12 +7807,15 @@ function App() {
     // still right when it names one. When it doesn't, the likely question
     // is "where is this thing?" — so lead with the search, but never take
     // the other reading away.
+    // One open cluster is still somewhere to look: `svc api` there used to
+    // offer only "namespace api", which isn't one, and found nothing.
     const first = kinds[0];
-    if (first && rest && !rest.startsWith("@") && !rest.includes("=") && tabs().length > 1) {
+    if (first && rest && !rest.startsWith("@") && !rest.includes("=") && tabs().length > 0) {
       const known = namespaces().some((n) => n.includes(rest));
+      const many = tabs().length > 1;
       const search: CmdItem = {
-        label: `⌕ search every cluster · ${first.kind} "${rest.replace(/^\//, "")}"`,
-        hint: `${tabs().length} open`,
+        label: `⌕ search ${many ? "every cluster" : "this cluster"} · ${first.kind} "${rest.replace(/^\//, "")}"`,
+        hint: many ? `${tabs().length} open` : (tabs()[0] ?? ""),
         keepOpen: true,
         search: true,
         run: () => runXSearch(first, rest.replace(/^\//, "")),

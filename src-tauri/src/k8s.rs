@@ -282,6 +282,11 @@ pub struct ResourceType {
     pub deletable: bool,
     #[serde(default = "yes")]
     pub editable: bool,
+    /// What the server says the kind is called for short — `svc`, `cm`, a
+    /// CRD's `vs` or `ro` — so a user can type it as they would to kubectl.
+    /// Only aggregated discovery carries it; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub short_names: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -1041,6 +1046,10 @@ async fn discover_aggregated(client: &Client) -> Result<Vec<ResourceType>, Strin
                     namespaced: r["scope"].as_str() == Some("Namespaced"),
                     deletable: verbs.contains(&"delete"),
                     editable: verbs.contains(&"patch") || verbs.contains(&"update"),
+                    short_names: r["shortNames"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -1078,6 +1087,7 @@ pub async fn discover(state: &AppState, context: String) -> Result<Vec<ResourceT
                 deletable: caps.supports_operation(verbs::DELETE),
                 editable: caps.supports_operation(verbs::PATCH)
                     || caps.supports_operation(verbs::UPDATE),
+                short_names: Vec::new(),
             });
         }
     }
@@ -1667,6 +1677,7 @@ async fn issues_with(client: Client, ctx: String) -> Result<Vec<Issue>, String> 
         namespaced,
         deletable: true,
         editable: true,
+        short_names: Vec::new(),
     };
     // Pods across every namespace, filtered to problem statuses.
     let pod_rt = core("Pod", "pods", true);
@@ -6745,6 +6756,7 @@ current-context: x
             namespaced: true,
             deletable: true,
             editable: true,
+            short_names: Vec::new(),
         }
     }
 
@@ -6861,3 +6873,4 @@ current-context: x
         stuck.abort();
     }
 }
+
